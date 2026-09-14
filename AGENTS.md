@@ -8,7 +8,7 @@
 | [compose.yaml](compose.yaml) | Deterministic local Faktory, Garage, and PostgreSQL integration topology. |
 | [Dockerfile](Dockerfile) | Multi-stage production image for the server, renderer, and SPA. |
 | [infra/pulumi/](infra/pulumi/) | Preview Kubernetes, PostgreSQL, Authentik, and networking declarations. |
-| [.tekton/](.tekton/) | Preview quality, image publication, and Pulumi delivery pipeline. |
+| [.tekton/](.tekton/) | Preview and release image publication and Pulumi delivery pipelines. |
 | [Cargo.toml](Cargo.toml) | Rust 1.96, edition 2024 workspace policy and shared dependencies. |
 | [package.json](package.json) | pnpm workspace tooling and browser protobuf dependencies. |
 | [pyproject.toml](pyproject.toml) | Python and CadQuery renderer environment contract. |

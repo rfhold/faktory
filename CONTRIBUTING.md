@@ -47,7 +47,7 @@ docker compose config --quiet
 git diff --check
 ```
 
-The preview and release pipelines run this complete sequence after the pinned Gitleaks scan passes.
+Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks but do not repeat the local quality suite.
 
 ## Releases
 

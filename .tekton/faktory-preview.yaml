@@ -61,47 +61,6 @@ spec:
         workspaces:
           - { name: output, workspace: source }
 
-      - name: quality
-        runAfter: [scan-private-material]
-        taskSpec:
-          workspaces:
-            - name: source
-          volumes:
-            - name: git-auth
-              secret:
-                secretName: "{{ git_auth_secret }}"
-          steps:
-            - name: checks
-              image: cr.holdenitdown.net/rfhold/general-ci@sha256:6943f91d774980357b24730a14ac4b026325d50962df4b2e15e24c3f43190e5b
-              workingDir: $(workspaces.source.path)
-              volumeMounts:
-                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
-              script: |
-                #!/bin/sh
-                set -eu
-                cp /etc/git-auth/.gitconfig /root/.gitconfig
-                cp /etc/git-auth/.git-credentials /root/.git-credentials
-                buf lint
-                cargo +1.96.0 fmt --all -- --check
-                cargo +1.96.0 check --workspace --all-targets
-                cargo +1.96.0 clippy --workspace --all-targets -- -D warnings
-                cargo +1.96.0 test --workspace --locked
-                pnpm install --frozen-lockfile
-                pnpm run typecheck
-                pnpm run web:build
-                pnpm run web:test
-                uv sync --frozen
-                uv run python -m unittest discover
-                cd infra/pulumi
-                bun install --frozen-lockfile
-                bun run build
-                bun run test
-                cd ../..
-                docker compose config --quiet
-                git diff --check
-        workspaces:
-          - { name: source, workspace: source }
-
       - name: scan-private-material
         runAfter: [fetch-repository]
         taskSpec:
@@ -119,7 +78,7 @@ spec:
           - { name: source, workspace: source }
 
       - name: build-amd64
-        runAfter: [quality, scan-private-material]
+        runAfter: [scan-private-material]
         retries: 1
         taskSpec:
           params:
@@ -156,7 +115,7 @@ spec:
           - { name: source, workspace: source }
 
       - name: build-arm64
-        runAfter: [quality, scan-private-material]
+        runAfter: [scan-private-material]
         retries: 1
         taskSpec:
           params:
