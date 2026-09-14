@@ -13,4 +13,6 @@ config:
   faktory:backupRetention: 14d
   faktory:databaseStorageSize: 10Gi
   faktory:protectData: "false"
+  faktory:oauthWrappingKeyVersions: [v1]
+  faktory:oauthActiveWrappingKeyVersion: v1
 encryptionsalt: v1:myA4y+QXFoE=:v1:cINYMv6F1KE6SNIE:yEZTTqYfMq9IN051x9K53NtkeaQs0Q==

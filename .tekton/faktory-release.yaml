@@ -7,6 +7,19 @@ metadata:
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
   taskRunSpecs:
+    - pipelineTaskName: verify-amd64
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: amd64
+    - pipelineTaskName: verify-arm64
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - key: workload-type
+            operator: Equal
+            value: gpu-inference
+            effect: NoSchedule
     - pipelineTaskName: deploy-production
       podTemplate:
         nodeSelector:
@@ -212,8 +225,86 @@ spec:
         workspaces:
           - { name: source, workspace: source }
 
+      - name: verify-amd64
+        runAfter: [build-amd64]
+        taskSpec:
+          params:
+            - { name: image, type: string }
+          steps:
+            - name: render
+              image: $(params.image)
+              imagePullPolicy: Always
+              script: |
+                #!/bin/sh
+                set -eu
+                output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
+                trap 'rm -rf "$output_dir"' EXIT
+                /opt/faktory/env/bin/python -m renderer \
+                  /opt/faktory/renderer/examples/box.py \
+                  "$output_dir/model.glb" \
+                  "$output_dir/model.svg" \
+                  "$output_dir/model.json"
+                /opt/faktory/env/bin/python -c '
+                import struct
+                import sys
+                from pathlib import Path
+
+                path = Path(sys.argv[1])
+                content = path.read_bytes()
+                if len(content) < 12:
+                    raise SystemExit("GLB header is truncated")
+                magic, version, declared_size = struct.unpack("<4sII", content[:12])
+                if magic != b"glTF":
+                    raise SystemExit("invalid GLB magic")
+                if version != 2:
+                    raise SystemExit("invalid GLB version")
+                if declared_size != len(content):
+                    raise SystemExit("invalid GLB declared size")
+                ' "$output_dir/model.glb"
+        params:
+          - { name: image, value: "$(params.base-image):sha-$(params.revision)-amd64" }
+
+      - name: verify-arm64
+        runAfter: [build-arm64]
+        taskSpec:
+          params:
+            - { name: image, type: string }
+          steps:
+            - name: render
+              image: $(params.image)
+              imagePullPolicy: Always
+              script: |
+                #!/bin/sh
+                set -eu
+                output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
+                trap 'rm -rf "$output_dir"' EXIT
+                /opt/faktory/env/bin/python -m renderer \
+                  /opt/faktory/renderer/examples/box.py \
+                  "$output_dir/model.glb" \
+                  "$output_dir/model.svg" \
+                  "$output_dir/model.json"
+                /opt/faktory/env/bin/python -c '
+                import struct
+                import sys
+                from pathlib import Path
+
+                path = Path(sys.argv[1])
+                content = path.read_bytes()
+                if len(content) < 12:
+                    raise SystemExit("GLB header is truncated")
+                magic, version, declared_size = struct.unpack("<4sII", content[:12])
+                if magic != b"glTF":
+                    raise SystemExit("invalid GLB magic")
+                if version != 2:
+                    raise SystemExit("invalid GLB version")
+                if declared_size != len(content):
+                    raise SystemExit("invalid GLB declared size")
+                ' "$output_dir/model.glb"
+        params:
+          - { name: image, value: "$(params.base-image):sha-$(params.revision)-arm64" }
+
       - name: publish-manifest
-        runAfter: [build-amd64, build-arm64]
+        runAfter: [verify-amd64, verify-arm64]
         retries: 1
         taskSpec:
           params:

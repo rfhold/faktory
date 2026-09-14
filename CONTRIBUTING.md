@@ -47,7 +47,7 @@ docker compose config --quiet
 git diff --check
 ```
 
-Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks but do not repeat the local quality suite.
+Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks but do not repeat the local quality suite. After each architecture-specific runtime image is built, its matching-architecture pipeline task runs the packaged renderer against `renderer/examples/box.py` and validates the generated GLB header before manifest publication.
 
 ## Releases
 
@@ -72,6 +72,36 @@ uvx --from conda-lock==3.0.4 conda-lock lock \
 ```
 
 Review all changed package URLs and checksums before committing regenerated locks. BuildKit maps `TARGETARCH=amd64` to `conda-linux-64.lock` and `TARGETARCH=arm64` to `conda-linux-aarch64.lock`; other architectures fail before installation.
+
+To exercise the same packaged renderer contract locally for the host architecture, build the runtime image and override its server entrypoint:
+
+```bash
+docker build --target runtime --tag faktory-renderer-verify:local .
+docker run --rm --entrypoint /bin/sh faktory-renderer-verify:local -c '
+set -eu
+output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
+trap '\''rm -rf "$output_dir"'\'' EXIT
+/opt/faktory/env/bin/python -m renderer \
+  /opt/faktory/renderer/examples/box.py \
+  "$output_dir/model.glb" \
+  "$output_dir/model.svg" \
+  "$output_dir/model.json"
+/opt/faktory/env/bin/python -c '\''
+import struct
+import sys
+from pathlib import Path
+
+content = Path(sys.argv[1]).read_bytes()
+if len(content) < 12:
+    raise SystemExit("GLB header is truncated")
+magic, version, declared_size = struct.unpack("<4sII", content[:12])
+if magic != b"glTF" or version != 2 or declared_size != len(content):
+    raise SystemExit("invalid GLB header")
+'\'' "$output_dir/model.glb"
+'
+```
+
+This local command validates only the architecture executed by the local Docker engine. It does not replace the pipeline's native AMD64 and ARM64 tasks or prove either remote task has run.
 
 ## Local Compose Integration
 

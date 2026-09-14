@@ -218,11 +218,16 @@ async fn claim_render(repository: &Repository, job: &RenderJob) -> bool {
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
             }
-            Err(_) => break,
+            Err(error) => {
+                repository.mark_degraded();
+                tracing::warn!(
+                    repository.error.kind = error.kind(),
+                    "render claim remains recoverable only by startup reconciliation"
+                );
+                return false;
+            }
         }
     }
-    repository.mark_degraded();
-    tracing::warn!("render claim remains recoverable only by startup reconciliation");
     false
 }
 
@@ -257,16 +262,22 @@ async fn persist_terminal(
                     .await
             }
         };
-        if persisted.is_ok() {
-            return;
-        }
-        if attempt < 4 {
-            tokio::time::sleep(delay).await;
-            delay = delay.saturating_mul(2);
+        match persisted {
+            Ok(()) => return,
+            Err(_) if attempt < 4 => {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => {
+                repository.mark_degraded();
+                tracing::warn!(
+                    repository.error.kind = error.kind(),
+                    "render terminal state remains recoverable only by startup reconciliation"
+                );
+                return;
+            }
         }
     }
-    repository.mark_degraded();
-    tracing::warn!("render terminal state remains recoverable only by startup reconciliation");
 }
 
 async fn render(
@@ -581,19 +592,28 @@ fn validate_svg_element(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::BTreeSet,
+        io,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
     use crate::storage::{
         InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject,
     };
 
+    const PRIVATE_SENTINEL: &str = "private-render-repository-material";
+
     #[derive(Debug, Default)]
     struct TransientPutFailures {
         inner: InMemoryObjectStore,
         remaining: AtomicUsize,
+        attempts: AtomicUsize,
     }
 
     #[async_trait]
@@ -612,15 +632,17 @@ mod tests {
             bytes: Bytes,
             condition: PutCondition,
         ) -> Result<String, StorageError> {
-            if key.ends_with("/model.json")
-                && self
+            if key.ends_with("/model.json") {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if self
                     .remaining
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()
-            {
-                return Err(StorageError::Unavailable);
+                {
+                    return Err(StorageError::Unavailable);
+                }
             }
             self.inner.put(key, bytes, condition).await
         }
@@ -632,6 +654,59 @@ mod tests {
         async fn ready(&self) -> Result<(), StorageError> {
             self.inner.ready().await
         }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("recording writer").extend(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn warning_subscriber(output: &RecordingWriter) -> tracing::Dispatch {
+        let writer = output.clone();
+        tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(crate::observability::JsonEventFormatter)
+                    .with_writer(move || writer.clone())
+                    .with_filter(crate::observability::json_filter()),
+            ),
+        )
+    }
+
+    fn assert_repository_warning(output: &RecordingWriter, message: &str) {
+        let stdout = String::from_utf8(output.0.lock().expect("recording writer").clone())
+            .expect("UTF-8 stdout");
+        assert!(!stdout.contains(PRIVATE_SENTINEL));
+        let events = stdout
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON event"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "unexpected warning events: {stdout}");
+        let event = events[0].as_object().expect("event object");
+        assert_eq!(event["level"], "WARN");
+        assert_eq!(event["message"], message);
+        assert_eq!(event["repository.error.kind"], "unavailable");
+        assert_eq!(event["target"], "faktory_server::render");
+        assert!(event["timestamp"].is_string());
+        assert_eq!(
+            event.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "level",
+                "message",
+                "repository.error.kind",
+                "target",
+                "timestamp",
+            ])
+        );
     }
 
     fn glb_fixture(bin: Option<&[u8]>) -> Vec<u8> {
@@ -810,6 +885,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn render_claim_exhaustion_degrades_readiness_and_logs_only_error_kind() {
+        let store = Arc::new(TransientPutFailures::default());
+        let repository = Repository::new(store.clone(), 1);
+        let readiness_repository = repository.clone();
+        let model = repository
+            .create_model(PRIVATE_SENTINEL, "Part", b"source")
+            .await
+            .expect("accept source");
+        let job = RenderJob {
+            model_id: model.id,
+            revision: model.desired_source_revision,
+        };
+        store.attempts.store(0, Ordering::SeqCst);
+        store.remaining.store(5, Ordering::SeqCst);
+        let output = RecordingWriter::default();
+
+        let claimed = claim_render(&repository, &job)
+            .with_subscriber(warning_subscriber(&output))
+            .await;
+
+        assert!(!claimed);
+        assert_eq!(store.attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            readiness_repository.ready().await,
+            Err(RepositoryError::Unavailable)
+        );
+        assert_eq!(
+            repository
+                .get_model(&job.model_id)
+                .await
+                .expect("stranded model")
+                .record
+                .render_state,
+            crate::model::StoredRenderState::Pending
+        );
+        assert_repository_warning(
+            &output,
+            "render claim remains recoverable only by startup reconciliation",
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_state_write_retries_transient_failures() {
         let store = Arc::new(TransientPutFailures::default());
         let repository = Repository::new(store.clone(), 1);
@@ -972,12 +1089,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_state_write_exhaustion_degrades_readiness_across_clones() {
+    async fn terminal_state_write_exhaustion_degrades_readiness_and_logs_only_error_kind() {
         let store = Arc::new(TransientPutFailures::default());
         let repository = Repository::new(store.clone(), 1);
         let readiness_repository = repository.clone();
         let model = repository
-            .create_model("part", "Part", b"source")
+            .create_model(PRIVATE_SENTINEL, "Part", b"source")
             .await
             .expect("accept source");
         let job = RenderJob {
@@ -990,10 +1107,15 @@ mod tests {
                 .await
                 .expect("claim render")
         );
+        store.attempts.store(0, Ordering::SeqCst);
         store.remaining.store(5, Ordering::SeqCst);
+        let output = RecordingWriter::default();
 
-        persist_terminal(&repository, &job, &Err("safe failure")).await;
+        persist_terminal(&repository, &job, &Err("safe failure"))
+            .with_subscriber(warning_subscriber(&output))
+            .await;
 
+        assert_eq!(store.attempts.load(Ordering::SeqCst), 5);
         assert_eq!(
             readiness_repository.ready().await,
             Err(RepositoryError::Unavailable)
@@ -1006,6 +1128,10 @@ mod tests {
                 .record
                 .render_state,
             crate::model::StoredRenderState::Rendering
+        );
+        assert_repository_warning(
+            &output,
+            "render terminal state remains recoverable only by startup reconciliation",
         );
     }
 

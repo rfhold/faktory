@@ -176,6 +176,18 @@ pub enum RepositoryError {
     Corrupt,
 }
 
+impl RepositoryError {
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Unavailable => "unavailable",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
+
 impl From<StorageError> for RepositoryError {
     fn from(error: StorageError) -> Self {
         match error {

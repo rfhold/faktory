@@ -15,8 +15,8 @@ use mcp::{
     OAuthConsentHandler, OAuthConsentModel, OAuthConsentPresentation, OAuthResource,
     OAuthSigningKeyState, OidcEndpointPolicy, OidcPrincipalMapper, OidcPrincipalMapping,
     OidcResourceOwnerAuthenticator, OidcResourceOwnerConfig, OidcVerifiedIdentity,
-    PostgresOAuthAuthorizationStore, PostgresOidcResourceOwnerStore, VersionedOAuthWrappingKeyring,
-    server::BoxFuture,
+    PostgresOAuthAuthorizationStore, PostgresOidcResourceOwnerStore,
+    TrustedPrivateOAuthCimdDestinationPolicy, VersionedOAuthWrappingKeyring, server::BoxFuture,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -27,6 +27,9 @@ use crate::Secret;
 
 const MCP_SCOPE: &str = "faktory:use";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CIMD_TRUSTED_ORIGINS: usize = 16;
+const MAX_CIMD_TRUSTED_ORIGIN_BYTES: usize = 512;
+const MAX_CIMD_TRUSTED_ORIGINS_BYTES: usize = 4_096;
 
 #[derive(Clone)]
 pub struct ProductionAuthConfig {
@@ -42,6 +45,8 @@ pub struct ProductionAuthConfig {
     pub oauth_code_ttl: Duration,
     pub oauth_wrapping_keys_file: String,
     pub allow_dynamic_registration: bool,
+    pub allow_cimd: bool,
+    pub cimd_trusted_private_origins: Vec<Url>,
     pub allow_loopback_redirects: bool,
 }
 
@@ -62,6 +67,7 @@ impl fmt::Debug for ProductionAuthConfig {
                 "allow_dynamic_registration",
                 &self.allow_dynamic_registration,
             )
+            .field("allow_cimd", &self.allow_cimd)
             .field("allow_loopback_redirects", &self.allow_loopback_redirects)
             .finish_non_exhaustive()
     }
@@ -82,7 +88,7 @@ impl ProductionAuthConfig {
             || self.oauth_refresh_token_ttl.is_zero()
             || self.oauth_refresh_family_ttl < self.oauth_refresh_token_ttl
             || self.oauth_code_ttl.is_zero()
-            || !self.allow_dynamic_registration
+            || validate_cimd_trusted_private_origins(&self.cimd_trusted_private_origins).is_err()
             || public.path() != "/"
             || public.query().is_some()
             || public.fragment().is_some()
@@ -257,18 +263,9 @@ impl ProductionAuthRuntime {
             keyring,
         )
         .map_err(|_| "invalid hosted OAuth configuration".to_owned())?;
-        if config.allow_dynamic_registration || config.allow_loopback_redirects {
+        if let Some(options) = client_registration_options(config)? {
             oauth = oauth
-                .with_client_registration(OAuthClientRegistrationOptions {
-                    metadata_fetcher: Some(Arc::new(
-                        HardenedOAuthClientMetadataFetcher::production()
-                            .with_loopback_redirects(config.allow_loopback_redirects),
-                    )),
-                    dynamic_registration: config.allow_dynamic_registration,
-                    allow_loopback_redirects: config.allow_loopback_redirects,
-                    source_resolver: None,
-                    ..OAuthClientRegistrationOptions::default()
-                })
+                .with_client_registration(options)
                 .map_err(|_| "invalid OAuth registration configuration".to_owned())?;
         }
         initialize_signing_key(&pool, store.as_ref(), &oauth, &config.oauth_issuer()).await?;
@@ -293,6 +290,85 @@ impl ProductionAuthRuntime {
         .await
         .unwrap_or(false)
     }
+}
+
+fn client_registration_options(
+    config: &ProductionAuthConfig,
+) -> Result<Option<OAuthClientRegistrationOptions>, String> {
+    if !(config.allow_dynamic_registration || config.allow_cimd || config.allow_loopback_redirects)
+    {
+        return Ok(None);
+    }
+    let metadata_fetcher = if config.allow_cimd {
+        let mut fetcher = HardenedOAuthClientMetadataFetcher::production()
+            .with_loopback_redirects(config.allow_loopback_redirects);
+        if !config.cimd_trusted_private_origins.is_empty() {
+            let destination_policy = TrustedPrivateOAuthCimdDestinationPolicy::new(
+                config.cimd_trusted_private_origins.clone(),
+            )
+            .map_err(|_| "invalid trusted CIMD destination policy".to_owned())?;
+            fetcher = fetcher.with_destination_policy(Arc::new(destination_policy));
+        }
+        Some(Arc::new(fetcher) as Arc<_>)
+    } else {
+        None
+    };
+    Ok(Some(OAuthClientRegistrationOptions {
+        metadata_fetcher,
+        dynamic_registration: config.allow_dynamic_registration,
+        allow_loopback_redirects: config.allow_loopback_redirects,
+        source_resolver: None,
+        ..OAuthClientRegistrationOptions::default()
+    }))
+}
+
+/// Parse bounded, comma-separated trusted private CIMD origins.
+///
+/// # Errors
+///
+/// Returns an error unless every unique value is a credential-free HTTPS root origin.
+pub fn parse_cimd_trusted_private_origins(value: &str) -> Result<Vec<Url>, String> {
+    if value.is_empty() || value.len() > MAX_CIMD_TRUSTED_ORIGINS_BYTES {
+        return Err("FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS is invalid".to_owned());
+    }
+    let mut origins = Vec::new();
+    for (index, entry) in value.split(',').enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty()
+            || entry.len() > MAX_CIMD_TRUSTED_ORIGIN_BYTES
+            || index >= MAX_CIMD_TRUSTED_ORIGINS
+        {
+            return Err("FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS is invalid".to_owned());
+        }
+        let origin = Url::parse(entry)
+            .map_err(|_| "FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS is invalid".to_owned())?;
+        validate_cimd_trusted_private_origins(std::slice::from_ref(&origin))?;
+        if !origins
+            .iter()
+            .any(|existing: &Url| existing.origin() == origin.origin())
+        {
+            origins.push(origin);
+        }
+    }
+    Ok(origins)
+}
+
+fn validate_cimd_trusted_private_origins(origins: &[Url]) -> Result<(), String> {
+    if origins.len() > MAX_CIMD_TRUSTED_ORIGINS
+        || origins
+            .iter()
+            .map(|origin| origin.as_str().len())
+            .sum::<usize>()
+            > MAX_CIMD_TRUSTED_ORIGINS_BYTES
+        || origins
+            .iter()
+            .any(|origin| origin.as_str().len() > MAX_CIMD_TRUSTED_ORIGIN_BYTES)
+    {
+        return Err("FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS is invalid".to_owned());
+    }
+    TrustedPrivateOAuthCimdDestinationPolicy::new(origins.iter().cloned())
+        .map(|_| ())
+        .map_err(|_| "FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS is invalid".to_owned())
 }
 
 async fn initialize_signing_key(
@@ -458,6 +534,8 @@ mod tests {
             oauth_code_ttl: Duration::from_mins(5),
             oauth_wrapping_keys_file: "/run/secrets/faktory-oauth-keys".to_owned(),
             allow_dynamic_registration: true,
+            allow_cimd: false,
+            cimd_trusted_private_origins: Vec::new(),
             allow_loopback_redirects: false,
         };
         assert!(config.validate().is_ok());
@@ -499,11 +577,124 @@ mod tests {
             oauth_code_ttl: Duration::from_mins(5),
             oauth_wrapping_keys_file: "/run/secrets/faktory-oauth-keys".to_owned(),
             allow_dynamic_registration: true,
+            allow_cimd: false,
+            cimd_trusted_private_origins: Vec::new(),
             allow_loopback_redirects: true,
         };
         assert!(config.validate().is_err());
 
         config.public_base_url = "https://faktory.example/".to_owned();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn cimd_is_independent_from_dcr_and_loopback_support() {
+        let mut config = valid_config();
+        config.allow_dynamic_registration = true;
+        config.allow_loopback_redirects = true;
+        config.validate().expect("DCR and loopback configuration");
+        let options = client_registration_options(&config)
+            .expect("registration options")
+            .expect("enabled registration");
+        assert!(options.dynamic_registration);
+        assert!(options.allow_loopback_redirects);
+        assert!(options.metadata_fetcher.is_none());
+
+        config.allow_dynamic_registration = false;
+        config.allow_loopback_redirects = false;
+        config.allow_cimd = true;
+        config.validate().expect("CIMD-only configuration");
+        let options = client_registration_options(&config)
+            .expect("registration options")
+            .expect("enabled CIMD");
+        assert!(!options.dynamic_registration);
+        assert!(options.metadata_fetcher.is_some());
+
+        config.allow_cimd = false;
+        config.allow_loopback_redirects = true;
+        config.validate().expect("loopback-only configuration");
+        let options = client_registration_options(&config)
+            .expect("registration options")
+            .expect("enabled loopback support");
+        assert!(!options.dynamic_registration);
+        assert!(options.allow_loopback_redirects);
+        assert!(options.metadata_fetcher.is_none());
+
+        config.allow_loopback_redirects = false;
+        config
+            .validate()
+            .expect("disabled registration configuration");
+        assert!(
+            client_registration_options(&config)
+                .expect("registration options")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn trusted_cimd_origins_are_bounded_validated_and_deduplicated() {
+        let origins = parse_cimd_trusted_private_origins(
+            "https://PRIVATE.example:443, https://private.example/,https://other.example:8443",
+        )
+        .expect("trusted origins");
+        assert_eq!(origins.len(), 2);
+
+        for invalid in [
+            "http://private.example",
+            "https://user@private.example",
+            "https://private.example/path",
+            "https://private.example?token=secret-value",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://[::1]",
+            "https://private.example,",
+        ] {
+            let error = parse_cimd_trusted_private_origins(invalid).expect_err("invalid origin");
+            assert_eq!(
+                error,
+                "FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS is invalid"
+            );
+            assert!(!error.contains(invalid));
+            assert!(!error.contains("secret-value"));
+        }
+        let too_many = std::iter::repeat_n("https://private.example", 17)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_cimd_trusted_private_origins(&too_many).is_err());
+        assert!(parse_cimd_trusted_private_origins(&"x".repeat(4_097)).is_err());
+    }
+
+    #[test]
+    fn cimd_diagnostics_do_not_expose_trusted_origins() {
+        let mut config = valid_config();
+        config.allow_cimd = true;
+        config.cimd_trusted_private_origins =
+            vec![Url::parse("https://private.internal.example/").expect("URL")];
+        let diagnostic = format!("{config:?}");
+        assert!(diagnostic.contains("allow_cimd: true"));
+        assert!(!diagnostic.contains("private.internal.example"));
+    }
+
+    fn valid_config() -> ProductionAuthConfig {
+        ProductionAuthConfig {
+            database_url: Secret::new("postgres://user:long-password@db/faktory".to_owned())
+                .expect("secret"),
+            public_base_url: "https://faktory.example/".to_owned(),
+            oidc_issuer: "https://auth.example/application/o/faktory/".to_owned(),
+            oidc_client_id: "faktory".to_owned(),
+            oidc_client_secret: Secret::new("long-production-client-secret".to_owned())
+                .expect("secret"),
+            session_ttl: Duration::from_hours(8),
+            oauth_access_token_ttl: Duration::from_mins(15),
+            oauth_refresh_token_ttl: Duration::from_hours(24),
+            oauth_refresh_family_ttl: Duration::from_hours(720),
+            oauth_code_ttl: Duration::from_mins(5),
+            oauth_wrapping_keys_file: "/run/secrets/faktory-oauth-keys".to_owned(),
+            allow_dynamic_registration: true,
+            allow_cimd: false,
+            cimd_trusted_private_origins: Vec::new(),
+            allow_loopback_redirects: false,
+        }
     }
 }

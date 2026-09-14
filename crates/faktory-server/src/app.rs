@@ -247,7 +247,7 @@ pub async fn build_runtime(
     renders
         .reconcile(&repository)
         .await
-        .map_err(|_| "startup reconciliation failed".to_owned())?;
+        .map_err(startup_reconciliation_error)?;
 
     let router = match &config.auth {
         AuthConfig::Disabled => build_disabled_router(&config, repository.clone(), renders.clone()),
@@ -267,6 +267,14 @@ pub async fn build_runtime(
         repository,
         renders,
     })
+}
+
+fn startup_reconciliation_error(error: RepositoryError) -> String {
+    tracing::error!(
+        repository.error.kind = error.kind(),
+        "startup reconciliation failed"
+    );
+    "startup reconciliation failed".to_owned()
 }
 
 fn build_disabled_router(
@@ -846,6 +854,47 @@ mod tests {
         assert_eq!(event["http.response.status_code"], 503);
         assert_eq!(event["message"], "http request completed");
         assert!(event["duration_seconds"].is_number());
+    }
+
+    #[test]
+    fn startup_reconciliation_logs_only_the_repository_error_kind() {
+        let output = RecordingWriter::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(crate::observability::JsonEventFormatter)
+                .with_writer(move || writer.clone())
+                .with_filter(crate::observability::json_filter()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                startup_reconciliation_error(RepositoryError::Conflict),
+                "startup reconciliation failed"
+            );
+        });
+
+        let stdout = String::from_utf8(output.0.lock().expect("recording writer").clone())
+            .expect("UTF-8 stdout");
+        let event = serde_json::from_str::<serde_json::Value>(stdout.trim()).expect("JSON event");
+        assert_eq!(event["level"], "ERROR");
+        assert_eq!(event["message"], "startup reconciliation failed");
+        assert_eq!(event["repository.error.kind"], "conflict");
+        assert_eq!(
+            event
+                .as_object()
+                .expect("event object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "level",
+                "message",
+                "repository.error.kind",
+                "target",
+                "timestamp",
+            ])
+        );
     }
 
     fn assert_request_span(span_exporter: &InMemorySpanExporter) {

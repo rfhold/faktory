@@ -5,9 +5,10 @@ import { after, before, describe, test } from "node:test";
 import * as pulumi from "@pulumi/pulumi";
 import { requireImmutableImage, validateHttpsOrigin } from "./policy";
 
-interface ResourceRecord { type: string; name: string; inputs: Record<string, any>; }
+interface ResourceRecord { type: string; name: string; inputs: Record<string, any>; rawInputs: Record<string, any>; }
 const resources: ResourceRecord[] = [];
 const previousConfig = process.env.PULUMI_CONFIG;
+let program: typeof import("./index");
 
 before(async () => {
   process.env.PULUMI_CONFIG = JSON.stringify({
@@ -25,10 +26,12 @@ before(async () => {
     "faktory:backupRetention": "7d",
     "faktory:databaseStorageSize": "2Gi",
     "faktory:protectData": "false",
+    "faktory:oauthWrappingKeyVersions": '["v1","v2"]',
+    "faktory:oauthActiveWrappingKeyVersion": "v2",
   });
   pulumi.runtime.setMocks({
     newResource: (args) => {
-      resources.push({ type: args.type, name: args.name, inputs: unwrap(args.inputs) });
+      resources.push({ type: args.type, name: args.name, inputs: unwrap(args.inputs), rawInputs: args.inputs });
       const state: Record<string, unknown> = { ...args.inputs };
       if (args.type === "random:index/randomBytes:RandomBytes") state.base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
       if (args.type === "random:index/randomPassword:RandomPassword") state.result = "test-authentik-client-secret";
@@ -60,7 +63,7 @@ before(async () => {
       },
     }),
   }, "faktory", "test", false);
-  await import("./index");
+  program = await import("./index");
   await pulumi.runtime.disconnect();
 });
 
@@ -74,6 +77,18 @@ describe("configuration policy", () => {
     assert.throws(() => requireImmutableImage("registry.test/faktory:main"));
     assert.equal(validateHttpsOrigin("https://s3.example.test/", "s3"), "https://s3.example.test");
     assert.throws(() => validateHttpsOrigin("http://s3.example.test", "s3"));
+  });
+
+  test("validates bounded wrapping-key configuration", () => {
+    assert.doesNotThrow(() => program.validateOAuthWrappingKeyConfiguration(["v1"], "v1"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration("v1", "v1"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration([], "v1"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration(Array(33).fill(0).map((_, index) => `v${index}`), "v1"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration(["v1", "v1"], "v1"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration(["Invalid"], "Invalid"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration(["v1-"], "v1-"));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration([`v${"1".repeat(63)}`], `v${"1".repeat(63)}`));
+    assert.throws(() => program.validateOAuthWrappingKeyConfiguration(["v1"], "v2"));
   });
 
   test("defines secret-free preview and production stacks", () => {
@@ -98,15 +113,42 @@ describe("configuration policy", () => {
       assert.match(stack, /^\s*faktory:backupStorageClass: default-bucket$/m);
       assert.doesNotMatch(stack, /^\s*faktory:(?:s3Region|externalHttpsCidrs):/m);
       assert.doesNotMatch(stack, /^\s*faktory:image:/m);
+      assert.match(stack, /^\s*faktory:oauthWrappingKeyVersions: \[v1\]$/m);
+      assert.match(stack, /^\s*faktory:oauthActiveWrappingKeyVersion: v1$/m);
       assert.doesNotMatch(stack, /(?:accessKey|secretKey|password|clientSecret)\s*:/i);
     }
     const program = readFileSync(join(process.cwd(), "index.ts"), "utf8");
-    assert.equal((program.match(/protect: protectData/g) ?? []).length, 3);
+    assert.equal((program.match(/protect: protectData/g) ?? []).length, 4);
     assert.doesNotMatch(program, /process\.env\.FAKTORY_S3_(?:ACCESS_KEY|SECRET_KEY)/);
   });
 });
 
 describe("preview declarations", () => {
+  test("creates a deterministic retained wrapping-key ring", () => {
+    const generatedKeys = resources.filter((candidate) => candidate.type === "random:index/randomBytes:RandomBytes");
+    assert.deepEqual(generatedKeys.map(({ name }) => name), [
+      "faktory-oauth-wrapping-key-v1",
+      "faktory-oauth-wrapping-key-v2",
+    ]);
+    assert.deepEqual(generatedKeys.map(({ inputs }) => inputs.length), [32, 32]);
+
+    const secret = resource("kubernetes:core/v1:Secret", "faktory-oauth-wrapping-keys");
+    assert.notEqual(secret.inputs.stringData, undefined);
+    assert.ok(
+      Object.keys(secret.rawInputs.stringData).some((key) => key.startsWith("4dabf181")),
+      "keyring stringData must remain a Pulumi secret",
+    );
+    const keyring = JSON.parse(unwrap(secret.inputs.stringData)["keyring.json"]);
+    assert.equal(keyring.schema_version, 1);
+    assert.equal(keyring.active, "v2");
+    assert.deepEqual(keyring.keys.map(({ id }: { id: string }) => id), ["v1", "v2"]);
+
+    const deployment = resource("kubernetes:apps/v1:Deployment", "faktory").inputs.spec;
+    assert.match(deployment.template.metadata.annotations["faktory.holdenitdown.net/wrapping-key-checksum"], /^[a-f0-9]{64}$/);
+    const programSource = readFileSync(join(process.cwd(), "index.ts"), "utf8");
+    assert.match(programSource, /`faktory-oauth-wrapping-key-\$\{version\}`,[\s\S]*?\{ protect: protectData \}/);
+  });
+
   test("declares one hardened server and externalized runtime secrets", () => {
     const deployment = resource("kubernetes:apps/v1:Deployment", "faktory").inputs.spec;
     assert.equal(deployment.replicas, 1);
@@ -130,6 +172,8 @@ describe("preview declarations", () => {
     assert.equal(secret.FAKTORY_OAUTH_REFRESH_FAMILY_TTL_SECONDS, "2592000");
     assert.equal(secret.FAKTORY_OAUTH_WRAPPING_KEYS_FILE, "/var/run/secrets/faktory/oauth/keyring.json");
     assert.equal(secret.FAKTORY_OAUTH_ALLOW_DCR, "true");
+    assert.equal(secret.FAKTORY_OAUTH_ALLOW_CIMD, "true");
+    assert.equal(secret.FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS, undefined);
     assert.equal(secret.FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS, "true");
     assert.equal(secret.FAKTORY_S3_BUCKET, "test-artifacts");
     assert.equal(secret.FAKTORY_S3_ENDPOINT, "https://app-s3.example.test");

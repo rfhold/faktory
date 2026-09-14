@@ -26,7 +26,7 @@ Methods are limited to standard HTTP method names or `OTHER`. Matched Axum route
 
 ## Safety and Lifecycle
 
-Server signals must exclude credentials, tokens, session and authorization material, source text, model or view identifiers, request and response bodies, GLB or SVG bytes, object keys and credentials, raw renderer output, arbitrary errors, query strings, and unbounded paths. Events use controlled messages and fields; errors exposed by rendering remain safe and bounded as defined in [`access-authentication.md`](access-authentication.md).
+Server signals must exclude credentials, tokens, session and authorization material, source text, model or view identifiers, request and response bodies, GLB or SVG bytes, object keys and credentials, raw renderer output, arbitrary errors, query strings, and unbounded paths. Events use controlled messages and fields; repository failures expose only the fixed `repository.error.kind` values `invalid`, `not_found`, `conflict`, `unavailable`, or `corrupt`. Errors exposed by rendering remain safe and bounded as defined in [`access-authentication.md`](access-authentication.md).
 
 Telemetry configuration and initialization occur before authentication, storage, rendering, or listener startup. Invalid required identity, endpoint combinations, exporter initialization, or profiler initialization fail startup. Graceful shutdown stops the HTTP server, gives Pyroscope cleanup up to 10 seconds, then gives each OTLP provider up to 5 seconds to flush and stop. Failures and timeouts produce bounded status events and do not expose backend responses.
 

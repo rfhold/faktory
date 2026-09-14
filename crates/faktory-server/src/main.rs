@@ -2,6 +2,7 @@
 
 use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+use faktory_server::production::parse_cimd_trusted_private_origins;
 use faktory_server::{
     AppConfig, AuthConfig, AwsObjectStore, ProductionAuthConfig, RenderConfig, S3AccessKeyId,
     Secret, build_runtime, observability, profiling,
@@ -104,8 +105,18 @@ fn production_auth_from_env() -> Result<AuthConfig, Box<dyn Error + Send + Sync>
         oauth_code_ttl: Duration::from_secs(parse("FAKTORY_OAUTH_CODE_TTL_SECONDS", 300)?),
         oauth_wrapping_keys_file: required("FAKTORY_OAUTH_WRAPPING_KEYS_FILE")?,
         allow_dynamic_registration: parse_bool("FAKTORY_OAUTH_ALLOW_DCR", true)?,
+        allow_cimd: parse_bool("FAKTORY_OAUTH_ALLOW_CIMD", false)?,
+        cimd_trusted_private_origins: optional_cimd_trusted_private_origins()?,
         allow_loopback_redirects: parse_bool("FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS", false)?,
     })))
+}
+
+fn optional_cimd_trusted_private_origins() -> Result<Vec<url::Url>, Box<dyn Error + Send + Sync>> {
+    match env::var("FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS") {
+        Ok(value) => parse_cimd_trusted_private_origins(&value).map_err(Into::into),
+        Err(env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(_) => Err("FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS must contain valid UTF-8".into()),
+    }
 }
 
 fn normalized_base_url(mut value: String) -> String {
@@ -116,7 +127,15 @@ fn normalized_base_url(mut value: String) -> String {
 }
 
 fn parse_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    match env::var(name) {
+    parse_bool_value(name, env::var(name), default)
+}
+
+fn parse_bool_value(
+    name: &str,
+    value: Result<String, env::VarError>,
+    default: bool,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match value {
         Ok(value) if value == "true" => Ok(true),
         Ok(value) if value == "false" => Ok(false),
         Ok(_) => Err(format!("{name} must be true or false").into()),
@@ -178,6 +197,25 @@ mod tests {
         assert_eq!(
             auth_mode(Err(env::VarError::NotPresent)).expect("default mode"),
             AuthMode::Production
+        );
+    }
+
+    #[test]
+    fn cimd_boolean_defaults_off_and_requires_an_exact_value() {
+        assert!(
+            !parse_bool_value(
+                "FAKTORY_OAUTH_ALLOW_CIMD",
+                Err(env::VarError::NotPresent),
+                false,
+            )
+            .expect("default CIMD policy")
+        );
+        assert!(
+            parse_bool_value("FAKTORY_OAUTH_ALLOW_CIMD", Ok("true".to_owned()), false,)
+                .expect("enabled CIMD policy")
+        );
+        assert!(
+            parse_bool_value("FAKTORY_OAUTH_ALLOW_CIMD", Ok("TRUE".to_owned()), false,).is_err()
         );
     }
 }

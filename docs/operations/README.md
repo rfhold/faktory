@@ -5,5 +5,6 @@ These documents define MVP operation for implemented runtime behavior and reposi
 | Document | Covers |
 | --- | --- |
 | [Runtime and recovery](runtime-recovery.md) | Single-replica assumptions, startup reconciliation, failures, and external-action gates. |
+| [OAuth wrapping-key rotation and recovery](oauth-wrapping-key-rotation-recovery.md) | Staged keyring rotation, rollback, and paired database recovery. |
 | [Observability and profiling](observability-profiling.md) | Configuration, expected signals, shutdown, and troubleshooting. |
 | [Deployment and releases](deployment-releases.md) | Stack declarations, backups, signed release flow, downtime, and manual rollback. |

@@ -22,6 +22,9 @@ const backupStorageClass = config.require("backupStorageClass");
 const backupRetention = config.require("backupRetention");
 const databaseStorageSize = config.require("databaseStorageSize");
 const protectData = config.requireBoolean("protectData");
+const oauthWrappingKeyVersions = config.requireObject<unknown>("oauthWrappingKeyVersions");
+const oauthActiveWrappingKeyVersion = config.require("oauthActiveWrappingKeyVersion");
+validateOAuthWrappingKeyConfiguration(oauthWrappingKeyVersions, oauthActiveWrappingKeyVersion);
 const deploymentEnvironment = pulumi.getStack();
 const publicUrl = `https://${hostname}`;
 const labels = {
@@ -149,11 +152,18 @@ const databaseUrl = pulumi.all([decodeDatabaseSecret("username"), decodeDatabase
   ([username, password]) => `postgresql://${encodeURIComponent(username)}:${encodeURIComponent(password)}@faktory-postgres-rw.${namespaceName}.svc:5432/faktory?sslmode=verify-full&sslrootcert=%2Fvar%2Frun%2Fsecrets%2Ffaktory%2Fpostgres%2Fca.crt`,
 );
 
-const wrappingKey = new random.RandomBytes("faktory-oauth-wrapping-key-v1", { length: 32 });
-const wrappingKeyring = pulumi.secret(wrappingKey.base64.apply((key) => JSON.stringify({
+const wrappingKeys = oauthWrappingKeyVersions.map((version) => new random.RandomBytes(
+  `faktory-oauth-wrapping-key-${version}`,
+  { length: 32 },
+  { protect: protectData },
+).base64);
+const wrappingKeyring = pulumi.secret(pulumi.all(wrappingKeys).apply((keys) => JSON.stringify({
   schema_version: 1,
-  active: "v1",
-  keys: [{ id: "v1", key: Buffer.from(key, "base64").toString("base64url") }],
+  active: oauthActiveWrappingKeyVersion,
+  keys: oauthWrappingKeyVersions.map((version, index) => ({
+    id: version,
+    key: Buffer.from(keys[index], "base64").toString("base64url"),
+  })),
 })));
 const wrappingKeyChecksum = wrappingKeyring.apply((value) => createHash("sha256").update(value).digest("hex"));
 const wrappingKeySecret = new k8s.core.v1.Secret("faktory-oauth-wrapping-keys", {
@@ -179,6 +189,7 @@ const appSecret = new k8s.core.v1.Secret("faktory-app", {
     FAKTORY_OAUTH_CODE_TTL_SECONDS: "300",
     FAKTORY_OAUTH_WRAPPING_KEYS_FILE: "/var/run/secrets/faktory/oauth/keyring.json",
     FAKTORY_OAUTH_ALLOW_DCR: "true",
+    FAKTORY_OAUTH_ALLOW_CIMD: "true",
     FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true",
     FAKTORY_DEPLOYMENT_ENVIRONMENT: deploymentEnvironment,
     FAKTORY_PYROSCOPE_URL: "https://telemetry.holdenitdown.net:4040",
@@ -288,3 +299,19 @@ new k8s.apiextensions.CustomResource("faktory-route", {
 
 export const deployedNamespace = namespace.metadata.name;
 export const deployedUrl = publicUrl;
+
+export function validateOAuthWrappingKeyConfiguration(versions: unknown, activeVersion: string): asserts versions is string[] {
+  const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+  if (
+    !Array.isArray(versions) ||
+    versions.length === 0 ||
+    versions.length > 32 ||
+    versions.some((version) => typeof version !== "string" || !dnsLabel.test(version)) ||
+    new Set(versions).size !== versions.length ||
+    !versions.includes(activeVersion)
+  ) {
+    throw new Error(
+      "oauthWrappingKeyVersions must contain 1 to 32 unique DNS labels of at most 63 characters and include oauthActiveWrappingKeyVersion",
+    );
+  }
+}

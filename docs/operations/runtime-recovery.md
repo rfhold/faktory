@@ -26,7 +26,9 @@ Missing desired source objects or invalid metadata make the affected model unhea
 
 ## Backup and Restore Boundary
 
-CloudNativePG declarations send gzip-compressed base backups and WAL to the backup bucket under `database`; the immediate and scheduled policy is defined in [`deployment-releases.md`](deployment-releases.md). The artifact bucket is separate and is not copied by the database backup declaration. A complete recovery therefore needs both a usable database backup and the artifact bucket contents that its records reference.
+CloudNativePG declarations send gzip-compressed base backups and WAL to the backup bucket under `database`; the immediate and scheduled policy is defined in [`deployment-releases.md`](deployment-releases.md). The artifact bucket is separate and is not copied by the database backup declaration. A complete recovery therefore needs a usable database backup and the artifact bucket contents that its records reference.
+
+OAuth signing records in PostgreSQL depend on the retained wrapping keys in the `faktory-oauth-wrapping-keys` Secret. Treat the database and every referenced key version as one recovery unit. A restored database cannot use an encrypted signing record if its wrapping-key version is absent. Follow [`oauth-wrapping-key-rotation-recovery.md`](oauth-wrapping-key-rotation-recovery.md) for staged rotation and paired recovery.
 
 No automatic restore resource or disaster-recovery workflow is declared. Before an authorized restore, identify the target stack, verify the selected database recovery point and artifact availability through target-specific evidence, preserve the current resources, and prepare a reviewed CloudNativePG recovery declaration. Do not infer recoverability from retention settings or mock tests. Restore, bucket mutation, and destructive replacement require explicit target authorization and a rollback boundary.
 
