@@ -133,7 +133,7 @@ const browserApp = new BrowserApplication("faktory-browser", {
   issuerBaseUrl: authentikBaseUrl,
   redirectUris: [
     `${publicUrl}/oidc/callback`,
-    `${publicUrl}/oauth/authorize/callback`,
+    `${publicUrl}/oauth/oidc/login`,
   ],
   launchUrl: publicUrl,
   signingKeyId: signingKey.id,

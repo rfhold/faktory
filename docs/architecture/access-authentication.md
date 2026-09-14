@@ -16,7 +16,7 @@ Every authenticated web user may list models, inspect render state, retrieve cur
 
 ## MCP Access
 
-In production, the Faktory service is the hosted OAuth authorization server for MCP clients and uses Authentik for interactive user authentication. Dynamic client registration is enabled, including loopback redirect URIs required by local CLI clients such as OpenCode. MCP access tokens are Faktory-issued and resource-bound; browser sessions and Authentik tokens are not accepted as MCP bearer tokens. Disabled mode bypasses this hosted flow only for local Compose.
+In production, the Faktory service is the hosted OAuth authorization server for MCP clients and uses Authentik for interactive user authentication. Authentik registers the strict browser callback `/oidc/callback` and hosted MCP resource-owner callback `/oauth/oidc/login`; `/oauth/authorize/callback` is Faktory's internal post-login continuation and is not an Authentik redirect URI. Dynamic client registration is enabled, including loopback redirect URIs required by local CLI clients such as OpenCode. MCP access tokens are Faktory-issued and resource-bound; browser sessions and Authentik tokens are not accepted as MCP bearer tokens. Disabled mode bypasses this hosted flow only for local Compose.
 
 Any authenticated MCP principal may create models and edit model source. The MVP defines no narrower source-author role. Source mutation remains MCP-only. MCP tools do not expose arbitrary object keys, Python execution arguments, renderer commands, storage credentials, or geometry bytes. [`storage-rendering.md`](storage-rendering.md) defines model identity and source mutation semantics.
 
