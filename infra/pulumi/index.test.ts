@@ -129,6 +129,8 @@ describe("preview declarations", () => {
     assert.equal(secret.FAKTORY_OAUTH_ACCESS_TOKEN_TTL_SECONDS, "900");
     assert.equal(secret.FAKTORY_OAUTH_REFRESH_FAMILY_TTL_SECONDS, "2592000");
     assert.equal(secret.FAKTORY_OAUTH_WRAPPING_KEYS_FILE, "/var/run/secrets/faktory/oauth/keyring.json");
+    assert.equal(secret.FAKTORY_OAUTH_ALLOW_DCR, "true");
+    assert.equal(secret.FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS, "true");
     assert.equal(secret.FAKTORY_S3_BUCKET, "test-artifacts");
     assert.equal(secret.FAKTORY_S3_ENDPOINT, "https://app-s3.example.test");
     assert.equal(secret.FAKTORY_S3_ACCESS_KEY, "generated-access");

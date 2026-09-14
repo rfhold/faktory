@@ -179,7 +179,7 @@ const appSecret = new k8s.core.v1.Secret("faktory-app", {
     FAKTORY_OAUTH_CODE_TTL_SECONDS: "300",
     FAKTORY_OAUTH_WRAPPING_KEYS_FILE: "/var/run/secrets/faktory/oauth/keyring.json",
     FAKTORY_OAUTH_ALLOW_DCR: "true",
-    FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "false",
+    FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true",
     FAKTORY_DEPLOYMENT_ENVIRONMENT: deploymentEnvironment,
     FAKTORY_PYROSCOPE_URL: "https://telemetry.holdenitdown.net:4040",
     OTEL_EXPORTER_OTLP_ENDPOINT: "https://telemetry.holdenitdown.net:4318",
