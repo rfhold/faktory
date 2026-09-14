@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
-from renderer.worker import _validate_facts, _validate_glb, _validate_svg, render
+from renderer.worker import PROJECTIONS, _validate_facts, _validate_glb, _validate_svg, render
 
 
 def make_glb(json_payload: bytes, bin_payload: bytes | None = None) -> bytes:
@@ -28,6 +28,14 @@ class RendererTests(unittest.TestCase):
     def render_paths(self, root: Path) -> tuple[Path, Path, Path]:
         return root / "model.glb", root / "model.svg", root / "model.json"
 
+    def projection_paths(self, root: Path) -> tuple[Path, ...]:
+        return tuple(root / f"{name}.svg" for name, _ in PROJECTIONS)
+
+    def render_model(
+        self, source: Path, glb: Path, svg: Path, facts: Path
+    ) -> str | None:
+        return render(source, glb, svg, facts, self.projection_paths(glb.parent))
+
     def test_supported_result_types_produce_all_outputs(self) -> None:
         sources = {
             "workplane": "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 2, 3)\n",
@@ -44,10 +52,13 @@ class RendererTests(unittest.TestCase):
                 glb, svg, facts = self.render_paths(root)
                 source.write_text(source_text, encoding="utf-8")
 
-                self.assertIsNone(render(source, glb, svg, facts))
+                self.assertIsNone(self.render_model(source, glb, svg, facts))
                 self.assertTrue(_validate_glb(glb))
                 self.assertTrue(_validate_svg(svg))
                 self.assertTrue(_validate_facts(facts))
+                self.assertTrue(
+                    all(_validate_svg(path) for path in self.projection_paths(root))
+                )
                 self.assertEqual(glb.read_bytes()[:4], b"glTF")
 
     def test_box_facts_are_exact(self) -> None:
@@ -60,7 +71,7 @@ class RendererTests(unittest.TestCase):
             )
             glb, svg, facts_path = self.render_paths(root)
 
-            self.assertIsNone(render(source, glb, svg, facts_path))
+            self.assertIsNone(self.render_model(source, glb, svg, facts_path))
             self.assertEqual(
                 json.loads(facts_path.read_text(encoding="utf-8")),
                 {
@@ -83,7 +94,7 @@ class RendererTests(unittest.TestCase):
             )
             glb, svg, facts_path = self.render_paths(root)
 
-            self.assertIsNone(render(source, glb, svg, facts_path))
+            self.assertIsNone(self.render_model(source, glb, svg, facts_path))
             facts = json.loads(facts_path.read_text(encoding="utf-8"))
             self.assertAlmostEqual(facts["volume_cubic_millimeters"], 9.0)
             self.assertEqual(facts["size_millimeters"], {"x": 5.5, "y": 2.0, "z": 2.0})
@@ -101,7 +112,7 @@ class RendererTests(unittest.TestCase):
             )
             glb, svg, facts_path = self.render_paths(root)
 
-            self.assertIsNone(render(source, glb, svg, facts_path))
+            self.assertIsNone(self.render_model(source, glb, svg, facts_path))
             facts = json.loads(facts_path.read_text(encoding="utf-8"))
             self.assertAlmostEqual(facts["volume_cubic_millimeters"], 16.0)
             self.assertEqual(facts["size_millimeters"], {"x": 3.0, "y": 2.0, "z": 2.0})
@@ -117,16 +128,58 @@ class RendererTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 glb, svg, facts = self.render_paths(root)
-                self.assertIsNone(render(source, glb, svg, facts))
-                rendered.append(svg.read_text(encoding="utf-8"))
+                self.assertIsNone(self.render_model(source, glb, svg, facts))
+                rendered.append(
+                    (
+                        svg.read_text(encoding="utf-8"),
+                        tuple(
+                            path.read_text(encoding="utf-8")
+                            for path in self.projection_paths(root)
+                        ),
+                    )
+                )
 
         self.assertEqual(rendered[0], rendered[1])
-        root = ET.fromstring(rendered[0])
-        self.assertEqual(root.tag.rsplit("}", 1)[-1], "svg")
-        self.assertEqual(root.attrib["width"], "640.0")
-        self.assertEqual(root.attrib["height"], "480.0")
-        self.assertNotIn("x-axis", rendered[0])
-        self.assertNotIn("hidden-lines", rendered[0])
+        preview, projections = rendered[0]
+        self.assertEqual(preview, projections[0])
+        for projection in projections:
+            root = ET.fromstring(projection)
+            self.assertEqual(root.tag.rsplit("}", 1)[-1], "svg")
+            self.assertEqual(root.attrib["width"], "640.0")
+            self.assertEqual(root.attrib["height"], "480.0")
+            self.assertNotIn("x-axis", projection)
+            self.assertNotIn("hidden-lines", projection)
+
+    def test_projection_names_and_directions_are_fixed_and_complete(self) -> None:
+        expected = (
+            ("isometric", (1, -1, 1)),
+            ("front", (0, -1, 0)),
+            ("back", (0, 1, 0)),
+            ("left", (-1, 0, 0)),
+            ("right", (1, 0, 0)),
+            ("top", (0, 0, 1)),
+            ("bottom", (0, 0, -1)),
+        )
+        self.assertEqual(PROJECTIONS, expected)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "model.py"
+            source.write_text(
+                "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 2, 3)\n",
+                encoding="utf-8",
+            )
+            glb, svg, facts = self.render_paths(root)
+            generated = '<svg width="640.0" height="480.0"></svg>'
+            with mock.patch("renderer.worker.getSVG", return_value=generated) as get_svg:
+                self.assertIsNone(self.render_model(source, glb, svg, facts))
+
+            self.assertEqual(get_svg.call_count, 7)
+            self.assertEqual(
+                [call.args[1]["projectionDir"] for call in get_svg.call_args_list],
+                [direction for _, direction in expected],
+            )
+            self.assertEqual(svg.read_text(encoding="utf-8"), generated)
 
     def test_cli_suppresses_source_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -148,6 +201,7 @@ class RendererTests(unittest.TestCase):
                     str(glb),
                     str(svg),
                     str(facts),
+                    *(str(path) for path in self.projection_paths(root)),
                 ],
                 check=False,
                 capture_output=True,
@@ -157,7 +211,12 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(completed.stderr, "")
-            self.assertTrue(all(path.exists() for path in (glb, svg, facts)))
+            self.assertTrue(
+                all(
+                    path.exists()
+                    for path in (glb, svg, facts, *self.projection_paths(root))
+                )
+            )
 
     def test_cli_reports_only_a_stable_error_category(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -170,7 +229,14 @@ class RendererTests(unittest.TestCase):
             )
 
             completed = subprocess.run(
-                [sys.executable, "-m", "renderer", str(source), *(str(path) for path in outputs)],
+                [
+                    sys.executable,
+                    "-m",
+                    "renderer",
+                    str(source),
+                    *(str(path) for path in outputs),
+                    *(str(path) for path in self.projection_paths(root)),
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -182,7 +248,9 @@ class RendererTests(unittest.TestCase):
                 completed.stderr,
                 "renderer_error=source_execution_failed\n",
             )
-            self.assertFalse(any(path.exists() for path in outputs))
+            self.assertFalse(
+                any(path.exists() for path in (*outputs, *self.projection_paths(root)))
+            )
 
     def test_cli_rejects_wrong_argument_count(self) -> None:
         completed = subprocess.run(
@@ -206,14 +274,18 @@ class RendererTests(unittest.TestCase):
                 root = Path(directory)
                 source = root / "model.py"
                 source.write_text(source_text, encoding="utf-8")
-                self.assertEqual(render(source, *self.render_paths(root)), expected)
+                self.assertEqual(
+                    self.render_model(source, *self.render_paths(root)), expected
+                )
 
     def test_invalid_utf8_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "model.py"
             source.write_bytes(b"result = '\xff'\n")
-            self.assertEqual(render(source, *self.render_paths(root)), "invalid_utf8")
+            self.assertEqual(
+                self.render_model(source, *self.render_paths(root)), "invalid_utf8"
+            )
 
     def test_invalid_paths_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -227,19 +299,28 @@ class RendererTests(unittest.TestCase):
             dangling_output.symlink_to(root / "missing.svg")
 
             self.assertEqual(
-                render(root / "missing.py", glb, svg, facts),
+                self.render_model(root / "missing.py", glb, svg, facts),
                 "invalid_source_path",
             )
-            self.assertEqual(render(source, source, svg, facts), "invalid_output_path")
-            self.assertEqual(render(source, existing_output, svg, facts), "invalid_output_path")
             self.assertEqual(
-                render(source, root / "missing" / "model.glb", svg, facts),
+                self.render_model(source, source, svg, facts), "invalid_output_path"
+            )
+            self.assertEqual(
+                self.render_model(source, existing_output, svg, facts),
                 "invalid_output_path",
             )
-            self.assertEqual(render(source, glb, glb, facts), "invalid_output_path")
-            self.assertEqual(render(source, glb, svg, svg), "invalid_output_path")
             self.assertEqual(
-                render(source, glb, dangling_output, facts),
+                self.render_model(source, root / "missing" / "model.glb", svg, facts),
+                "invalid_output_path",
+            )
+            self.assertEqual(
+                self.render_model(source, glb, glb, facts), "invalid_output_path"
+            )
+            self.assertEqual(
+                self.render_model(source, glb, svg, svg), "invalid_output_path"
+            )
+            self.assertEqual(
+                self.render_model(source, glb, dangling_output, facts),
                 "invalid_output_path",
             )
             self.assertEqual(existing_output.read_bytes(), b"stale")
@@ -260,8 +341,10 @@ class RendererTests(unittest.TestCase):
                 )
                 outputs = self.render_paths(root)
                 with patcher:
-                    self.assertEqual(render(source, *outputs), expected)
-                self.assertFalse(any(path.exists() for path in outputs))
+                    self.assertEqual(self.render_model(source, *outputs), expected)
+                self.assertFalse(
+                    any(path.exists() for path in (*outputs, *self.projection_paths(root)))
+                )
 
     def test_facts_validator_rejects_nonfinite_and_extra_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

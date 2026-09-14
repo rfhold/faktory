@@ -15,6 +15,15 @@ from cadquery.occ_impl.exporters import getSVG
 from cadquery.occ_impl.exporters.assembly import exportGLTF
 
 ERROR_PREFIX: Final = "renderer_error="
+PROJECTIONS: Final = (
+    ("isometric", (1, -1, 1)),
+    ("front", (0, -1, 0)),
+    ("back", (0, 1, 0)),
+    ("left", (-1, 0, 0)),
+    ("right", (1, 0, 0)),
+    ("top", (0, 0, 1)),
+    ("bottom", (0, 0, -1)),
+)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -139,8 +148,11 @@ def render(
     glb_path: Path,
     svg_path: Path,
     facts_path: Path,
+    projection_paths: tuple[Path, ...],
 ) -> str | None:
-    output_paths = (glb_path, svg_path, facts_path)
+    if len(projection_paths) != len(PROJECTIONS):
+        return "invalid_arguments"
+    output_paths = (glb_path, svg_path, facts_path, *projection_paths)
     path_error = _validate_paths(source_path, output_paths)
     if path_error is not None:
         return path_error
@@ -217,24 +229,32 @@ def render(
         _remove_outputs(output_paths)
         return "invalid_facts"
 
-    try:
-        svg = getSVG(
-            compound,
-            {
-                "width": 640,
-                "height": 480,
-                "marginLeft": 32,
-                "marginTop": 32,
-                "projectionDir": (1, -1, 1),
-                "showAxes": False,
-                "showHidden": False,
-                "strokeColor": (24, 24, 24),
-            },
-        )
-        svg_path.write_text(svg, encoding="utf-8")
-    except BaseException:
-        _remove_outputs(output_paths)
-        return "svg_export_failed"
+    for (name, direction), projection_path in zip(
+        PROJECTIONS, projection_paths, strict=True
+    ):
+        try:
+            svg = getSVG(
+                compound,
+                {
+                    "width": 640,
+                    "height": 480,
+                    "marginLeft": 32,
+                    "marginTop": 32,
+                    "projectionDir": direction,
+                    "showAxes": False,
+                    "showHidden": False,
+                    "strokeColor": (24, 24, 24),
+                },
+            )
+            projection_path.write_text(svg, encoding="utf-8")
+            if name == "isometric":
+                svg_path.write_text(svg, encoding="utf-8")
+        except BaseException:
+            _remove_outputs(output_paths)
+            return "svg_export_failed"
+        if not _validate_svg(projection_path):
+            _remove_outputs(output_paths)
+            return "invalid_svg"
     if not _validate_svg(svg_path):
         _remove_outputs(output_paths)
         return "invalid_svg"
@@ -257,11 +277,17 @@ def render(
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 4:
+    if len(args) != 11:
         print(f"{ERROR_PREFIX}invalid_arguments", file=sys.stderr)
         return 2
 
-    error = render(Path(args[0]), Path(args[1]), Path(args[2]), Path(args[3]))
+    error = render(
+        Path(args[0]),
+        Path(args[1]),
+        Path(args[2]),
+        Path(args[3]),
+        tuple(Path(path) for path in args[4:]),
+    )
     if error is not None:
         print(f"{ERROR_PREFIX}{error}", file=sys.stderr)
         return 1

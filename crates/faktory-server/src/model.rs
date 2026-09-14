@@ -120,6 +120,83 @@ pub struct RenderedOutput {
     pub glb: Bytes,
     pub preview: Bytes,
     pub facts: GeometryFactsRecord,
+    pub projections: TechnicalProjectionImages,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TechnicalProjection {
+    Isometric,
+    Front,
+    Back,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl TechnicalProjection {
+    pub const ALL: [Self; 7] = [
+        Self::Isometric,
+        Self::Front,
+        Self::Back,
+        Self::Left,
+        Self::Right,
+        Self::Top,
+        Self::Bottom,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Isometric => "isometric",
+            Self::Front => "front",
+            Self::Back => "back",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TechnicalProjectionImages {
+    pub isometric: Bytes,
+    pub front: Bytes,
+    pub back: Bytes,
+    pub left: Bytes,
+    pub right: Bytes,
+    pub top: Bytes,
+    pub bottom: Bytes,
+}
+
+impl TechnicalProjectionImages {
+    #[must_use]
+    pub fn all(image: Bytes) -> Self {
+        Self {
+            isometric: image.clone(),
+            front: image.clone(),
+            back: image.clone(),
+            left: image.clone(),
+            right: image.clone(),
+            top: image.clone(),
+            bottom: image,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(&self, projection: TechnicalProjection) -> &Bytes {
+        match projection {
+            TechnicalProjection::Isometric => &self.isometric,
+            TechnicalProjection::Front => &self.front,
+            TechnicalProjection::Back => &self.back,
+            TechnicalProjection::Left => &self.left,
+            TechnicalProjection::Right => &self.right,
+            TechnicalProjection::Top => &self.top,
+            TechnicalProjection::Bottom => &self.bottom,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -550,6 +627,13 @@ impl Repository {
             .await?;
         self.put_immutable(&preview_key(model_id, revision), output.preview.clone())
             .await?;
+        for projection in TechnicalProjection::ALL {
+            self.put_immutable(
+                &projection_key(model_id, revision, projection),
+                output.projections.get(projection).clone(),
+            )
+            .await?;
+        }
         let loaded = self.get_model(model_id).await?;
         if !can_complete_render(&loaded.record, revision, output.facts) {
             return Ok(());
@@ -630,6 +714,24 @@ impl Repository {
         Ok(self
             .store
             .get(&preview_key(model_id, revision))
+            .await?
+            .bytes)
+    }
+
+    pub async fn projection_image(
+        &self,
+        model_id: &str,
+        revision: &str,
+        projection: TechnicalProjection,
+    ) -> Result<Bytes, RepositoryError> {
+        validate_revision(revision)?;
+        let model = self.get_model(model_id).await?.record;
+        if model.current_successful_source_revision != revision {
+            return Err(RepositoryError::NotFound);
+        }
+        Ok(self
+            .store
+            .get(&projection_key(model_id, revision, projection))
             .await?
             .bytes)
     }
@@ -1082,6 +1184,13 @@ pub fn preview_key(model_id: &str, revision: &str) -> String {
     format!("models/{model_id}/revisions/{revision}/preview.svg")
 }
 #[must_use]
+pub fn projection_key(model_id: &str, revision: &str, projection: TechnicalProjection) -> String {
+    format!(
+        "models/{model_id}/revisions/{revision}/projections/{}.png",
+        projection.as_str()
+    )
+}
+#[must_use]
 pub fn view_key(model_id: &str, view_id: &str) -> String {
     format!("models/{model_id}/views/{view_id}.json")
 }
@@ -1102,6 +1211,7 @@ mod tests {
     struct FailingStore {
         inner: InMemoryObjectStore,
         fail_model_put: AtomicBool,
+        fail_projection_put: AtomicBool,
         fail_delete: AtomicBool,
     }
 
@@ -1122,6 +1232,11 @@ mod tests {
             condition: PutCondition,
         ) -> Result<String, StorageError> {
             if key.ends_with("/model.json") && self.fail_model_put.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Unavailable);
+            }
+            if key.contains("/projections/")
+                && self.fail_projection_put.swap(false, Ordering::SeqCst)
+            {
                 return Err(StorageError::Unavailable);
             }
             self.inner.put(key, bytes, condition).await
@@ -1155,6 +1270,7 @@ mod tests {
                     z: 4.0,
                 },
             },
+            projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
         }
     }
 
@@ -1673,6 +1789,17 @@ mod tests {
             .await
             .expect("last good GLB");
         assert_eq!(geometry, Bytes::from_static(b"old"));
+        assert_eq!(
+            repository
+                .projection_image(
+                    &first.id,
+                    &first.desired_source_revision,
+                    TechnicalProjection::Top,
+                )
+                .await
+                .expect("last good projection"),
+            Bytes::from_static(b"png")
+        );
         let model = repository
             .get_model(&first.id)
             .await
@@ -1716,6 +1843,7 @@ mod tests {
             .record;
         let mut replacement = rendered(b"new");
         replacement.preview = Bytes::from_static(b"<svg><path/></svg>");
+        replacement.projections = TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
         replacement.facts.volume_cubic_millimeters = 48.0;
         repository
             .complete_render(
@@ -1742,6 +1870,71 @@ mod tests {
                 .await
                 .expect("preview"),
             replacement.preview
+        );
+    }
+
+    #[tokio::test]
+    async fn projections_are_complete_immutable_and_current_success_gated() {
+        let repository = repository();
+        let first = repository
+            .create_model("part", "Part", b"first")
+            .await
+            .expect("create");
+        repository
+            .complete_render(&first.id, &first.desired_source_revision, rendered(b"old"))
+            .await
+            .expect("first render");
+        let second = repository
+            .edit_model(
+                &first.id,
+                &first.desired_source_revision,
+                None,
+                Some(&[SourcePatch {
+                    old: "first".to_owned(),
+                    new: "second".to_owned(),
+                }]),
+            )
+            .await
+            .expect("edit")
+            .record;
+        let mut replacement = rendered(b"new");
+        replacement.projections = TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
+        repository
+            .complete_render(&second.id, &second.desired_source_revision, replacement)
+            .await
+            .expect("replacement render");
+
+        for projection in TechnicalProjection::ALL {
+            assert_eq!(
+                repository
+                    .projection_image(&second.id, &second.desired_source_revision, projection)
+                    .await
+                    .expect("current projection"),
+                Bytes::from_static(b"new-png")
+            );
+            assert_eq!(
+                repository
+                    .store
+                    .get(&projection_key(
+                        &first.id,
+                        &first.desired_source_revision,
+                        projection,
+                    ))
+                    .await
+                    .expect("immutable old projection")
+                    .bytes,
+                Bytes::from_static(b"png")
+            );
+        }
+        assert_eq!(
+            repository
+                .projection_image(
+                    &first.id,
+                    &first.desired_source_revision,
+                    TechnicalProjection::Front,
+                )
+                .await,
+            Err(RepositoryError::NotFound)
         );
     }
 
@@ -1778,6 +1971,27 @@ mod tests {
         let completed = repository.get_model(&model.id).await.expect("model").record;
         assert_eq!(completed.render_state, StoredRenderState::Ready);
         assert_eq!(completed.current_successful_facts, Some(output.facts));
+    }
+
+    #[tokio::test]
+    async fn projection_storage_failure_cannot_advance_current_success() {
+        let store = Arc::new(FailingStore::default());
+        let repository = Repository::new(store.clone(), 8);
+        let model = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        store.fail_projection_put.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            repository
+                .complete_render(&model.id, &model.desired_source_revision, rendered(b"glb"),)
+                .await,
+            Err(RepositoryError::Unavailable)
+        );
+        let unchanged = repository.get_model(&model.id).await.expect("model").record;
+        assert_eq!(unchanged.render_state, StoredRenderState::Pending);
+        assert!(unchanged.current_successful_source_revision.is_empty());
     }
 
     #[tokio::test]

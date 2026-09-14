@@ -9,10 +9,11 @@ models/{model_id}/model.json
 models/{model_id}/revisions/{source_sha256}/source.py
 models/{model_id}/revisions/{source_sha256}/model.glb
 models/{model_id}/revisions/{source_sha256}/preview.svg
+models/{model_id}/revisions/{source_sha256}/projections/{projection}.png
 models/{model_id}/views/{view_id}.json
 ```
 
-`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. View IDs and etags are server-issued opaque UUIDs. `source_sha256` is the lowercase hexadecimal SHA-256 of the exact accepted source bytes. Revision source objects are immutable. Each successful revision owns immutable `model.glb` and `preview.svg` objects. Model and view creation and all immutable writes retain the object store's atomic `If-None-Match: *` request. For matched mutable `model.json` and view JSON updates and deletes, the process serializes mutations, reads the current object ETag, rejects a mismatch, and then sends an unconditional mutation. This is process-local optimistic concurrency, not distributed atomic compare-and-swap; it is safe only while the deployment enforces one server replica with a `Recreate` strategy.
+`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. View IDs and etags are server-issued opaque UUIDs. `source_sha256` is the lowercase hexadecimal SHA-256 of the exact accepted source bytes. Revision source objects are immutable. Each new successful revision owns immutable `model.glb`, `preview.svg`, and seven projection PNGs. `projection` is selected only from `isometric`, `front`, `back`, `left`, `right`, `top`, and `bottom`; arbitrary object-key input is forbidden. Model and view creation and all immutable writes retain the object store's atomic `If-None-Match: *` request. For matched mutable `model.json` and view JSON updates and deletes, the process serializes mutations, reads the current object ETag, rejects a mismatch, and then sends an unconditional mutation. This is process-local optimistic concurrency, not distributed atomic compare-and-swap; it is safe only while the deployment enforces one server replica with a `Recreate` strategy.
 
 `model.json` is the authority for display name, desired source revision, current successful source revision, render state, safe render error, default view ID, optional current-successful facts, and `updated_at`. Facts belong to the recorded current successful revision. They contain total volume in cubic millimetres and source-coordinate axis-aligned x/y/z dimensions in millimetres. Each view object contains the protobuf-equivalent camera fields and etag metadata. JSON schema details must be fixed with the storage adapter; implementations must not infer an alternative key layout.
 
@@ -36,12 +37,15 @@ A name-only edit updates metadata without a source revision, render work, or ren
 
 1. Validate the edited UTF-8 source, compute `source_sha256`, and persist immutable `source.py` before marking that revision desired.
 2. Set the desired revision and render state to `PENDING`, then `RENDERING` when work starts.
-3. Preserve the current successful revision, GLB, preview, and facts while the replacement renders.
+3. Preserve the current successful revision, GLB, preview, projections, and facts while the replacement renders.
 4. Compute facts from the CadQuery result before glTF export. Sum compound or assembly component volumes without a boolean union, so overlaps can count independently.
-5. Compute source-coordinate axis-aligned dimensions before glTF export, then produce and validate temporary GLB and SVG outputs.
-6. Store immutable `model.glb` and `preview.svg` only after all outputs and facts pass validation.
-7. After both writes succeed, atomically advance the current successful revision, replace its facts, clear the safe error, and set `READY`.
-8. On any failure, preserve the prior current successful revision, artifacts, and facts. Set the desired revision state to `FAILED` and record only a safe bounded error.
+5. Compute source-coordinate axis-aligned dimensions before glTF export, then produce and validate temporary GLB, preview SVG, and seven 640x480 projection SVG outputs. CadQuery projection directions are fixed as isometric `(1,-1,1)`, front `(0,-1,0)`, back `(0,1,0)`, left `(-1,0,0)`, right `(1,0,0)`, top `(0,0,1)`, and bottom `(0,0,-1)`.
+6. Rasterize projection SVGs onto an opaque white background inside the bounded Rust render worker with pinned, minimal-feature `resvg` 0.45.1. Each PNG must be exactly 640x480 and no larger than 512 KiB. MCP requests never execute source or rasterize images.
+7. Store immutable `model.glb`, `preview.svg`, and every projection PNG only after all outputs and facts pass validation.
+8. Only after every artifact write succeeds, atomically advance the current successful revision, replace its facts, clear the safe error, and set `READY`.
+9. On any failure, preserve the prior current successful revision, artifacts, and facts. Set the desired revision state to `FAILED` and record only a safe bounded error.
+
+Revisions rendered before projection support are not backfilled. They retain their existing GLB and preview behavior, but projection inspection reports a safe not-found error until a subsequent successful source render populates all seven images.
 
 The one server replica uses an in-process bounded rendering queue. On restart, models left `PENDING` are queued without rewriting `model.json`; interrupted `RENDERING` models are reset to `PENDING` before being queued. Reconciliation is serialized with repository mutations. Queue limits, renderer timeout, output limits, and subprocess behavior are explicit runtime configuration.
 

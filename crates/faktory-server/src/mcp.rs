@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use mcp::{
     McpProtectedResourceMetadata, McpToolCall, McpToolDefinition, McpToolResult,
     OAuthAuthorizationServer,
@@ -14,8 +15,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{ModelRecord, Repository, RepositoryError, SourcePatch},
-    render::RenderQueue,
+    model::{ModelRecord, Repository, RepositoryError, SourcePatch, TechnicalProjection},
+    render::{PROJECTION_HEIGHT, PROJECTION_WIDTH, RenderQueue, validate_projection_png},
 };
 
 #[derive(Clone, Debug)]
@@ -84,6 +85,19 @@ impl FaktoryMcp {
         let input: ModelIdInput = parse(call)?;
         match get_model_with_source(&self.repository, &input.model_id).await {
             Ok((model, source)) => Ok(model_get_result(model, source)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "model.inspect", definition = model_inspect_definition())]
+    async fn model_inspect(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: InspectInput = parse(call)?;
+        match inspect_model(&self.repository, &input.model_id, input.projection).await {
+            Ok(result) => Ok(result),
             Err(error) => Ok(tool_error(error)),
         }
     }
@@ -205,6 +219,50 @@ fn model_get_result(model: ModelRecord, source: String) -> McpToolResult {
     result(json!({ "model": model, "source": source }))
 }
 
+async fn inspect_model(
+    repository: &Repository,
+    model_id: &str,
+    projection: TechnicalProjection,
+) -> Result<McpToolResult, RepositoryError> {
+    let model = repository.get_model(model_id).await?.record;
+    let rendered_revision = model.current_successful_source_revision.clone();
+    if rendered_revision.is_empty() {
+        return Err(RepositoryError::NotFound);
+    }
+    let image = repository
+        .projection_image(model_id, &rendered_revision, projection)
+        .await?;
+    validate_projection_png(&image).map_err(|_| RepositoryError::Corrupt)?;
+    let stale = model.desired_source_revision != rendered_revision;
+    let text = if stale {
+        format!(
+            "Warning: showing the last successful {} projection; the desired revision is not rendered.",
+            projection.as_str()
+        )
+    } else {
+        format!("{} technical projection.", projection.as_str())
+    };
+    let metadata = json!({
+        "model_id": model.id,
+        "projection": projection,
+        "width": PROJECTION_WIDTH,
+        "height": PROJECTION_HEIGHT,
+        "desired_revision": model.desired_source_revision,
+        "rendered_revision": rendered_revision,
+        "render_state": model.render_state,
+        "mime_type": "image/png",
+        "stale": stale
+    });
+    Ok(McpToolResult::new(json!({
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "image", "data": BASE64.encode(image), "mimeType": "image/png" }
+        ],
+        "structuredContent": { "metadata": metadata },
+        "isError": false
+    })))
+}
+
 async fn create_and_schedule(
     repository: Repository,
     renders: RenderQueue,
@@ -290,6 +348,13 @@ async fn join_scheduled<T>(
 #[serde(deny_unknown_fields)]
 struct ModelIdInput {
     model_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectInput {
+    model_id: String,
+    projection: TechnicalProjection,
 }
 
 #[derive(Deserialize)]
@@ -436,6 +501,26 @@ fn model_get_definition() -> McpToolDefinition {
         model_id_schema(),
     )
 }
+fn model_inspect_definition() -> McpToolDefinition {
+    definition(
+        "model.inspect",
+        "Return one bounded technical projection from the current successful render.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "model_id": model_id_property(),
+                "projection": {
+                    "type": "string",
+                    "enum": ["isometric", "front", "back", "left", "right", "top", "bottom"],
+                    "description": "Canonical technical projection."
+                }
+            },
+            "required": ["model_id", "projection"],
+            "additionalProperties": false
+        }),
+    )
+}
 fn model_retry_definition() -> McpToolDefinition {
     definition(
         "model.render.retry",
@@ -564,13 +649,19 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
     use bytes::Bytes;
     use tokio::sync::Semaphore;
+    use tower::ServiceExt as _;
 
     use super::*;
     use crate::{
         model::{
-            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, StoredRenderState, source_key,
+            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, StoredRenderState,
+            TechnicalProjectionImages, source_key,
         },
         render::RenderConfig,
         storage::{InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject},
@@ -687,6 +778,36 @@ mod tests {
         }
     }
 
+    fn valid_projection_png() -> Bytes {
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(PROJECTION_WIDTH, PROJECTION_HEIGHT)
+            .expect("projection pixmap");
+        pixmap.fill(resvg::tiny_skia::Color::WHITE);
+        Bytes::from(pixmap.encode_png().expect("encode projection PNG"))
+    }
+
+    fn pseudo_projection_png() -> Bytes {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&PROJECTION_WIDTH.to_be_bytes());
+        bytes.extend_from_slice(&PROJECTION_HEIGHT.to_be_bytes());
+        Bytes::from(bytes)
+    }
+
+    fn rendered_output(image: Bytes) -> RenderedOutput {
+        RenderedOutput {
+            glb: Bytes::from_static(b"glb"),
+            preview: Bytes::from_static(b"<svg></svg>"),
+            facts: GeometryFactsRecord {
+                volume_cubic_millimeters: 1.0,
+                size_millimeters: GeometrySizeRecord {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 1.0,
+                },
+            },
+            projections: TechnicalProjectionImages::all(image),
+        }
+    }
+
     #[test]
     fn successful_result_puts_complete_json_in_text_and_structured_content() {
         let output = json!({
@@ -754,6 +875,7 @@ mod tests {
                             z: 1.0,
                         },
                     },
+                    projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
                 },
             )
             .await
@@ -788,6 +910,270 @@ mod tests {
             model.desired_source_revision,
             model.current_successful_source_revision
         );
+    }
+
+    #[tokio::test]
+    async fn model_inspect_returns_one_semantic_png_with_fresh_metadata() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let created = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        let image = valid_projection_png();
+        repository
+            .complete_render(
+                &created.id,
+                &created.desired_source_revision,
+                rendered_output(image.clone()),
+            )
+            .await
+            .expect("complete render");
+
+        let output = inspect_model(&repository, "part", TechnicalProjection::Front)
+            .await
+            .expect("inspect result")
+            .raw;
+
+        assert_eq!(output["isError"], false);
+        assert_eq!(output["content"].as_array().unwrap().len(), 2);
+        assert_eq!(output["content"][0]["type"], "text");
+        assert_eq!(output["content"][1]["type"], "image");
+        assert_eq!(output["content"][1]["mimeType"], "image/png");
+        let decoded = BASE64
+            .decode(output["content"][1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, image);
+        validate_projection_png(&decoded).expect("semantic image is a valid projection PNG");
+        let metadata = &output["structuredContent"]["metadata"];
+        assert_eq!(metadata["model_id"], "part");
+        assert_eq!(metadata["projection"], "front");
+        assert_eq!(metadata["width"], 640);
+        assert_eq!(metadata["height"], 480);
+        assert_eq!(
+            metadata["desired_revision"],
+            created.desired_source_revision
+        );
+        assert_eq!(
+            metadata["rendered_revision"],
+            created.desired_source_revision
+        );
+        assert_eq!(metadata["render_state"], "READY");
+        assert_eq!(metadata["mime_type"], "image/png");
+        assert_eq!(metadata["stale"], false);
+        assert!(
+            !metadata
+                .to_string()
+                .contains(output["content"][1]["data"].as_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn streamable_http_tools_call_preserves_semantic_image_block() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let model = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        repository
+            .complete_render(
+                &model.id,
+                &model.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete render");
+        let renders = RenderQueue::start(
+            repository.clone(),
+            RenderConfig {
+                command: vec!["unused".to_owned()],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 1024,
+            },
+        )
+        .expect("render queue");
+        let router = FaktoryMcp::new(repository, renders).router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "model.inspect")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "model.inspect",
+                        "arguments": {"model_id": "part", "projection": "right"},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                            "io.modelcontextprotocol/clientInfo": {
+                                "name": "faktory-test",
+                                "version": "1.0.0"
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("MCP request");
+
+        let response = router.oneshot(request).await.expect("MCP response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        assert_eq!(status, StatusCode::OK, "MCP response: {body:?}");
+        let body = std::str::from_utf8(&body).expect("UTF-8 response");
+        let payload = body
+            .strip_prefix("data: ")
+            .and_then(|body| body.strip_suffix("\n\n"))
+            .unwrap_or(body);
+        let response: Value = serde_json::from_str(payload).expect("JSON-RPC response");
+        let content = response["result"]["content"]
+            .as_array()
+            .expect("semantic content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let image = BASE64
+            .decode(content[1]["data"].as_str().expect("image data"))
+            .expect("base64 image");
+        validate_projection_png(&image).expect("transported projection PNG");
+    }
+
+    #[tokio::test]
+    async fn model_inspect_returns_last_good_with_warning_when_stale() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let created = repository
+            .create_model("part", "Part", b"first")
+            .await
+            .expect("create model");
+        repository
+            .complete_render(
+                &created.id,
+                &created.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete render");
+        let edited = repository
+            .edit_model(
+                "part",
+                &created.desired_source_revision,
+                None,
+                Some(&[SourcePatch {
+                    old: "first".to_owned(),
+                    new: "second".to_owned(),
+                }]),
+            )
+            .await
+            .expect("edit model")
+            .record;
+
+        let output = inspect_model(&repository, "part", TechnicalProjection::Top)
+            .await
+            .expect("last-good inspect")
+            .raw;
+        assert!(
+            output["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Warning:")
+        );
+        assert_eq!(output["structuredContent"]["metadata"]["stale"], true);
+        assert_eq!(
+            output["structuredContent"]["metadata"]["desired_revision"],
+            edited.desired_source_revision
+        );
+        assert_eq!(
+            output["structuredContent"]["metadata"]["rendered_revision"],
+            created.desired_source_revision
+        );
+        assert_eq!(
+            output["structuredContent"]["metadata"]["render_state"],
+            "PENDING"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_inspect_safely_errors_without_a_successful_image() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+
+        let error = inspect_model(&repository, "part", TechnicalProjection::Bottom)
+            .await
+            .expect_err("no successful render");
+        let output = tool_error(error).raw;
+        assert_eq!(output["isError"], true);
+        assert_eq!(output["structuredContent"]["error"]["code"], "not_found");
+        assert_eq!(output["content"].as_array().unwrap().len(), 1);
+
+        let store = Arc::new(InMemoryObjectStore::default());
+        let legacy_repository = Repository::new(store.clone(), 1);
+        let rendered = legacy_repository
+            .create_model("legacy", "Legacy", b"source")
+            .await
+            .expect("create legacy model");
+        legacy_repository
+            .complete_render(
+                &rendered.id,
+                &rendered.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete legacy fixture");
+        let key = crate::model::projection_key(
+            &rendered.id,
+            &rendered.desired_source_revision,
+            TechnicalProjection::Bottom,
+        );
+        let image = store.get(&key).await.expect("stored image");
+        store.delete(&key, &image.etag).await.expect("remove image");
+        let missing = inspect_model(&legacy_repository, "legacy", TechnicalProjection::Bottom)
+            .await
+            .expect_err("legacy image absent");
+        assert_eq!(
+            tool_error(missing).raw["structuredContent"]["error"]["code"],
+            "not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_inspect_maps_corrupt_projection_to_safe_invalid_state() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let model = repository
+            .create_model("corrupt", "Corrupt", b"source")
+            .await
+            .expect("create corrupt model");
+        repository
+            .complete_render(
+                &model.id,
+                &model.desired_source_revision,
+                rendered_output(pseudo_projection_png()),
+            )
+            .await
+            .expect("complete corrupt fixture");
+
+        let error = inspect_model(&repository, "corrupt", TechnicalProjection::Isometric)
+            .await
+            .expect_err("corrupt image rejected");
+        let output = tool_error(error).raw;
+        assert_eq!(output["isError"], true);
+        assert_eq!(
+            output["structuredContent"]["error"]["code"],
+            "invalid_state"
+        );
+        assert_eq!(output["content"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -950,6 +1336,26 @@ mod tests {
             "^[0-9a-f]{64}$"
         );
         assert_eq!(edit.input_schema["anyOf"].as_array().map(Vec::len), Some(2));
+
+        let inspect = model_inspect_definition();
+        assert_eq!(inspect.name, "model.inspect");
+        assert_eq!(
+            inspect.input_schema["properties"]["projection"]["enum"],
+            json!([
+                "isometric",
+                "front",
+                "back",
+                "left",
+                "right",
+                "top",
+                "bottom"
+            ])
+        );
+        assert_eq!(
+            inspect.input_schema["required"],
+            json!(["model_id", "projection"])
+        );
+        assert_eq!(inspect.input_schema["additionalProperties"], false);
     }
 
     #[tokio::test]

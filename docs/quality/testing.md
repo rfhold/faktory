@@ -57,13 +57,15 @@ Watch tests must prove that the first event is exactly one authoritative snapsho
 
 ## Required Storage and Render Coverage
 
-Adapter and renderer tests cover exact S3 keys, lowercase source digests, UTF-8 rejection, immutable revision writes, accepted CadQuery result types, invalid or absent `result`, GLB validation, bounded execution, restart reconciliation, and conditional view writes. Exact-key coverage includes `models/{model_id}/revisions/{source_sha256}/preview.svg`.
+Adapter and renderer tests cover exact S3 keys, lowercase source digests, UTF-8 rejection, immutable revision writes, accepted CadQuery result types, invalid or absent `result`, GLB validation, bounded execution, restart reconciliation, and conditional view writes. Exact-key coverage includes `models/{model_id}/revisions/{source_sha256}/preview.svg` and every closed `models/{model_id}/revisions/{source_sha256}/projections/{projection}.png` key.
 
 Renderer tests must validate total compound and assembly component volume in cubic millimetres. Overlap fixtures must prove that components count independently without a boolean union. Tests must validate source-coordinate axis-aligned x/y/z dimensions in millimetres before glTF export.
 
-Renderer tests must validate non-empty, well-formed SVG output and GLB output. Missing or malformed output and invalid facts must fail the render before artifact storage or metadata advancement.
+Renderer tests must validate non-empty, well-formed SVG output and GLB output, fixed projection names and vectors, deterministic generation, and all seven projection outputs. Rust rasterization tests must validate PNG signatures, exact 640x480 dimensions, deterministic bytes, an opaque white untouched background pixel, the 512 KiB per-image cap, and complete output construction. Missing, oversized, or malformed output and invalid facts must fail the render before metadata advancement.
 
-Replacement tests must prove atomic current-success advancement only after both immutable artifact writes and valid facts. No model record can expose artifacts or facts from mixed revisions. Every earlier failure must preserve the prior revision, GLB, preview, and facts. Pending and rendering replacements must preserve the same last-good data. A first-render failure must leave both artifacts and facts unavailable while it exposes safe failure state.
+Replacement tests must prove atomic current-success advancement only after every immutable artifact write and valid facts. No model record can expose artifacts or facts from mixed revisions. Every earlier failure must preserve the prior revision, GLB, preview, projections, and facts. Pending and rendering replacements must preserve the same last-good data. A first-render failure must leave all artifacts and facts unavailable while it exposes safe failure state. Projection access must enforce the current-success revision gate, immutable key behavior, legacy-image absence, and retained last-good behavior.
+
+MCP tests cover the exact `model.inspect` projection schema, one validated semantic PNG image block, metadata without image bytes, fresh and stale revision semantics, explicit stale warning text, and safe errors for no successful render, a missing legacy image, or corrupt stored PNG bytes. Streamable HTTP coverage exercises a stateless `tools/call` through the actual Faktory MCP router and proves that the semantic image block survives transport.
 
 Timestamp tests must prove that accepted model creates, source edits, and name edits change `updated_at`. Render-state transitions and view mutations must preserve it.
 
@@ -75,7 +77,7 @@ Preview route tests must cover production session enforcement and disabled-mode 
 
 Catalog tests must prove one row per model and lazy preview fetches. They must verify semantic labels for volume and x/y/z dimensions. Models without successful geometry must show unavailable facts. Accessibility tests must cover useful preview alternatives, keyboard access, and status announcements. Responsive tests must cover narrow and wide viewports without clipped facts or controls.
 
-Negative tests must prove that credentials, tokens, Python source, GLB or SVG bytes, object-store internals, and raw renderer output do not leak through server logs, traces, metrics, errors, protobuf responses, or browser responses. Exact source is intentionally allowed only in authorized MCP `model.get` results. Browser testing instead enforces the explicit Faro boundary in [`../architecture/observability.md`](../architecture/observability.md): Faktory-owned values are bounded, while accepted standard instrumentation can collect URLs, console, exception, browser, resource, and session metadata.
+Negative tests must prove that credentials, tokens, Python source, GLB, SVG, or PNG bytes, object-store internals, and raw renderer output do not leak through server logs, traces, metrics, errors, protobuf responses, or browser responses. Exact source is intentionally allowed only in authorized MCP `model.get` results, and one projection PNG is intentionally allowed only in authorized MCP `model.inspect` results. Browser testing instead enforces the explicit Faro boundary in [`../architecture/observability.md`](../architecture/observability.md): Faktory-owned values are bounded, while accepted standard instrumentation can collect URLs, console, exception, browser, resource, and session metadata.
 
 ## Evidence Boundary
 

@@ -31,6 +31,7 @@ opentelemetry_sdk.workspace = true
 prost-types.workspace = true
 pyroscope.workspace = true
 quick-xml.workspace = true
+resvg.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true

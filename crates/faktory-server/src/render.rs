@@ -20,8 +20,13 @@ use tokio::{
 };
 
 use crate::model::{
-    GeometryFactsRecord, RenderedOutput, Repository, RepositoryError, validate_geometry_facts,
+    GeometryFactsRecord, RenderedOutput, Repository, RepositoryError, TechnicalProjection,
+    TechnicalProjectionImages, validate_geometry_facts,
 };
+
+pub(crate) const PROJECTION_WIDTH: u32 = 640;
+pub(crate) const PROJECTION_HEIGHT: u32 = 480;
+pub(crate) const MAX_PROJECTION_IMAGE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
 pub struct RenderConfig {
@@ -294,6 +299,11 @@ async fn render(
     let glb_path = directory.path().join("model.glb");
     let preview_path = directory.path().join("preview.svg");
     let facts_path = directory.path().join("facts.json");
+    let projection_paths = TechnicalProjection::ALL.map(|projection| {
+        directory
+            .path()
+            .join(format!("projection-{}.svg", projection.as_str()))
+    });
     tokio::fs::write(&source_path, source)
         .await
         .map_err(|_| "temporary storage unavailable")?;
@@ -304,6 +314,7 @@ async fn render(
         .arg(&glb_path)
         .arg(&preview_path)
         .arg(&facts_path)
+        .args(&projection_paths)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -323,11 +334,80 @@ async fn render(
     let glb = read_glb(&glb_path, config.max_output_bytes).await?;
     let preview = read_svg(&preview_path, config.max_output_bytes).await?;
     let facts = read_facts(&facts_path, config.max_output_bytes).await?;
+    let mut projection_images = Vec::with_capacity(TechnicalProjection::ALL.len());
+    for path in &projection_paths {
+        let svg = read_svg(path, config.max_output_bytes).await?;
+        projection_images.push(rasterize_projection(&svg)?);
+    }
+    let [isometric, front, back, left, right, top, bottom] = projection_images
+        .try_into()
+        .map_err(|_| "renderer produced incomplete projections")?;
     Ok(RenderedOutput {
         glb,
         preview,
         facts,
+        projections: TechnicalProjectionImages {
+            isometric,
+            front,
+            back,
+            left,
+            right,
+            top,
+            bottom,
+        },
     })
+}
+
+fn rasterize_projection(svg: &[u8]) -> Result<Bytes, &'static str> {
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+        .map_err(|_| "rendered projection is invalid")?;
+    let expected_size =
+        resvg::tiny_skia::Size::from_wh(640.0, 480.0).ok_or("invalid projection dimensions")?;
+    if tree.size() != expected_size {
+        return Err("rendered projection has invalid dimensions");
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(PROJECTION_WIDTH, PROJECTION_HEIGHT)
+        .ok_or("projection rasterization failed")?;
+    pixmap.fill(resvg::tiny_skia::Color::WHITE);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
+    let png = pixmap
+        .encode_png()
+        .map_err(|_| "projection encoding failed")?;
+    validate_projection_png(&png)?;
+    Ok(Bytes::from(png))
+}
+
+pub(crate) fn validate_projection_png(png: &[u8]) -> Result<(), &'static str> {
+    if png.len() > MAX_PROJECTION_IMAGE_BYTES
+        || png.len() < 24
+        || &png[..8] != b"\x89PNG\r\n\x1a\n"
+        || &png[12..16] != b"IHDR"
+        || u32::from_be_bytes(
+            png[16..20]
+                .try_into()
+                .map_err(|_| "rendered projection is invalid")?,
+        ) != PROJECTION_WIDTH
+        || u32::from_be_bytes(
+            png[20..24]
+                .try_into()
+                .map_err(|_| "rendered projection is invalid")?,
+        ) != PROJECTION_HEIGHT
+    {
+        return Err("rendered projection has invalid size");
+    }
+    let decoded =
+        resvg::tiny_skia::Pixmap::decode_png(png).map_err(|_| "rendered projection is invalid")?;
+    if decoded.width() != PROJECTION_WIDTH
+        || decoded.height() != PROJECTION_HEIGHT
+        || decoded.pixels().iter().any(|pixel| pixel.alpha() != 255)
+    {
+        return Err("rendered projection is invalid");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -731,6 +811,13 @@ mod tests {
         bytes
     }
 
+    fn pseudo_projection_png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&PROJECTION_WIDTH.to_be_bytes());
+        bytes.extend_from_slice(&PROJECTION_HEIGHT.to_be_bytes());
+        bytes
+    }
+
     fn rendered_output(glb: &'static [u8]) -> RenderedOutput {
         RenderedOutput {
             glb: Bytes::from_static(glb),
@@ -743,6 +830,7 @@ mod tests {
                     z: 1.0,
                 },
             },
+            projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
         }
     }
 
@@ -844,14 +932,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rasterizes_deterministic_bounded_pngs() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"><path d="M10 10L100 100" stroke="#000"/></svg>"##;
+        let first = rasterize_projection(svg).expect("rasterize SVG");
+        let second = rasterize_projection(svg).expect("rasterize SVG again");
+
+        assert_eq!(first, second);
+        assert!(first.len() <= MAX_PROJECTION_IMAGE_BYTES);
+        assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(u32::from_be_bytes(first[16..20].try_into().unwrap()), 640);
+        assert_eq!(u32::from_be_bytes(first[20..24].try_into().unwrap()), 480);
+        let decoded = resvg::tiny_skia::Pixmap::decode_png(&first).expect("decode PNG");
+        let background = decoded.pixel(639, 479).expect("background pixel");
+        assert_eq!(
+            (
+                background.red(),
+                background.green(),
+                background.blue(),
+                background.alpha(),
+            ),
+            (255, 255, 255, 255)
+        );
+        assert!(rasterize_projection(b"not svg").is_err());
+
+        let mut wrong_dimensions = first.to_vec();
+        wrong_dimensions[16..20].copy_from_slice(&639_u32.to_be_bytes());
+        assert!(validate_projection_png(&wrong_dimensions).is_err());
+        let oversized = vec![0; MAX_PROJECTION_IMAGE_BYTES + 1];
+        assert!(validate_projection_png(&oversized).is_err());
+        let pseudo_png = pseudo_projection_png();
+        assert!(validate_projection_png(&pseudo_png).is_err());
+        let transparent = resvg::tiny_skia::Pixmap::new(PROJECTION_WIDTH, PROJECTION_HEIGHT)
+            .expect("transparent pixmap")
+            .encode_png()
+            .expect("encode transparent PNG");
+        assert!(validate_projection_png(&transparent).is_err());
+    }
+
+    #[test]
+    fn rejects_projection_svgs_without_exact_intrinsic_dimensions() {
+        for invalid in [
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><path/></svg>"#.as_slice(),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="639" height="480"><path/></svg>"#,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="479"><path/></svg>"#,
+        ] {
+            assert!(rasterize_projection(invalid).is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn renderer_receives_four_paths_and_returns_all_outputs() {
+    async fn renderer_receives_all_projection_paths_and_returns_complete_outputs() {
         let directory = tempfile::tempdir().expect("temp directory");
         let script_path = directory.path().join("renderer.sh");
         tokio::fs::write(
             &script_path,
-            b"test \"$#\" -eq 4 || exit 2\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$2\"\nprintf '<svg></svg>' > \"$3\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4\"\n",
+            b"test \"$#\" -eq 11 || exit 2\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$2\"\nprintf '<svg></svg>' > \"$3\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4\"\nfor output in \"$5\" \"$6\" \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
         )
         .await
         .expect("write renderer");
@@ -880,6 +1017,9 @@ mod tests {
         .await
         .expect("render outputs");
         assert_eq!(output.glb, glb_fixture(None));
+        for projection in TechnicalProjection::ALL {
+            validate_projection_png(output.projections.get(projection)).expect("valid PNG");
+        }
         assert_eq!(output.preview, Bytes::from_static(b"<svg></svg>"));
         assert!((output.facts.volume_cubic_millimeters - 24.0).abs() < f64::EPSILON);
     }

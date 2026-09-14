@@ -8,7 +8,7 @@
 
 `faktory.v1.FaktoryService` provides unary `ListModels`, `GetModel`, `ListViews`, `PutView`, `DeleteView`, and `SetDefaultView`, plus server-streaming `WatchModels`. Production requires an authenticated browser session at the gRPC-web boundary. Explicit disabled mode admits the same calls without credentials for loopback-only Compose use.
 
-MCP model source tools are outside the protobuf service contract. `model.get` returns model metadata together with the exact UTF-8 source for its desired revision. [`storage-rendering.md`](storage-rendering.md) defines caller-supplied model IDs and the `model.create` and `model.edit` source contract. Protobuf model records remain metadata-only, and protobuf model ID fields remain strings.
+MCP model tools are outside the protobuf service contract. `model.get` returns model metadata together with the exact UTF-8 source for its desired revision. `model.inspect` accepts a model ID and one closed projection enum value. It returns a text block, exactly one base64 `image/png` block, structured metadata without image bytes, and `isError: false`. Metadata contains model ID, projection, 640x480 dimensions, desired and rendered revisions, desired-revision render state, MIME type, and `stale`, where `stale` is true exactly when desired and rendered revisions differ. A stale result remains useful by returning the retained last-good image with explicit warning text. A model without a successful render or a legacy successful revision without projection images returns a safe tool error. [`storage-rendering.md`](storage-rendering.md) defines caller-supplied model IDs and the `model.create` and `model.edit` source contract. Protobuf model records remain metadata-only, and protobuf model ID fields remain strings.
 
 `Model.desired_source_revision` is the lowercase SHA-256 selected by the latest accepted source creation or edit. `current_successful_source_revision` identifies the revision whose GLB, preview, and facts remain available. They differ during a render and after a failed replacement, except that an explicit same-source rerender keeps them equal while work is pending. `render_state` describes work for the desired revision; `render_error` is empty except for a safe, bounded failure summary.
 
@@ -30,7 +30,7 @@ A named view stores an ID, display name, target XYZ, rotation quaternion XYZW, p
 
 ## Artifact HTTP
 
-Geometry bytes and preview bytes never travel in protobuf messages. Metadata facts and `updated_at` travel in complete `Model` records.
+Geometry, preview, and projection bytes never travel in protobuf messages. Metadata facts and `updated_at` travel in complete `Model` records. Projection PNGs travel only in semantic MCP image results, never through browser artifact URLs.
 
 The server exposes `GET /artifacts/{model_id}/{revision}/model.glb` and `GET /artifacts/{model_id}/{revision}/preview.svg`. Production requires a browser session. Explicit disabled mode requires no credentials. Each route serves an artifact only when `revision` matches the model's current successful revision. This gate includes the retained last-good revision after a failed replacement. A model without a successful render returns `404`. A request for any other revision also returns `404`.
 

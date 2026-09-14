@@ -766,6 +766,9 @@ mod tests {
                     z: 4.0,
                 },
             },
+            projections: crate::model::TechnicalProjectionImages::all(bytes::Bytes::from_static(
+                b"png",
+            )),
         }
     }
 

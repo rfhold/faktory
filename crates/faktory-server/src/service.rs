@@ -178,7 +178,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{GeometryFactsRecord, GeometrySizeRecord, RenderedOutput},
+        model::{
+            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, TechnicalProjectionImages,
+        },
         storage::InMemoryObjectStore,
     };
 
@@ -194,6 +196,7 @@ mod tests {
                     z: 4.0,
                 },
             },
+            projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
         }
     }
 
