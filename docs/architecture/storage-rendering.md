@@ -30,7 +30,7 @@ The production stack sets `protectData=true`, which applies Pulumi protection to
 
 `model.edit` requires `model_id`, `expected_revision`, and at least one of `name` or a non-empty `patches` array. Each patch contains `old` and `new`. The server applies patches sequentially to the desired source. Each non-empty `old` value must match exactly once at its step. The server rejects a stale revision, an empty `old`, a missing or ambiguous match, and an overall no-op source edit.
 
-A name-only edit updates metadata without a source revision, render work, or render-state change. Source creation and source edits are MCP-only. The browser has no source editor or source mutation route.
+A name-only edit updates metadata without a source revision, render work, or render-state change. MCP `model.get` loads model metadata first, then returns the immutable UTF-8 source selected by that record's desired revision. MCP `model.list`, protobuf responses, and browser responses remain metadata-only. Source retrieval, creation, and edits are MCP-only; the browser has no source route or editor.
 
 ## Replacement Rendering
 

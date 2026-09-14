@@ -8,7 +8,7 @@
 
 `faktory.v1.FaktoryService` provides unary `ListModels`, `GetModel`, `ListViews`, `PutView`, `DeleteView`, and `SetDefaultView`, plus server-streaming `WatchModels`. Production requires an authenticated browser session at the gRPC-web boundary. Explicit disabled mode admits the same calls without credentials for loopback-only Compose use.
 
-MCP model mutation tools are outside the protobuf service contract. [`storage-rendering.md`](storage-rendering.md) defines caller-supplied model IDs and the `model.create` and `model.edit` source contract. Protobuf model ID fields remain strings.
+MCP model source tools are outside the protobuf service contract. `model.get` returns model metadata together with the exact UTF-8 source for its desired revision. [`storage-rendering.md`](storage-rendering.md) defines caller-supplied model IDs and the `model.create` and `model.edit` source contract. Protobuf model records remain metadata-only, and protobuf model ID fields remain strings.
 
 `Model.desired_source_revision` is the lowercase SHA-256 selected by the latest accepted source creation or edit. `current_successful_source_revision` identifies the revision whose GLB, preview, and facts remain available. They differ during a render and after a failed replacement, except that an explicit same-source rerender keeps them equal while work is pending. `render_state` describes work for the desired revision; `render_error` is empty except for a safe, bounded failure summary.
 

@@ -82,8 +82,8 @@ impl FaktoryMcp {
     #[tool(name = "model.get", definition = model_get_definition())]
     async fn model_get(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
         let input: ModelIdInput = parse(call)?;
-        match self.repository.get_model(&input.model_id).await {
-            Ok(model) => Ok(result(json!({ "model": model.record }))),
+        match get_model_with_source(&self.repository, &input.model_id).await {
+            Ok((model, source)) => Ok(model_get_result(model, source)),
             Err(error) => Ok(tool_error(error)),
         }
     }
@@ -182,6 +182,27 @@ impl FaktoryMcp {
             Err(error) => Ok(tool_error(error)),
         }
     }
+}
+
+async fn get_model_with_source(
+    repository: &Repository,
+    model_id: &str,
+) -> Result<(ModelRecord, String), RepositoryError> {
+    let model = repository.get_model(model_id).await?.record;
+    let source = match repository
+        .source(&model.id, &model.desired_source_revision)
+        .await
+    {
+        Ok(source) => source,
+        Err(RepositoryError::NotFound) => return Err(RepositoryError::Corrupt),
+        Err(error) => return Err(error),
+    };
+    let source = String::from_utf8(source.to_vec()).map_err(|_| RepositoryError::Corrupt)?;
+    Ok((model, source))
+}
+
+fn model_get_result(model: ModelRecord, source: String) -> McpToolResult {
+    result(json!({ "model": model, "source": source }))
 }
 
 async fn create_and_schedule(
@@ -408,7 +429,12 @@ fn model_list_definition() -> McpToolDefinition {
     )
 }
 fn model_get_definition() -> McpToolDefinition {
-    definition("model.get", "Get one model.", true, model_id_schema())
+    definition(
+        "model.get",
+        "Get one model and its exact desired-revision source.",
+        true,
+        model_id_schema(),
+    )
 }
 fn model_retry_definition() -> McpToolDefinition {
     definition(
@@ -543,7 +569,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::StoredRenderState,
+        model::{
+            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, StoredRenderState, source_key,
+        },
         render::RenderConfig,
         storage::{InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject},
     };
@@ -604,6 +632,61 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockingFirstSourceGet {
+        inner: InMemoryObjectStore,
+        block_source_get: AtomicBool,
+        source_get_started: Semaphore,
+        release_source_get: Semaphore,
+    }
+
+    impl BlockingFirstSourceGet {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryObjectStore::default(),
+                block_source_get: AtomicBool::new(false),
+                source_get_started: Semaphore::new(0),
+                release_source_get: Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BlockingFirstSourceGet {
+        async fn get(&self, key: &str) -> Result<StoredObject, StorageError> {
+            if key.ends_with("/source.py") && self.block_source_get.swap(false, Ordering::SeqCst) {
+                self.source_get_started.add_permits(1);
+                self.release_source_get
+                    .acquire()
+                    .await
+                    .expect("release semaphore open")
+                    .forget();
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            bytes: Bytes,
+            condition: PutCondition,
+        ) -> Result<String, StorageError> {
+            self.inner.put(key, bytes, condition).await
+        }
+
+        async fn delete(&self, key: &str, expected_etag: &str) -> Result<(), StorageError> {
+            self.inner.delete(key, expected_etag).await
+        }
+
+        async fn ready(&self) -> Result<(), StorageError> {
+            self.inner.ready().await
+        }
+    }
+
     #[test]
     fn successful_result_puts_complete_json_in_text_and_structured_content() {
         let output = json!({
@@ -617,6 +700,229 @@ mod tests {
 
         assert_eq!(serde_json::from_str::<Value>(text).unwrap(), output);
         assert_eq!(result.raw["structuredContent"], output);
+    }
+
+    #[tokio::test]
+    async fn model_get_returns_exact_source_with_matching_desired_revision() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let exact_source = "# caf\u{e9}\nresult = box";
+        let created = repository
+            .create_model("part", "Part", exact_source.as_bytes())
+            .await
+            .expect("create model");
+
+        let (model, source) = get_model_with_source(&repository, "part")
+            .await
+            .expect("get model source");
+        let tool_result = model_get_result(model, source);
+        let output = tool_result.raw["structuredContent"].clone();
+        let text = tool_result.raw["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+
+        assert_eq!(output["source"], exact_source);
+        assert_eq!(
+            output["model"]["desired_source_revision"],
+            created.desired_source_revision
+        );
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), output);
+        assert_eq!(tool_result.raw["structuredContent"], output);
+        assert!(output.get("storage_etag").is_none());
+        assert!(output["model"].get("storage_etag").is_none());
+        assert!(output["model"].get("etag").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_get_returns_desired_source_instead_of_current_successful_source() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let created = repository
+            .create_model("part", "Part", b"old source")
+            .await
+            .expect("create model");
+        repository
+            .complete_render(
+                &created.id,
+                &created.desired_source_revision,
+                RenderedOutput {
+                    glb: Bytes::from_static(b"glb"),
+                    preview: Bytes::from_static(b"<svg></svg>"),
+                    facts: GeometryFactsRecord {
+                        volume_cubic_millimeters: 1.0,
+                        size_millimeters: GeometrySizeRecord {
+                            x: 1.0,
+                            y: 1.0,
+                            z: 1.0,
+                        },
+                    },
+                },
+            )
+            .await
+            .expect("complete initial render");
+        let edited = repository
+            .edit_model(
+                "part",
+                &created.desired_source_revision,
+                None,
+                Some(&[SourcePatch {
+                    old: "old".to_owned(),
+                    new: "desired".to_owned(),
+                }]),
+            )
+            .await
+            .expect("edit model");
+
+        let (model, source) = get_model_with_source(&repository, "part")
+            .await
+            .expect("get desired source");
+
+        assert_eq!(source, "desired source");
+        assert_eq!(
+            model.current_successful_source_revision,
+            created.desired_source_revision
+        );
+        assert_eq!(
+            model.desired_source_revision,
+            edited.record.desired_source_revision
+        );
+        assert_ne!(
+            model.desired_source_revision,
+            model.current_successful_source_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn model_get_pairs_loaded_metadata_with_its_immutable_source_during_edit() {
+        let store = Arc::new(BlockingFirstSourceGet::new());
+        let repository = Repository::new(store.clone(), 1);
+        let created = repository
+            .create_model("part", "Part", b"old source")
+            .await
+            .expect("create model");
+        store.block_source_get.store(true, Ordering::SeqCst);
+
+        let get_repository = repository.clone();
+        let get = tokio::spawn(async move { get_model_with_source(&get_repository, "part").await });
+        store
+            .source_get_started
+            .acquire()
+            .await
+            .expect("source-start semaphore open")
+            .forget();
+
+        let edited = repository
+            .edit_model(
+                "part",
+                &created.desired_source_revision,
+                None,
+                Some(&[SourcePatch {
+                    old: "old".to_owned(),
+                    new: "new".to_owned(),
+                }]),
+            )
+            .await
+            .expect("edit model");
+        store.release_source_get.add_permits(1);
+
+        let (model, source) = get
+            .await
+            .expect("model get task")
+            .expect("get model source");
+        assert_eq!(
+            model.desired_source_revision,
+            created.desired_source_revision
+        );
+        assert_eq!(source, "old source");
+        assert_ne!(
+            model.desired_source_revision,
+            edited.record.desired_source_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn model_list_serialization_remains_metadata_only() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        repository
+            .create_model("part", "Part", b"private source")
+            .await
+            .expect("create model");
+
+        let output = json!({
+            "models": repository.list_models().await.expect("list models")
+        });
+
+        assert_eq!(output["models"].as_array().map(Vec::len), Some(1));
+        assert!(output.get("source").is_none());
+        assert!(output["models"][0].get("source").is_none());
+        assert!(output["models"][0].get("storage_etag").is_none());
+        assert!(!output.to_string().contains("private source"));
+    }
+
+    #[tokio::test]
+    async fn model_get_maps_invalid_utf8_source_to_safe_invalid_state() {
+        let store = Arc::new(InMemoryObjectStore::default());
+        let repository = Repository::new(store.clone(), 1);
+        let created = repository
+            .create_model("part", "Part", b"valid source")
+            .await
+            .expect("create model");
+        store
+            .put(
+                &source_key("part", &created.desired_source_revision),
+                Bytes::from_static(b"\xff\xfe"),
+                PutCondition::Any,
+            )
+            .await
+            .expect("corrupt source");
+
+        let error = get_model_with_source(&repository, "part")
+            .await
+            .expect_err("invalid UTF-8 must fail");
+        assert_eq!(error, RepositoryError::Corrupt);
+
+        let output = tool_error(error);
+        assert_eq!(
+            output.raw["structuredContent"]["error"]["code"],
+            "invalid_state"
+        );
+        assert_eq!(output.raw["content"][0]["text"], "Stored state is invalid.");
+        assert_eq!(output.raw["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn model_get_distinguishes_missing_model_from_missing_desired_source() {
+        let store = Arc::new(InMemoryObjectStore::default());
+        let repository = Repository::new(store.clone(), 1);
+
+        let absent = get_model_with_source(&repository, "absent")
+            .await
+            .expect_err("absent model must fail");
+        assert_eq!(absent, RepositoryError::NotFound);
+        assert_eq!(
+            tool_error(absent).raw["structuredContent"]["error"]["code"],
+            "not_found"
+        );
+
+        let created = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        let key = source_key("part", &created.desired_source_revision);
+        let source = store.get(&key).await.expect("stored source");
+        store
+            .delete(&key, &source.etag)
+            .await
+            .expect("delete desired source");
+
+        let missing_source = get_model_with_source(&repository, "part")
+            .await
+            .expect_err("missing desired source must fail");
+        assert_eq!(missing_source, RepositoryError::Corrupt);
+        let output = tool_error(missing_source);
+        assert_eq!(
+            output.raw["structuredContent"]["error"]["code"],
+            "invalid_state"
+        );
+        assert_eq!(output.raw["content"][0]["text"], "Stored state is invalid.");
     }
 
     #[test]
