@@ -1,0 +1,9 @@
+title = "Faktory secret scanning"
+
+[allowlist]
+description = "Known local Compose credentials that are visibly development-only"
+regexes = [
+  '''development-only-[A-Za-z0-9-]+''',
+  '''GK0123456789abcdef0123456789abcdef''',
+  '''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''',
+]

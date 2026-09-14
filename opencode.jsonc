@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "faktory-local": {
+      "type": "remote",
+      "url": "http://localhost:8080/mcp",
+      "oauth": false,
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}

@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package faktory.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// FaktoryService exposes model metadata and shared named camera views.
+// Rendered geometry is transferred over authenticated HTTP, not this service.
+service FaktoryService {
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc GetModel(GetModelRequest) returns (GetModelResponse);
+  rpc ListViews(ListViewsRequest) returns (ListViewsResponse);
+  rpc PutView(PutViewRequest) returns (PutViewResponse);
+  rpc DeleteView(DeleteViewRequest) returns (DeleteViewResponse);
+  rpc SetDefaultView(SetDefaultViewRequest) returns (SetDefaultViewResponse);
+  rpc WatchModels(WatchModelsRequest) returns (stream WatchModelsResponse);
+}
+
+enum RenderState {
+  RENDER_STATE_UNSPECIFIED = 0;
+  RENDER_STATE_PENDING = 1;
+  RENDER_STATE_RENDERING = 2;
+  RENDER_STATE_READY = 3;
+  RENDER_STATE_FAILED = 4;
+}
+
+enum Projection {
+  PROJECTION_UNSPECIFIED = 0;
+  PROJECTION_PERSPECTIVE = 1;
+  PROJECTION_ORTHOGRAPHIC = 2;
+}
+
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Quaternion {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+message ModelGeometryFacts {
+  double volume_cubic_millimeters = 1;
+  Vector3 size_millimeters = 2;
+}
+
+message Model {
+  string id = 1;
+  string name = 2;
+  string desired_source_revision = 3;
+  string current_successful_source_revision = 4;
+  RenderState render_state = 5;
+  string render_error = 6;
+  string default_view_id = 7;
+  ModelGeometryFacts current_successful_facts = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message NamedView {
+  string id = 1;
+  string name = 2;
+  Vector3 target = 3;
+  Quaternion rotation = 4;
+  Projection projection = 5;
+  double distance = 6;
+  double field_of_view_degrees = 7;
+  double orthographic_scale = 8;
+  string etag = 9;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated Model models = 1;
+}
+
+message GetModelRequest {
+  string model_id = 1;
+}
+
+message GetModelResponse {
+  Model model = 1;
+}
+
+message ListViewsRequest {
+  string model_id = 1;
+}
+
+message ListViewsResponse {
+  repeated NamedView views = 1;
+  string default_view_id = 2;
+}
+
+message PutViewRequest {
+  string model_id = 1;
+  NamedView view = 2;
+  optional string expected_etag = 3;
+}
+
+message PutViewResponse {
+  NamedView view = 1;
+}
+
+message DeleteViewRequest {
+  string model_id = 1;
+  string view_id = 2;
+  string expected_etag = 3;
+}
+
+message DeleteViewResponse {}
+
+message SetDefaultViewRequest {
+  string model_id = 1;
+  string view_id = 2;
+}
+
+message SetDefaultViewResponse {
+  Model model = 1;
+}
+
+message WatchModelsRequest {}
+
+message ModelSnapshot {
+  repeated Model models = 1;
+}
+
+message ModelChanged {
+  Model model = 1;
+}
+
+message WatchModelsResponse {
+  oneof event {
+    ModelSnapshot initial_snapshot = 1;
+    ModelChanged model_changed = 2;
+  }
+}

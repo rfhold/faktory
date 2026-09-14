@@ -1,0 +1,13 @@
+target/
+node_modules/
+.pnpm-store/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+dist/
+coverage/
+models/
+*.glb

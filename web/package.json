@@ -1,0 +1,30 @@
+{
+  "name": "@rfhold/faktory-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.15.0",
+    "@connectrpc/connect": "2.2.0",
+    "@connectrpc/connect-web": "2.2.0",
+    "@grafana/faro-web-sdk": "2.11.0",
+    "@grafana/faro-web-tracing": "2.11.0",
+    "@solidjs/router": "0.15.3",
+    "@tanstack/solid-query": "5.87.1",
+    "solid-js": "1.9.15",
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.180.0",
+    "happy-dom": "18.0.1",
+    "typescript": "5.9.2",
+    "vite": "7.1.5",
+    "vite-plugin-solid": "2.11.8",
+    "vitest": "3.2.4"
+  }
+}

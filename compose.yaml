@@ -1,0 +1,96 @@
+name: faktory
+
+x-garage-environment: &garage-environment
+  GARAGE_CONFIG_FILE: /etc/garage.toml
+  GARAGE_DEFAULT_ACCESS_KEY: GK0123456789abcdef0123456789abcdef
+  GARAGE_DEFAULT_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  GARAGE_DEFAULT_BUCKET: faktory
+
+services:
+  garage:
+    image: docker.io/dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment: *garage-environment
+    volumes:
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+      - ./deploy/garage/garage.toml:/etc/garage.toml:ro
+    ports:
+      - "127.0.0.1:3900:3900"
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    restart: unless-stopped
+
+  garage-init:
+    image: docker.io/dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
+    entrypoint: ["/garage"]
+    command: ["status"]
+    environment: *garage-environment
+    volumes:
+      - garage-meta:/var/lib/garage/meta
+      - ./deploy/garage/garage.toml:/etc/garage.toml:ro
+    depends_on:
+      garage:
+        condition: service_healthy
+    restart: "no"
+
+  postgres:
+    image: docker.io/library/postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+    environment:
+      POSTGRES_DB: faktory
+      POSTGRES_USER: faktory
+      POSTGRES_PASSWORD: development-only-postgres-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faktory -d faktory"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    restart: unless-stopped
+
+  faktory:
+    build:
+      context: .
+      target: runtime
+    environment:
+      FAKTORY_AUTH_MODE: disabled
+      FAKTORY_DEPLOYMENT_ENVIRONMENT: local
+      FAKTORY_PUBLIC_BASE_URL: http://localhost:8080
+      FAKTORY_S3_ENDPOINT: http://garage:3900
+      FAKTORY_S3_REGION: garage
+      FAKTORY_S3_BUCKET: faktory
+      FAKTORY_S3_ACCESS_KEY: GK0123456789abcdef0123456789abcdef
+      FAKTORY_S3_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      RUST_LOG: faktory_server=info,kuri_server=info,mcp=info,tower_http=info
+    depends_on:
+      garage-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  garage-meta:
+  garage-data:
+  postgres-data:

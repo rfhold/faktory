@@ -1,0 +1,6 @@
+name: faktory
+runtime:
+  name: nodejs
+  options:
+    packagemanager: bun
+description: Kubernetes declarations for the single-replica Faktory service

@@ -1,0 +1,78 @@
+[workspace]
+members = ["crates/faktory-proto", "crates/faktory-server"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+prost = "0.14.1"
+prost-types = "0.14.1"
+quick-xml = "0.39.4"
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router"] }
+tonic-prost = "0.14.2"
+async-trait = "0.1.92"
+aws-config = "1.8.12"
+aws-credential-types = "1.2.10"
+aws-sdk-s3 = "1.115.0"
+axum = { version = "0.8.9", features = ["http2"] }
+bytes = "1.12.1"
+base64 = "0.22.1"
+chrono = "0.4.45"
+futures-util = "0.3.34"
+getrandom = "0.3.4"
+http = "1.5.0"
+http-body = "1.0.1"
+http-body-util = "0.1.3"
+kuri-server = { git = "https://git.holdenitdown.net/rfhold/kuri.git", rev = "99d0fe1883fd177e7b5eb1254a220cb3d0e86814", default-features = false }
+mcp = { git = "https://git.holdenitdown.net/rfhold/kuri.git", rev = "99d0fe1883fd177e7b5eb1254a220cb3d0e86814", default-features = false, features = ["macros", "oauth-authorization-server-postgres", "oauth-resource-owner-oidc-postgres", "progressive"] }
+opentelemetry = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "metrics", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+pyroscope = { version = "=2.0.6", features = ["backend-pprof-rs"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
+rustix = { version = "1.1.4", features = ["process"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+tempfile = "3.23.0"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tonic-web = "0.14.6"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.8", features = ["fs", "trace"] }
+tracing = "0.1.44"
+tracing-opentelemetry = "0.33.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+uuid = { version = "1.19.0", features = ["v4"] }
+url = "2.5.8"
+
+[workspace.lints.rust]
+deprecated_safe = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+unsafe_code = "forbid"
+unused = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }

@@ -1,0 +1,22 @@
+{
+  "name": "faktory-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.34.3",
+  "scripts": {
+    "generate:proto": "buf generate && node -e \"const fs=require('node:fs');const p='proto/gen/ts/faktory/v1/faktory_pb.ts';fs.writeFileSync(p,fs.readFileSync(p,'utf8').replace(/\\n+$/, '\\n'))\"",
+    "check:proto": "buf lint",
+    "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module preserve --target ES2022 proto/gen/ts/faktory/v1/faktory_pb.ts",
+    "web:dev": "pnpm --filter @rfhold/faktory-web dev",
+    "web:build": "pnpm --filter @rfhold/faktory-web build",
+    "web:test": "pnpm --filter @rfhold/faktory-web test"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.15.0",
+    "@connectrpc/connect": "2.2.0",
+    "@connectrpc/connect-web": "2.2.0"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.15.0",
+    "typescript": "5.9.2"
+  }
+}

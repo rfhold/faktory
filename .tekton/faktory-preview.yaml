@@ -1,0 +1,286 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: faktory-preview
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push, incoming]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    pipelinesascode.tekton.dev/max-keep-runs: "2"
+spec:
+  timeouts:
+    pipeline: 2h0m0s
+  params:
+    - name: repo-url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+    - name: base-image
+      value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/faktory"
+  pipelineSpec:
+    params:
+      - { name: repo-url, type: string }
+      - { name: revision, type: string }
+      - { name: base-image, type: string }
+    workspaces:
+      - name: source
+    tasks:
+      - name: fetch-repository
+        retries: 1
+        taskSpec:
+          params:
+            - { name: repo-url, type: string }
+            - { name: revision, type: string }
+          workspaces:
+            - name: output
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: clone
+              image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+              workingDir: $(workspaces.output.path)
+              volumeMounts:
+                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                cp /etc/git-auth/.gitconfig /root/.gitconfig
+                cp /etc/git-auth/.git-credentials /root/.git-credentials
+                git clone "$(params.repo-url)" .
+                git checkout --detach "$(params.revision)"
+                test "$(git rev-parse HEAD)" = "$(params.revision)"
+        params:
+          - { name: repo-url, value: $(params.repo-url) }
+          - { name: revision, value: $(params.revision) }
+        workspaces:
+          - { name: output, workspace: source }
+
+      - name: quality
+        runAfter: [scan-private-material]
+        taskSpec:
+          workspaces:
+            - name: source
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: checks
+              image: cr.holdenitdown.net/rfhold/general-ci@sha256:6943f91d774980357b24730a14ac4b026325d50962df4b2e15e24c3f43190e5b
+              workingDir: $(workspaces.source.path)
+              volumeMounts:
+                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                cp /etc/git-auth/.gitconfig /root/.gitconfig
+                cp /etc/git-auth/.git-credentials /root/.git-credentials
+                buf lint
+                cargo +1.96.0 fmt --all -- --check
+                cargo +1.96.0 check --workspace --all-targets
+                cargo +1.96.0 clippy --workspace --all-targets -- -D warnings
+                cargo +1.96.0 test --workspace --locked
+                pnpm install --frozen-lockfile
+                pnpm run typecheck
+                pnpm run web:build
+                pnpm run web:test
+                uv sync --frozen
+                uv run python -m unittest discover
+                cd infra/pulumi
+                bun install --frozen-lockfile
+                bun run build
+                bun run test
+                cd ../..
+                docker compose config --quiet
+                git diff --check
+        workspaces:
+          - { name: source, workspace: source }
+
+      - name: scan-private-material
+        runAfter: [fetch-repository]
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: scan
+              image: docker.io/zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f602fb195b7fadc1e812065883f695d1eeaba854
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                gitleaks dir --config .gitleaks.toml --redact --no-banner --exit-code 1 .
+        workspaces:
+          - { name: source, workspace: source }
+
+      - name: build-amd64
+        runAfter: [quality, scan-private-material]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: image, type: string }
+            - { name: revision, type: string }
+            - { name: buildkit-addr, type: string }
+          workspaces:
+            - name: source
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: build
+              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
+              workingDir: $(workspaces.source.path)
+              volumeMounts:
+                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=runtime --opt platform=linux/amd64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --secret id=gitconfig,src=/etc/git-auth/.gitconfig \
+                  --secret id=git-credentials,src=/etc/git-auth/.git-credentials \
+                  --output "type=image,name=$(params.image),push=true"
+        params:
+          - { name: image, value: "$(params.base-image):preview-$(params.revision)-amd64" }
+          - { name: revision, value: $(params.revision) }
+          - { name: buildkit-addr, value: "{{ BUILDKIT_AMD64_ADDR }}" }
+        workspaces:
+          - { name: source, workspace: source }
+
+      - name: build-arm64
+        runAfter: [quality, scan-private-material]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: image, type: string }
+            - { name: revision, type: string }
+            - { name: buildkit-addr, type: string }
+          workspaces:
+            - name: source
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: build
+              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
+              workingDir: $(workspaces.source.path)
+              volumeMounts:
+                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=runtime --opt platform=linux/arm64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --secret id=gitconfig,src=/etc/git-auth/.gitconfig \
+                  --secret id=git-credentials,src=/etc/git-auth/.git-credentials \
+                  --output "type=image,name=$(params.image),push=true"
+        params:
+          - { name: image, value: "$(params.base-image):preview-$(params.revision)-arm64" }
+          - { name: revision, value: $(params.revision) }
+          - { name: buildkit-addr, value: "{{ BUILDKIT_ARM64_ADDR }}" }
+        workspaces:
+          - { name: source, workspace: source }
+
+      - name: publish-manifest
+        runAfter: [build-amd64, build-arm64]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: base-image, type: string }
+            - { name: revision, type: string }
+          steps:
+            - name: publish
+              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
+              script: |
+                #!/busybox/sh
+                set -eu
+                base="$(params.base-image):preview-$(params.revision)"
+                crane index append \
+                  --manifest "${base}-amd64" \
+                  --manifest "${base}-arm64" \
+                  --tag "${base}"
+                manifest="$(crane manifest "${base}")"
+                printf '%s' "$manifest" | grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"amd64"'
+                printf '%s' "$manifest" | grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"arm64"'
+        params:
+          - { name: base-image, value: $(params.base-image) }
+          - { name: revision, value: $(params.revision) }
+
+      - name: resolve-image
+        runAfter: [publish-manifest]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: base-image, type: string }
+            - { name: tag, type: string }
+            - { name: revision, type: string }
+          results:
+            - { name: image, type: string }
+          steps:
+            - name: resolve
+              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
+              script: |
+                #!/busybox/sh
+                set -eu
+                tagged="$(params.base-image):$(params.tag)"
+                digest="$(crane digest "$tagged")"
+                case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
+                image="$(params.base-image)@$digest"
+                config="$(crane config "$image")"
+                printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
+                printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
+                printf '%s' "$image" > "$(results.image.path)"
+        params:
+          - { name: base-image, value: $(params.base-image) }
+          - { name: tag, value: preview-$(params.revision) }
+          - { name: revision, value: $(params.revision) }
+
+      - name: deploy-preview
+        runAfter: [resolve-image]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: image, type: string }
+          workspaces:
+            - name: source
+          volumes:
+            - name: kubeconfig
+              secret:
+                secretName: tekton-cluster-kubeconfig
+          steps:
+            - name: preview-and-apply
+              image: cr.holdenitdown.net/rfhold/general-ci@sha256:6943f91d774980357b24730a14ac4b026325d50962df4b2e15e24c3f43190e5b
+              workingDir: $(workspaces.source.path)/infra/pulumi
+              env:
+                - { name: KUBECONFIG, value: /etc/kubeconfig/kubeconfig }
+                - { name: PULUMI_HOME, value: /tmp/pulumi-home }
+              envFrom:
+                - secretRef: { name: pulumi-credentials }
+                - secretRef: { name: authentik-credentials }
+              volumeMounts:
+                - { name: kubeconfig, mountPath: /etc/kubeconfig, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                bun install --frozen-lockfile
+                pulumi preview --stack preview --diff --config "image=$(params.image)"
+                pulumi up --stack preview --yes --skip-preview --config "image=$(params.image)"
+        params:
+          - { name: image, value: $(tasks.resolve-image.results.image) }
+        workspaces:
+          - { name: source, workspace: source }
+    workspaces:
+      - name: source
+        volumeClaimTemplate:
+          spec:
+            accessModes: [ReadWriteMany]
+            storageClassName: shared-fs
+            resources:
+              requests:
+                storage: 20Gi

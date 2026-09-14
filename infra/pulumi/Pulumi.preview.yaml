@@ -1,0 +1,16 @@
+config:
+  kubernetes:context: pantheon
+  faktory:namespace: faktory-preview
+  faktory:hostname: preview-faktory.holdenitdown.net
+  faktory:displayName: Faktory Preview
+  faktory:slug: faktory-preview
+  faktory:authentikBaseUrl: https://auth.holdenitdown.net
+  faktory:s3Endpoint: https://s3.pantheon.holdenitdown.net
+  faktory:backupEndpoint: https://s3.pantheon.holdenitdown.net
+  faktory:storageClass: shared-fs
+  faktory:bucketStorageClass: default-bucket
+  faktory:backupStorageClass: default-bucket
+  faktory:backupRetention: 14d
+  faktory:databaseStorageSize: 10Gi
+  faktory:protectData: "false"
+encryptionsalt: v1:myA4y+QXFoE=:v1:cINYMv6F1KE6SNIE:yEZTTqYfMq9IN051x9K53NtkeaQs0Q==
