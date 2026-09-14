@@ -360,10 +360,8 @@ fn parse<T: for<'de> Deserialize<'de>>(call: McpToolCall) -> ServerResult<T> {
 }
 
 fn result(value: Value) -> McpToolResult {
-    McpToolResult::new(json!({
-        "content": [{ "type": "text", "text": "Request completed." }],
-        "structuredContent": value
-    }))
+    mcp::progressive::tool_result(value, None)
+        .expect("unfiltered JSON output must produce a tool result")
 }
 
 fn tool_error(error: RepositoryError) -> McpToolResult {
@@ -604,6 +602,21 @@ mod tests {
         async fn ready(&self) -> Result<(), StorageError> {
             self.inner.ready().await
         }
+    }
+
+    #[test]
+    fn successful_result_puts_complete_json_in_text_and_structured_content() {
+        let output = json!({
+            "model": {
+                "model_id": "part",
+                "desired_source_revision": "abc123"
+            }
+        });
+        let result = result(output.clone());
+        let text = result.raw["content"][0]["text"].as_str().unwrap();
+
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), output);
+        assert_eq!(result.raw["structuredContent"], output);
     }
 
     #[test]
