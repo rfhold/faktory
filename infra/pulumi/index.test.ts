@@ -178,7 +178,7 @@ describe("preview declarations", () => {
     assert.equal(provider?.inputs.clientType, "confidential");
     assert.deepEqual(provider?.inputs.allowedRedirectUris, [
       { matching_mode: "strict", url: "https://faktory.example.test/oidc/callback" },
-      { matching_mode: "strict", url: "https://faktory.example.test/oauth/oidc/login" },
+      { matching_mode: "strict", url: "https://faktory.example.test/oauth/oidc/callback" },
     ]);
     assert.equal(resourceByName("faktory-route").inputs.kind, "HTTPRoute");
     const network = resource("kubernetes:networking.k8s.io/v1:NetworkPolicy", "faktory-network").inputs.spec;

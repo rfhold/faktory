@@ -101,6 +101,21 @@ impl ProductionAuthConfig {
     pub fn mcp_resource(&self) -> String {
         format!("{}mcp", self.public_base_url)
     }
+
+    #[must_use]
+    pub fn browser_oidc_callback(&self) -> String {
+        format!("{}oidc/callback", self.public_base_url)
+    }
+
+    #[must_use]
+    pub fn mcp_oidc_callback(&self) -> String {
+        format!("{}oauth/oidc/callback", self.public_base_url)
+    }
+
+    #[must_use]
+    pub fn mcp_authorization_endpoint(&self) -> String {
+        format!("{}oauth/authorize", self.public_base_url)
+    }
 }
 
 pub struct ProductionAuthRuntime {
@@ -144,7 +159,7 @@ impl ProductionAuthRuntime {
             config.oidc_issuer.clone(),
             config.oidc_client_id.clone(),
             Some(config.oidc_client_secret.expose().to_owned()),
-            format!("{}oidc/callback", config.public_base_url),
+            config.browser_oidc_callback(),
             config.oidc_client_id.clone(),
             ["openid", "profile", "email"].map(str::to_owned).to_vec(),
             config.session_ttl,
@@ -187,8 +202,8 @@ impl ProductionAuthRuntime {
             Some(McpOAuthSecret::new(
                 config.oidc_client_secret.expose().to_owned(),
             )),
-            format!("{}oauth/oidc/login", config.public_base_url),
-            format!("{}oauth/authorize/callback", config.public_base_url),
+            config.mcp_oidc_callback(),
+            config.mcp_authorization_endpoint(),
             ["openid", "profile", "email"].map(str::to_owned).to_vec(),
             config.oauth_code_ttl.min(Duration::from_mins(10)),
             OidcEndpointPolicy::HttpsOnly,
@@ -448,6 +463,18 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(config.oauth_issuer(), "https://faktory.example/oauth");
         assert_eq!(config.mcp_resource(), "https://faktory.example/mcp");
+        assert_eq!(
+            config.browser_oidc_callback(),
+            "https://faktory.example/oidc/callback"
+        );
+        assert_eq!(
+            config.mcp_oidc_callback(),
+            "https://faktory.example/oauth/oidc/callback"
+        );
+        assert_eq!(
+            config.mcp_authorization_endpoint(),
+            "https://faktory.example/oauth/authorize"
+        );
         let mut invalid = config;
         for url in ["http://faktory.example/", "http://localhost:8080/"] {
             invalid.public_base_url = url.to_owned();
