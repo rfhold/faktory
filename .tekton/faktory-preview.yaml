@@ -182,7 +182,14 @@ spec:
                   /opt/faktory/renderer/examples/box.py \
                   "$output_dir/model.glb" \
                   "$output_dir/model.svg" \
-                  "$output_dir/model.json"
+                  "$output_dir/model.json" \
+                  "$output_dir/isometric.svg" \
+                  "$output_dir/front.svg" \
+                  "$output_dir/back.svg" \
+                  "$output_dir/left.svg" \
+                  "$output_dir/right.svg" \
+                  "$output_dir/top.svg" \
+                  "$output_dir/bottom.svg"
                 /opt/faktory/env/bin/python -c '
                 import struct
                 import sys
@@ -221,7 +228,14 @@ spec:
                   /opt/faktory/renderer/examples/box.py \
                   "$output_dir/model.glb" \
                   "$output_dir/model.svg" \
-                  "$output_dir/model.json"
+                  "$output_dir/model.json" \
+                  "$output_dir/isometric.svg" \
+                  "$output_dir/front.svg" \
+                  "$output_dir/back.svg" \
+                  "$output_dir/left.svg" \
+                  "$output_dir/right.svg" \
+                  "$output_dir/top.svg" \
+                  "$output_dir/bottom.svg"
                 /opt/faktory/env/bin/python -c '
                 import struct
                 import sys
