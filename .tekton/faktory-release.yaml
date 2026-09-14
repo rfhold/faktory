@@ -348,6 +348,8 @@ spec:
               script: |
                 #!/bin/sh
                 set -eu
+                test "`bun --version`" = "1.3.5"
+                test "`pulumi version`" = "v3.253.0"
                 bun install --frozen-lockfile
                 pulumi preview --stack prod --diff --config "image=$(params.image)"
                 pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)"
@@ -355,12 +357,12 @@ spec:
           - { name: image, value: $(tasks.promote-release.results.image) }
         workspaces:
           - { name: source, workspace: source }
-    workspaces:
-      - name: source
-        volumeClaimTemplate:
-          spec:
-            accessModes: [ReadWriteMany]
-            storageClassName: shared-fs
-            resources:
-              requests:
-                storage: 20Gi
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteMany]
+          storageClassName: shared-fs
+          resources:
+            requests:
+              storage: 20Gi

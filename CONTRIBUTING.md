@@ -9,7 +9,7 @@ Read [the documentation index](docs/README.md) and the nearest contract before c
 - Node.js with pnpm `10.34.3`.
 - Python `>=3.12,<3.13` managed by uv for native renderer development and tests.
 - conda-lock `3.0.4` and micromamba `2.3.3` for the production image's Linux AMD64 and ARM64 renderer environments.
-- Bun `1.3.11` for Pulumi declaration tests.
+- Bun `1.3.5` for Pulumi declaration tests and deployment.
 - Docker Engine with Docker Compose v2 or later for the integration environment.
 
 ## Generate Protocol Bindings
