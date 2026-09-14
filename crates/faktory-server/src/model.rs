@@ -259,7 +259,7 @@ impl Repository {
         self.store.ready().await?;
         for key in self.model_keys().await? {
             let model = self.load_model_key(&key).await?;
-            self.validate_graph(&model).await?;
+            self.validate_graph(&model.record).await?;
         }
         Ok(())
     }
@@ -271,7 +271,7 @@ impl Repository {
     pub async fn list_models(&self) -> Result<Vec<ModelRecord>, RepositoryError> {
         let mut models = Vec::new();
         for key in self.model_keys().await? {
-            models.push(self.load_model_key(&key).await?);
+            models.push(self.load_model_key(&key).await?.record);
         }
         models.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(models)
@@ -635,9 +635,10 @@ impl Repository {
     }
 
     pub async fn reconcile(&self) -> Result<Vec<(String, String)>, RepositoryError> {
+        let _guard = self.mutations.lock().await;
         let mut jobs = Vec::new();
         for key in self.model_keys().await? {
-            let mut model = match self.load_model_key(&key).await {
+            let loaded = match self.load_model_key(&key).await {
                 Ok(model) => model,
                 Err(
                     RepositoryError::Invalid | RepositoryError::Corrupt | RepositoryError::NotFound,
@@ -647,7 +648,7 @@ impl Repository {
                 }
                 Err(error) => return Err(error),
             };
-            if let Err(error) = self.validate_graph(&model).await {
+            if let Err(error) = self.validate_graph(&loaded.record).await {
                 match error {
                     RepositoryError::Invalid
                     | RepositoryError::Corrupt
@@ -660,15 +661,18 @@ impl Repository {
                     error => return Err(error),
                 }
             }
-            if matches!(
-                model.render_state,
-                StoredRenderState::Pending | StoredRenderState::Rendering
-            ) {
-                let loaded = self.get_model(&model.id).await?;
-                model.render_state = StoredRenderState::Pending;
-                self.save_model(&model, PutCondition::Matches(loaded.storage_etag))
-                    .await?;
-                jobs.push((model.id, model.desired_source_revision));
+            let mut model = loaded.record;
+            match model.render_state {
+                StoredRenderState::Pending => {
+                    jobs.push((model.id, model.desired_source_revision));
+                }
+                StoredRenderState::Rendering => {
+                    model.render_state = StoredRenderState::Pending;
+                    self.save_model(&model, PutCondition::Matches(loaded.storage_etag))
+                        .await?;
+                    jobs.push((model.id, model.desired_source_revision));
+                }
+                StoredRenderState::Ready | StoredRenderState::Failed => {}
             }
         }
         Ok(jobs)
@@ -684,15 +688,18 @@ impl Repository {
             .collect())
     }
 
-    async fn load_model_key(&self, key: &str) -> Result<ModelRecord, RepositoryError> {
+    async fn load_model_key(&self, key: &str) -> Result<LoadedModel, RepositoryError> {
         let model_id = key
             .strip_prefix("models/")
             .and_then(|key| key.strip_suffix("/model.json"))
             .filter(|model_id| !model_id.contains('/'))
             .ok_or(RepositoryError::Corrupt)?;
-        let record = self.load_json::<ModelRecord>(key).await?.0;
+        let (record, storage_etag) = self.load_json::<ModelRecord>(key).await?;
         validate_model_record(&record, model_id)?;
-        Ok(record)
+        Ok(LoadedModel {
+            record,
+            storage_etag,
+        })
     }
 
     async fn validate_graph(&self, model: &ModelRecord) -> Result<(), RepositoryError> {
@@ -2138,6 +2145,23 @@ mod tests {
                 .render_state,
             StoredRenderState::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_requeues_pending_model_without_rewriting_it() {
+        let store = Arc::new(FailingStore::default());
+        let repository = Repository::new(store.clone(), 8);
+        let model = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("accept source");
+        store.fail_model_put.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            repository.reconcile().await.expect("reconcile"),
+            vec![(model.id, model.desired_source_revision)]
+        );
+        assert!(store.fail_model_put.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

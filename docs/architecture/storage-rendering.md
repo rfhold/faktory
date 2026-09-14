@@ -12,7 +12,7 @@ models/{model_id}/revisions/{source_sha256}/preview.svg
 models/{model_id}/views/{view_id}.json
 ```
 
-`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. View IDs and etags are server-issued opaque UUIDs. `source_sha256` is the lowercase hexadecimal SHA-256 of the exact accepted source bytes. Revision source objects are immutable. Each successful revision owns immutable `model.glb` and `preview.svg` objects. `model.json` and view JSON are mutable records written with conditional requests where required for concurrency.
+`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. View IDs and etags are server-issued opaque UUIDs. `source_sha256` is the lowercase hexadecimal SHA-256 of the exact accepted source bytes. Revision source objects are immutable. Each successful revision owns immutable `model.glb` and `preview.svg` objects. Model and view creation and all immutable writes retain the object store's atomic `If-None-Match: *` request. For matched mutable `model.json` and view JSON updates and deletes, the process serializes mutations, reads the current object ETag, rejects a mismatch, and then sends an unconditional mutation. This is process-local optimistic concurrency, not distributed atomic compare-and-swap; it is safe only while the deployment enforces one server replica with a `Recreate` strategy.
 
 `model.json` is the authority for display name, desired source revision, current successful source revision, render state, safe render error, default view ID, optional current-successful facts, and `updated_at`. Facts belong to the recorded current successful revision. They contain total volume in cubic millimetres and source-coordinate axis-aligned x/y/z dimensions in millimetres. Each view object contains the protobuf-equivalent camera fields and etag metadata. JSON schema details must be fixed with the storage adapter; implementations must not infer an alternative key layout.
 
@@ -43,7 +43,7 @@ A name-only edit updates metadata without a source revision, render work, or ren
 7. After both writes succeed, atomically advance the current successful revision, replace its facts, clear the safe error, and set `READY`.
 8. On any failure, preserve the prior current successful revision, artifacts, and facts. Set the desired revision state to `FAILED` and record only a safe bounded error.
 
-The one server replica uses an in-process bounded rendering queue. On restart, models left `PENDING` or `RENDERING` are reconciled from `model.json`. Queue limits, renderer timeout, output limits, and subprocess behavior are explicit runtime configuration.
+The one server replica uses an in-process bounded rendering queue. On restart, models left `PENDING` are queued without rewriting `model.json`; interrupted `RENDERING` models are reset to `PENDING` before being queued. Reconciliation is serialized with repository mutations. Queue limits, renderer timeout, output limits, and subprocess behavior are explicit runtime configuration.
 
 ## Security Boundary
 

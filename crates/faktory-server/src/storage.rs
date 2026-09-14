@@ -7,7 +7,7 @@ use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client, primitives::ByteStream};
 use bytes::Bytes;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::auth::{S3AccessKeyId, Secret};
 
@@ -54,6 +54,7 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
 pub struct AwsObjectStore {
     client: Client,
     bucket: String,
+    mutations: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for AwsObjectStore {
@@ -94,6 +95,7 @@ impl AwsObjectStore {
         Ok(Self {
             client: Client::from_conf(config),
             bucket,
+            mutations: Arc::new(Mutex::new(())),
         })
     }
 }
@@ -160,6 +162,7 @@ impl ObjectStore for AwsObjectStore {
         bytes: Bytes,
         condition: PutCondition,
     ) -> Result<String, StorageError> {
+        let _guard = self.mutations.lock().await;
         let request = self
             .client
             .put_object()
@@ -169,7 +172,12 @@ impl ObjectStore for AwsObjectStore {
         let request = match condition {
             PutCondition::Any => request,
             PutCondition::Absent => request.if_none_match("*"),
-            PutCondition::Matches(etag) => request.if_match(etag),
+            PutCondition::Matches(expected) => {
+                if self.get(key).await?.etag != expected {
+                    return Err(StorageError::Conflict);
+                }
+                request
+            }
         };
         let response = request.send().await.map_err(|error| {
             if error
@@ -188,11 +196,14 @@ impl ObjectStore for AwsObjectStore {
     }
 
     async fn delete(&self, key: &str, expected_etag: &str) -> Result<(), StorageError> {
+        let _guard = self.mutations.lock().await;
+        if self.get(key).await?.etag != expected_etag {
+            return Err(StorageError::Conflict);
+        }
         self.client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
-            .if_match(expected_etag)
             .send()
             .await
             .map_err(|error| {
@@ -216,6 +227,285 @@ impl ObjectStore for AwsObjectStore {
             .await
             .map_err(|_| StorageError::Unavailable)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use axum::{Router, body::Body, extract::State, response::Response, routing::any};
+    use http::{HeaderMap, Method, StatusCode, header};
+    use tokio::task::JoinHandle;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct CapturedRequest {
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScriptedResponse {
+        status: StatusCode,
+        etag: Option<&'static str>,
+        body: &'static str,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedState {
+        responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    struct ScriptedServer {
+        endpoint: String,
+        state: ScriptedState,
+        task: JoinHandle<()>,
+    }
+
+    impl ScriptedServer {
+        async fn start(responses: Vec<ScriptedResponse>, delay: Duration) -> Self {
+            let state = ScriptedState {
+                responses: Arc::new(Mutex::new(responses.into())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+                delay,
+            };
+            let router = Router::new()
+                .route("/{*key}", any(scripted_s3))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind scripted S3 server");
+            let address = listener.local_addr().expect("scripted S3 address");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .await
+                    .expect("serve scripted S3 responses");
+            });
+            Self {
+                endpoint: format!("http://{address}"),
+                state,
+                task,
+            }
+        }
+
+        async fn requests(&self) -> Vec<CapturedRequest> {
+            self.state.requests.lock().await.clone()
+        }
+    }
+
+    impl Drop for ScriptedServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn scripted_s3(
+        State(state): State<ScriptedState>,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_active.fetch_max(active, Ordering::SeqCst);
+        state.requests.lock().await.push(CapturedRequest {
+            method,
+            headers,
+            body,
+        });
+        tokio::time::sleep(state.delay).await;
+        let response = state
+            .responses
+            .lock()
+            .await
+            .pop_front()
+            .expect("scripted response");
+        state.active.fetch_sub(1, Ordering::SeqCst);
+
+        let mut builder = Response::builder().status(response.status);
+        if let Some(etag) = response.etag {
+            builder = builder.header(header::ETAG, etag);
+        }
+        builder
+            .body(Body::from(response.body))
+            .expect("scripted response body")
+    }
+
+    const fn response(
+        status: StatusCode,
+        etag: Option<&'static str>,
+        body: &'static str,
+    ) -> ScriptedResponse {
+        ScriptedResponse { status, etag, body }
+    }
+
+    async fn aws_store(server: &ScriptedServer) -> AwsObjectStore {
+        AwsObjectStore::garage(
+            server.endpoint.clone(),
+            "us-east-1".to_owned(),
+            "bucket".to_owned(),
+            S3AccessKeyId::new("test-access-key".to_owned()).expect("test access key"),
+            Secret::new("test-secret-at-least-24-bytes".to_owned()).expect("test secret"),
+        )
+        .await
+        .expect("AWS object store")
+    }
+
+    #[tokio::test]
+    async fn aws_matched_put_gets_etag_then_sends_unconditional_put() {
+        let server = ScriptedServer::start(
+            vec![
+                response(StatusCode::OK, Some("\"current\""), "old"),
+                response(StatusCode::OK, Some("\"updated\""), ""),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let store = aws_store(&server).await;
+
+        assert_eq!(
+            store
+                .put(
+                    "mutable",
+                    Bytes::from_static(b"new"),
+                    PutCondition::Matches("\"current\"".to_owned()),
+                )
+                .await
+                .expect("matched PUT"),
+            "\"updated\""
+        );
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, Method::GET);
+        assert_eq!(requests[1].method, Method::PUT);
+        assert_eq!(requests[1].body, Bytes::from_static(b"new"));
+        assert!(!requests[1].headers.contains_key(header::IF_MATCH));
+        assert!(!requests[1].headers.contains_key(header::IF_NONE_MATCH));
+    }
+
+    #[tokio::test]
+    async fn aws_matched_delete_gets_etag_then_sends_unconditional_delete() {
+        let server = ScriptedServer::start(
+            vec![
+                response(StatusCode::OK, Some("\"current\""), "old"),
+                response(StatusCode::NO_CONTENT, None, ""),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let store = aws_store(&server).await;
+
+        store
+            .delete("mutable", "\"current\"")
+            .await
+            .expect("matched DELETE");
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, Method::GET);
+        assert_eq!(requests[1].method, Method::DELETE);
+        assert!(!requests[1].headers.contains_key(header::IF_MATCH));
+    }
+
+    #[tokio::test]
+    async fn aws_matched_mutations_stop_on_stale_or_missing_objects() {
+        let stale_server = ScriptedServer::start(
+            vec![response(StatusCode::OK, Some("\"newer\""), "value")],
+            Duration::ZERO,
+        )
+        .await;
+        let stale_store = aws_store(&stale_server).await;
+        assert_eq!(
+            stale_store
+                .put(
+                    "mutable",
+                    Bytes::from_static(b"stale"),
+                    PutCondition::Matches("\"old\"".to_owned()),
+                )
+                .await,
+            Err(StorageError::Conflict)
+        );
+        assert_eq!(stale_server.requests().await.len(), 1);
+
+        let missing_server = ScriptedServer::start(
+            vec![response(
+                StatusCode::NOT_FOUND,
+                None,
+                "<Error><Code>NoSuchKey</Code></Error>",
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let missing_store = aws_store(&missing_server).await;
+        assert_eq!(
+            missing_store.delete("missing", "\"old\"").await,
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(missing_server.requests().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aws_absent_put_retains_atomic_header_and_maps_precondition_failure() {
+        let server = ScriptedServer::start(
+            vec![response(
+                StatusCode::PRECONDITION_FAILED,
+                None,
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let store = aws_store(&server).await;
+
+        assert_eq!(
+            store
+                .put(
+                    "immutable",
+                    Bytes::from_static(b"value"),
+                    PutCondition::Absent,
+                )
+                .await,
+            Err(StorageError::Conflict)
+        );
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::PUT);
+        assert_eq!(requests[0].headers.get(header::IF_NONE_MATCH).unwrap(), "*");
+    }
+
+    #[tokio::test]
+    async fn aws_clones_serialize_concurrent_mutations() {
+        let server = ScriptedServer::start(
+            vec![
+                response(StatusCode::OK, Some("\"one\""), ""),
+                response(StatusCode::OK, Some("\"two\""), ""),
+            ],
+            Duration::from_millis(50),
+        )
+        .await;
+        let first = aws_store(&server).await;
+        let second = first.clone();
+
+        let (first_result, second_result) = tokio::join!(
+            first.put("one", Bytes::from_static(b"one"), PutCondition::Any),
+            second.put("two", Bytes::from_static(b"two"), PutCondition::Any),
+        );
+        first_result.expect("first mutation");
+        second_result.expect("second mutation");
+
+        assert_eq!(server.requests().await.len(), 2);
+        assert_eq!(server.state.max_active.load(Ordering::SeqCst), 1);
     }
 }
 
