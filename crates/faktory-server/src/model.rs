@@ -1,7 +1,10 @@
 //! Persisted model and named-view records.
 
+pub mod library;
+pub mod project;
+pub mod rollout;
+
 use std::{
-    fmt::Write as _,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +17,6 @@ use faktory_proto::v1::{
     Model, ModelGeometryFacts, NamedView, Projection, Quaternion, RenderState, Vector3,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::storage::{ObjectStore, PutCondition, StorageError};
@@ -490,32 +492,22 @@ impl Repository {
         name: &str,
         source: &[u8],
     ) -> Result<ModelRecord, RepositoryError> {
+        validate_source(source)?;
         validate_model_id(model_id)?;
         validate_name(name)?;
-        validate_source(source)?;
-        let _guard = self.mutations.lock().await;
         match self.get_model(model_id).await {
             Ok(_) => return Err(RepositoryError::Conflict),
             Err(RepositoryError::NotFound) => {}
             Err(error) => return Err(error),
         }
-        let revision = source_revision(source);
-        let source_key = source_key(model_id, &revision);
-        self.put_immutable(&source_key, Bytes::copy_from_slice(source))
-            .await?;
-        let record = ModelRecord {
-            id: model_id.to_owned(),
-            name: name.to_owned(),
-            desired_source_revision: revision,
-            current_successful_source_revision: String::new(),
-            render_state: StoredRenderState::Pending,
-            render_error: String::new(),
-            default_view_id: String::new(),
-            current_successful_facts: None,
-            updated_at: mutation_timestamp(None)?,
-        };
-        self.save_model(&record, PutCondition::Absent).await?;
-        Ok(record)
+        let project = project::ProjectBundle::single_source(source)?;
+        let revision = project.digest()?;
+        self.put_immutable(
+            &source_key(model_id, &revision),
+            Bytes::copy_from_slice(source),
+        )
+        .await?;
+        self.create_project(model_id, name, project).await
     }
 
     pub async fn edit_model(
@@ -525,66 +517,47 @@ impl Repository {
         name: Option<&str>,
         patches: Option<&[SourcePatch]>,
     ) -> Result<EditedModel, RepositoryError> {
-        validate_model_id(model_id)?;
-        validate_revision(expected_revision)?;
         if name.is_none() && patches.is_none() || patches.is_some_and(<[SourcePatch]>::is_empty) {
             return Err(RepositoryError::Invalid);
         }
-        if let Some(name) = name {
-            validate_name(name)?;
-        }
-        let _guard = self.mutations.lock().await;
-        let loaded = self.get_model(model_id).await?;
-        if loaded.record.desired_source_revision != expected_revision {
-            return Err(RepositoryError::Conflict);
-        }
-        let mut record = loaded.record;
-        let source_changed = if let Some(patches) = patches {
-            let source = self.source(model_id, expected_revision).await?;
-            let mut edited =
-                String::from_utf8(source.to_vec()).map_err(|_| RepositoryError::Corrupt)?;
-            let original = edited.clone();
-            for patch in patches {
-                if patch.old.is_empty()
-                    || edited
-                        .as_bytes()
-                        .windows(patch.old.len())
-                        .filter(|candidate| *candidate == patch.old.as_bytes())
-                        .take(2)
-                        .count()
-                        != 1
-                {
-                    return Err(RepositoryError::Invalid);
-                }
-                edited = edited.replacen(&patch.old, &patch.new, 1);
+        let project_edit = patches.map(|patches| project::ProjectEdit {
+            operations: vec![project::ProjectOperation::FilePatch {
+                path: "source.py".to_owned(),
+                patches: patches
+                    .iter()
+                    .map(|patch| project::ExactPatch {
+                        old: patch.old.clone(),
+                        new: patch.new.clone(),
+                    })
+                    .collect(),
+            }],
+            ..project::ProjectEdit::default()
+        });
+        if let Some(edit) = &project_edit {
+            if self
+                .get_model(model_id)
+                .await?
+                .record
+                .desired_source_revision
+                != expected_revision
+            {
+                return Err(RepositoryError::Conflict);
             }
-            if edited == original {
-                return Err(RepositoryError::Invalid);
-            }
-            validate_source(edited.as_bytes())?;
-            let revision = source_revision(edited.as_bytes());
-            self.put_immutable(&source_key(model_id, &revision), Bytes::from(edited))
-                .await?;
-            record.desired_source_revision = revision;
-            record.render_state = StoredRenderState::Pending;
-            record.render_error.clear();
-            true
-        } else {
-            false
-        };
-        if let Some(name) = name {
-            if !source_changed && name == record.name {
-                return Err(RepositoryError::Invalid);
-            }
-            record.name = name.to_owned();
-        }
-        record.updated_at = mutation_timestamp(Some(record.updated_at))?;
-        self.save_model(&record, PutCondition::Matches(loaded.storage_etag))
+            let project = self.get_project(model_id, expected_revision).await?;
+            let next = project.apply(edit)?;
+            let entrypoint = next
+                .files
+                .iter()
+                .find(|file| file.path == next.entrypoint)
+                .ok_or(RepositoryError::Corrupt)?;
+            self.put_immutable(
+                &source_key(model_id, &next.digest()?),
+                Bytes::copy_from_slice(entrypoint.content.as_bytes()),
+            )
             .await?;
-        Ok(EditedModel {
-            record,
-            source_changed,
-        })
+        }
+        self.edit_project(model_id, expected_revision, name, project_edit.as_ref())
+            .await
     }
 
     pub async fn retry_render(&self, model_id: &str) -> Result<ModelRecord, RepositoryError> {
@@ -896,9 +869,18 @@ impl Repository {
     }
 
     async fn validate_graph(&self, model: &ModelRecord) -> Result<(), RepositoryError> {
-        self.store
-            .get(&source_key(&model.id, &model.desired_source_revision))
-            .await?;
+        match self
+            .get_project(&model.id, &model.desired_source_revision)
+            .await
+        {
+            Ok(_) => {}
+            Err(RepositoryError::NotFound) => {
+                self.store
+                    .get(&source_key(&model.id, &model.desired_source_revision))
+                    .await?;
+            }
+            Err(error) => return Err(error),
+        }
         if !model.current_successful_source_revision.is_empty() {
             self.store
                 .get(&geometry_key(
@@ -979,7 +961,10 @@ impl Repository {
     }
 }
 
-fn validate_model_record(record: &ModelRecord, expected_id: &str) -> Result<(), RepositoryError> {
+pub(crate) fn validate_model_record(
+    record: &ModelRecord,
+    expected_id: &str,
+) -> Result<(), RepositoryError> {
     let invalid_fields = validate_model_id(expected_id).is_err()
         || validate_model_id(&record.id).is_err()
         || validate_name(&record.name).is_err()
@@ -1083,7 +1068,10 @@ fn mutation_timestamp(
     Ok(timestamp)
 }
 
-fn validate_view_record(record: &ViewRecord, expected_id: &str) -> Result<(), RepositoryError> {
+pub(crate) fn validate_view_record(
+    record: &ViewRecord,
+    expected_id: &str,
+) -> Result<(), RepositoryError> {
     let invalid_fields = validate_id(expected_id).is_err()
         || validate_id(&record.id).is_err()
         || validate_name(&record.name).is_err()
@@ -1237,13 +1225,12 @@ const fn validate_source(source: &[u8]) -> Result<(), RepositoryError> {
     }
 }
 
+#[cfg(test)]
 fn source_revision(source: &[u8]) -> String {
-    Sha256::digest(source)
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(output, "{byte:02x}").expect("writing to a String cannot fail");
-            output
-        })
+    project::ProjectBundle::single_source(source)
+        .expect("validated source")
+        .digest()
+        .expect("canonical bundle")
 }
 
 fn validate_revision(revision: &str) -> Result<(), RepositoryError> {
@@ -1819,7 +1806,7 @@ mod tests {
                 .await
                 .expect("revisions")
                 .len(),
-            1
+            2
         );
     }
 

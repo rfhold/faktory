@@ -1,6 +1,6 @@
 # Documentation
 
-This index routes readers to the authoritative Faktory MVP contracts. Runtime behavior and preview, production, backup, observability, and delivery declarations are implemented in the repository. These declarations do not authorize deployment, and no preview or production deployment or pipeline run is evidenced here.
+This index routes readers to authoritative Faktory MVP contracts implemented in the repository. Repository implementation and declarations do not authorize deployment, and they provide no evidence of a preview or production deployment or pipeline run.
 
 | Document | Covers |
 | --- | --- |

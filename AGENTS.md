@@ -20,7 +20,8 @@
 - Read [docs/README.md](docs/README.md) before changing behavior or contracts.
 - The local MVP implementation, image, Compose environment, and preview declarations exist. No Faktory service is deployed and no external system is configured or mutated.
 - Keep geometry transfer out of protobuf; authenticated HTTP owns GLB delivery.
-- Treat `proto/faktory/v1/faktory.proto` as the API authority and regenerate committed bindings after changes.
+- Treat `proto/faktory/v1/faktory.proto` as the browser wire authority; keep model projects and shared-library source MCP-only.
+- Follow [the model-project contract](docs/architecture/model-projects-libraries.md) and [the object-store migration contract](docs/operations/object-store-migrations.md) for the approved multi-file cutover.
 - Preserve Rust 1.96, edition 2024, Buf v2 `STANDARD` lint, and `FILE` breaking policy.
 - Keep uv authoritative for native renderer development and tests; image builds consume the committed conda explicit lock matching BuildKit `TARGETARCH`.
 - Keep planned behavior distinct from implemented and deployed behavior in documentation.

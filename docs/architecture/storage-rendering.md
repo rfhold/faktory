@@ -1,27 +1,33 @@
 # Storage and Rendering
 
+The project-key layout, project mutation language, and ordered legacy migration below are implemented in the repository. This local implementation does not prove a preview or production deployment. [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) defines conversion before repository validation or render reconciliation.
+
 ## Object Layout
 
 The runtime storage adapter uses one S3-compatible artifact bucket with these exact keys. Local Compose supplies Garage 2.3 as that object store:
 
 ```text
 models/{model_id}/model.json
-models/{model_id}/revisions/{source_sha256}/source.py
-models/{model_id}/revisions/{source_sha256}/model.glb
-models/{model_id}/revisions/{source_sha256}/preview.svg
-models/{model_id}/revisions/{source_sha256}/projections/{projection}.png
-models/{model_id}/revisions/{source_sha256}/renders/three-v2/canonical/{projection}.png
-models/{model_id}/revisions/{source_sha256}/renders/three-v2/views/{view_id}/{etag}.png
+models/{model_id}/revisions/{project_sha256}/project.json
+models/{model_id}/revisions/{project_sha256}/model.glb
+models/{model_id}/revisions/{project_sha256}/preview.svg
+models/{model_id}/revisions/{project_sha256}/projections/{projection}.png
+models/{model_id}/revisions/{project_sha256}/renders/three-v2/canonical/{projection}.png
+models/{model_id}/revisions/{project_sha256}/renders/three-v2/views/{view_id}/{etag}.png
 models/{model_id}/views/{view_id}.json
+libraries/{library_name}/releases/{version}/release.json
+libraries/{library_name}/index.json
+system/library-rollouts/{library_name}/{version}/{release_sha256}.json
+system/migrations/{migration_id}.json
 ```
 
-`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. View IDs and etags are server-issued opaque UUIDs. `source_sha256` is the lowercase hexadecimal SHA-256 of the exact accepted source bytes. Revision source objects are immutable. Each new successful revision owns immutable `model.glb`, `preview.svg`, seven technical PNGs, and seven canonical shaded PNGs. `projection` accepts only `isometric`, `front`, `back`, `left`, `right`, `top`, and `bottom`; arbitrary object-key input is forbidden. Recipe-versioned paths invalidate caches when visual semantics change. Named-view keys bind the source revision, view ID, etag, and recipe.
+`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. View IDs and etags are server-issued opaque UUIDs. `project_sha256` is the lowercase hexadecimal SHA-256 of the canonical project bundle defined in [`model-projects-libraries.md`](model-projects-libraries.md). Project bundles and release objects are immutable. Each new successful project revision owns immutable `model.glb`, `preview.svg`, seven technical PNGs, and seven canonical shaded PNGs. `projection` accepts only `isometric`, `front`, `back`, `left`, `right`, `top`, and `bottom`; arbitrary object-key input is forbidden. Recipe-versioned paths invalidate caches when visual semantics change. Named-view keys bind the project revision, view ID, etag, and recipe. Migration subkeys and recovery backups are defined in [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md).
 
 Model and view creation and all immutable writes retain the object store's atomic `If-None-Match: *` request. A repeated immutable write accepts identical bytes and rejects conflicting bytes. For matched mutable `model.json` and view JSON changes and deletes, the process serializes mutations, reads the current object ETag, rejects a mismatch, and then sends an unconditional mutation. This process-local optimistic concurrency requires one server replica with a `Recreate` strategy.
 
-`model.json` is the authority for display name, desired source revision, current successful source revision, render state, safe render error, default view ID, optional current-successful facts, and `updated_at`. Facts belong to the recorded current successful revision. They contain total volume in cubic millimetres and source-coordinate axis-aligned x/y/z dimensions in millimetres. Each view object contains the protobuf-equivalent camera fields and etag metadata. JSON schema details must be fixed with the storage adapter; implementations must not infer an alternative key layout.
+`model.json` is the authority for display name, desired project revision, current successful project revision, render state, safe render error, default view ID, optional current-successful facts, and `updated_at`. The unchanged protobuf fields retain `source_revision` in their names as a wire-compatibility label. Facts belong to the recorded current successful revision. They contain total volume in cubic millimetres and source-coordinate axis-aligned x/y/z dimensions in millimetres. Each view object contains the protobuf-equivalent camera fields and etag metadata. JSON schema details must be fixed with the storage adapter; implementations must not infer an alternative key layout.
 
-`updated_at` records the latest accepted model create, source edit, or name edit. Render-state transitions and view mutations do not change it.
+`updated_at` records the latest accepted model create, project edit, compatible-library rollout, or name edit. Render-state transitions and view mutations do not change it.
 
 ## Declared Bucket Ownership
 
@@ -29,17 +35,15 @@ Model and view creation and all immutable writes retain the object store's atomi
 
 The production stack sets `protectData=true`, which applies Pulumi protection to both claims and the PostgreSQL cluster. Preview sets it to false. Protection prevents an ordinary Pulumi delete or replacement of those protected resources; it is not a backup, does not cover every stack resource, and does not override the object-bucket storage class's reclaim policy. No declaration proves that either claim or its generated bucket exists.
 
-## Source Contract
+## Project Contract
 
-`model.create` requires `model_id`, `name`, and `source`. Creation succeeds only when the model ID is absent; a current model conflicts. The source is exactly one non-empty UTF-8 Python file. After execution, its top-level `result` must be a CadQuery `Workplane`, `Shape`, or `Assembly`. Imports and other top-level Python statements are allowed under the trusted-source MVP assumption. CQGI parameters and multi-file projects are excluded.
+[`model-projects-libraries.md`](model-projects-libraries.md) is authoritative for canonical files, managed `AGENTS.md`, dependencies, exact locks, and MCP file operations. Creation succeeds only when the model ID is absent; a current model conflicts. After the explicit Python entrypoint executes with the locked direct libraries available, its top-level `result` must be a CadQuery `Workplane`, `Shape`, or `Assembly`. Imports and other top-level Python statements remain allowed under the trusted-source MVP assumption. CQGI parameters are excluded.
 
-`model.edit` requires `model_id`, `expected_revision`, and at least one of `name` or a non-empty `patches` array. Each patch contains `old` and `new`. The server applies patches sequentially to the desired source. Each non-empty `old` value must match exactly once at its step. The server rejects a stale revision, an empty `old`, a missing or ambiguous match, and an overall no-op source edit.
-
-A name-only edit updates metadata without a source revision, render work, or render-state change. MCP `model.get` loads model metadata first, then returns the immutable UTF-8 source selected by that record's desired revision. MCP `model.list`, protobuf responses, and browser responses remain metadata-only. Source retrieval, creation, and edits are MCP-only; the browser has no source route or editor.
+A name-only edit updates metadata without a project revision, render work, or render-state change. MCP project and library tools are the only source-bearing interfaces. MCP `model.list`, inspect results, protobuf responses, and browser responses remain source-free metadata or artifacts; the browser has no project route or editor.
 
 ## Replacement Rendering
 
-1. Validate the edited UTF-8 source, compute `source_sha256`, and persist immutable `source.py` before marking that revision desired.
+1. Validate and canonicalize the edited project, resolve dependencies only when creation or an explicit dependency edit requires it, compute `project_sha256`, and persist immutable `project.json` before marking that revision desired.
 2. Set the desired revision and render state to `PENDING`, then `RENDERING` when work starts.
 3. Preserve the current successful revision, GLB, preview, images, and facts while the replacement renders.
 4. Compute facts from the CadQuery result before glTF export. Sum compound or assembly component volumes without a boolean union, so overlaps can count independently.
@@ -50,13 +54,13 @@ A name-only edit updates metadata without a source revision, render work, or ren
 9. After every immutable write succeeds, atomically advance the current successful revision, replace its facts, clear the safe error, and set `READY`.
 10. On any failure, preserve the prior current successful revision, artifacts, and facts. Set the desired revision state to `FAILED` and record only a safe bounded error.
 
-Canonical shaded objects are never migrated or overwritten. Existing `three-v1` objects remain legacy and unselected after `three-v2` becomes active. An existing revision needs a successful rerender before canonical v2 inspection can select its seven `three-v2` artifacts; until then, canonical shaded inspection returns not found while technical images retain current behavior. Saved-view inspection can use the current-successful GLB and populate its `three-v2` cache through the existing on-demand render path.
+Canonical shaded objects are never overwritten. The ordered legacy migration copies and remaps existing objects without deleting them. Existing `three-v1` objects remain legacy and unselected after `three-v2` becomes active. An existing revision needs a successful rerender before canonical v2 inspection can select its seven `three-v2` artifacts; until then, canonical shaded inspection returns not found while technical images retain current behavior. Saved-view inspection can use the current-successful GLB and populate its `three-v2` cache through the existing on-demand render path.
 
 The one server replica uses an in-process bounded rendering queue. On restart, models left `PENDING` are queued without rewriting `model.json`; interrupted `RENDERING` models are reset to `PENDING` before being queued. Reconciliation is serialized with repository mutations. Queue limits, renderer timeout, output limits, and subprocess behavior are explicit runtime configuration.
 
 ## Projection Semantics
 
-The CadQuery HLR adapter passes an explicit OpenCascade `gp_Ax2` direction and screen-right basis. This fixes both view direction and roll. Stored images remain immutable, so corrected technical orientation appears only after a later successful source revision.
+The CadQuery HLR adapter passes an explicit OpenCascade `gp_Ax2` direction and screen-right basis. This fixes both view direction and roll. Stored images remain immutable, so corrected technical orientation appears only after a later successful project revision.
 
 | Projection | Source camera direction | Source screen-right | Three camera direction | Three screen-right |
 | --- | --- | --- | --- | --- |
@@ -84,4 +88,4 @@ Before an immutable cache write, the repository rechecks the current successful 
 
 ## Security Boundary
 
-MVP source is trusted operational input but remains capable of arbitrary Python behavior. The renderer is not a hostile-code sandbox. Production source access for untrusted principals is forbidden until a separately reviewed isolation design exists.
+MVP project and library source is trusted operational input but remains capable of arbitrary Python behavior. The renderer is not a hostile-code sandbox. Production source access for untrusted principals is forbidden until a separately reviewed isolation design exists.

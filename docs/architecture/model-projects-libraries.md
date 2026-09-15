@@ -1,0 +1,107 @@
+# Model Projects and Shared Libraries
+
+## Status and Authority
+
+This document defines the implemented model-project and shared-library contract. The project API, library API, rollout worker, and migration exist in the repository as one hard cutover; no compatibility schema exposes singular `source` input or output. This repository state does not prove a preview or production deployment. [`storage-rendering.md`](storage-rendering.md) owns object keys and render advancement, while [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) owns legacy conversion.
+
+The MCP API is the only source-bearing interface. Protobuf and browser APIs continue to expose model metadata and current-successful artifacts only. Existing protobuf field names such as `desired_source_revision` remain unchanged; their values identify project revisions after the cutover.
+
+## Canonical Project Bundle
+
+A model revision is the lowercase hexadecimal SHA-256 of one immutable canonical project bundle. A bundle contains:
+
+- normalized UTF-8 project files, including the rendered `AGENTS.md`;
+- one explicit Python entrypoint path;
+- direct shared-library requirements as compatible version ranges; and
+- one exact immutable release lock for every requirement.
+
+The project may contain at most 256 caller-owned files and 64 direct-library requirements. Each normalized caller-owned file is at most 1,048,576 bytes, and their combined normalized content is at most 1,048,576 bytes. The generated `AGENTS.md` is at most 1,048,576 bytes, and the final canonical bundle is at most 16,777,216 bytes. The caller-content limit preserves the implemented single-source bound while permitting multiple files; the other limits are new. Empty files are allowed, but the Python entrypoint must be non-empty.
+
+Every path is a relative POSIX path composed strictly of printable ASCII bytes `0x20` through `0x7e`, with `/` as the separator. A path is at most 1,024 bytes, each component is at most 255 bytes, and no two paths have the same byte representation. Paths are case-sensitive and preserved byte-for-byte. They must not be absolute or empty and must not contain an empty, `.` or `..` component, a backslash, or trailing slash. `AGENTS.md` is the only reserved path. Symlinks, hard links, devices, and directories as entries are forbidden. The entrypoint must name an existing regular `.py` file other than `AGENTS.md`.
+
+Canonicalization first validates each path without rewriting it, decodes each file as strict UTF-8, removes one leading UTF-8 BOM when present, converts CRLF and bare CR to LF, and encodes the result as UTF-8 without adding or removing a final newline. Faktory then regenerates `AGENTS.md`. The canonical bundle is UTF-8 JSON with no insignificant whitespace, a trailing LF, keys ordered exactly as shown below, and JSON strings escaped according to RFC 8259. The encoder escapes quotation mark, reverse solidus, and control characters; it uses the two-character control escape where RFC 8259 defines one and lowercase `\u00xx` otherwise, and it does not escape solidus or non-ASCII file content. Arrays use the stated order:
+
+```json
+{"format":"faktory-project-v1","entrypoint":"main.py","requirements":[{"name":"fasteners","range":">=1.2.0,<2.0.0"}],"locks":[{"name":"fasteners","version":"1.4.1","release_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}],"files":[{"path":"AGENTS.md","content":"..."},{"path":"main.py","content":"..."}]}
+```
+
+Requirements and locks are sorted by library-name ASCII bytes. Files are sorted by exact path bytes. Names are unique in each array, each requirement has exactly one same-name lock, and no unspecified JSON member is permitted. The SHA-256 covers every byte, including the final LF. This representation, rather than upload order, request JSON, object metadata, or render artifacts, defines revision identity.
+
+## Managed AGENTS.md
+
+Every project contains `AGENTS.md` with exactly three top-level sections in this order:
+
+1. `# Index` is generated from the canonical path list and identifies the entrypoint.
+2. `# Dependency Guidance` is generated from the exact locks and embeds each release's agent guidance and links to its bundled documentation.
+3. `# Hints` contains model-specific user guidance and may be empty.
+
+Faktory owns the first two sections and their separating whitespace. It preserves the normalized body beneath `# Hints`; that body may use headings at level two or lower but may not contain another top-level heading. Project creation accepts `hints`, not caller-supplied `AGENTS.md` bytes. `model.edit` may change hints through its dedicated exact-patch operation, but generic add, patch, delete, or rename operations cannot target `AGENTS.md`. Faktory regenerates the complete file after any file, entrypoint, requirement, or lock change. A generated index never exposes object-store keys or hidden server metadata.
+
+The generated bytes use LF and this exact structure, ending with one LF. Canonical JSON-string encoding quotes every path and documentation name. The index lists all files, including `AGENTS.md`, in canonical path order. A dependency subsection is repeated in library-name order; normalized guidance must not contain a level-one or level-two heading. Its documentation list names every bundled doc in canonical path order. With no locks, the dependency body is exactly `No shared libraries are locked.`. The hints body follows the final heading after one blank line and has trailing blank lines removed.
+
+```text
+# Index
+
+Entrypoint: "main.py"
+
+- "AGENTS.md"
+- "main.py"
+
+# Dependency Guidance
+
+## faktory_shared.fasteners 1.4.1
+
+Release: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+<normalized agent guidance>
+
+Documentation through MCP library.get:
+
+- "guide.md"
+
+# Hints
+
+<normalized user hints>
+```
+
+## MCP Model Cutover
+
+The hard cutover retains the `model.create`, `model.get`, and `model.edit` names but removes every singular `source` and source-patch schema:
+
+- `model.create` requires `model_id`, `name`, `files`, and `entrypoint`. Each file has `path` and `content`. Optional `requirements` and `hints` default to an empty array and empty string. Faktory resolves each supplied requirement and writes exact locks before calculating the revision.
+- `model.get` accepts only `model_id`. It returns complete model metadata and the complete canonical desired-revision project: every file with its content, the generated `AGENTS.md`, entrypoint, requirements, and exact locks.
+- `model.edit` requires `model_id`, `expected_revision`, and at least a name change or one `operations` array. The array contains 1 through 256 ordered operations: `file.add(path, content)`, `file.patch(path, patches)`, `file.delete(path)`, `file.rename(from, to)`, `entrypoint.set(path)`, `dependencies.set(requirements)`, and `hints.patch(patches)`. One patch operation contains 1 through 256 exact patches. A name-only edit omits `operations`.
+
+Operations apply sequentially to the desired project. An exact patch has non-empty `old` text that must match exactly once at its step; patches within an operation also apply sequentially. Add rejects an existing path, delete rejects a missing path or the active entrypoint, and rename rejects a missing source or existing destination. The complete result must pass path, entrypoint, dependency, AGENTS, and size validation and must differ from the prior project. `expected_revision` guards the whole edit. A name-only edit retains its existing metadata-only behavior.
+
+Creation, retrieval, editing, library operations, and source-bearing errors remain confidential to authorized MCP callers. Model list and inspect tools, browser gRPC-web, watches, protobuf records, logs, telemetry, and HTTP artifacts never contain project files, AGENTS content, requirements guidance, or library source.
+
+## Shared Library Releases
+
+A library name matches `^[a-z][a-z0-9_]{0,63}$` and imports beneath `faktory_shared.<name>`. Each immutable release contains 1 through 256 normalized Python package files under `faktory_shared/<name>/`, one non-empty agent-guidance document, and 1 through 64 UTF-8 documentation files under `docs/`. Guidance is at most 16,384 bytes. Each package or documentation file is at most 1,048,576 bytes, their combined normalized content is at most 1,048,576 bytes, and the canonical release bundle is at most 8,388,608 bytes. It uses an exact stable version `MAJOR.MINOR.PATCH` with no leading zero, prerelease, or build suffix.
+
+The canonical release bundle is one UTF-8 JSON object with keys in exact `format`, `name`, `version`, `guidance`, `docs`, and `files` order and the project bundle's string encoding and final LF. Each doc and file has exact `path` then `content` keys. Docs and files are separately sorted by exact ASCII path bytes. No unspecified member is permitted. The release identity is the lowercase SHA-256 of those canonical bytes.
+
+```json
+{"format":"faktory-library-v1","name":"fasteners","version":"1.4.1","guidance":"...","docs":[{"path":"docs/guide.md","content":"..."}],"files":[{"path":"faktory_shared/fasteners/__init__.py","content":"..."}]}
+```
+
+Major versions may break consumers. Minor and patch versions must remain backward compatible with every earlier release in the same major. A new version must be greater than every previously published version of that library. Publication is permanent: versions and bytes cannot be replaced, yanked, or deleted. A release has no dependency section and must not use a static import statement for another `faktory_shared` package. Server publication validation rejects forbidden static statement forms before storage. Before execution, the Python worker parses every library file and rejects syntax-aware multiline, aliased, and relative cross-library imports. Models must declare every shared library they use directly; transitive shared-library dependencies are unsupported.
+
+Faktory provides no external dependency declaration, installation, or resolution. Trusted projects and libraries can import modules already present in the fixed renderer runtime or Python standard library. This availability does not create a supported dependency contract. Dynamic import tricks that bypass static validation fall outside the trusted-source guarantee; the renderer is not a hostile-code sandbox.
+
+The only accepted model requirement syntax is `>=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0`, with no whitespace, where `NEXT_MAJOR` is `MAJOR + 1`. The lower bound records the oldest compatible API the model accepts. Each lock records the selected exact version and release SHA-256. Initial resolution and explicit dependency edits select the highest published compatible version, then store it in the bundle. Rendering imports only those locked releases and never consults the mutable release catalog.
+
+MCP-only `library.list`, `library.get`, and `library.publish` tools expose release metadata and authorized source, guidance, and docs. Publication validates package namespace, canonical bytes, stable SemVer, version uniqueness, direct-only imports, and compatibility policy. There is no browser, protobuf, HTTP artifact, deletion, or yank API for libraries.
+
+## Compatible Rollout
+
+Publishing a minor or patch release creates a durable rollout record keyed by library name and exact release identity. The single server processes that record idempotently. For each model whose current desired project declares a range containing the new version, it rechecks the current desired revision under the mutation lock, replaces only that library's lock, regenerates `AGENTS.md`, calculates the deterministic project revision, and advances that revision to `PENDING`. The ordinary render path then preserves and replaces artifacts atomically.
+
+The rollout records a per-model terminal outcome and can resume after restart without duplicating revisions or render work. A model changed concurrently is re-evaluated against its new desired project rather than overwritten. Publication succeeds only after the release and rollout intent are durable; it does not wait for every render. A newly published compatible version is selected even if a prior compatible render failed. A major release never creates automatic model revisions; each consumer must explicitly change its requirement through `model.edit`.
+
+`model.render.retry` retries the exact desired project revision and its stored locks. It never resolves requirements, adopts a later release, regenerates AGENTS, or changes revision identity.
+
+## Exclusions
+
+This contract adds no browser source UI, protobuf fields, library yanking or deletion, prerelease versions, external dependency management, hostile-code sandbox, or multi-replica coordination. The trusted-source and source-confidentiality boundaries remain in force.

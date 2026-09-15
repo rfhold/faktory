@@ -43,7 +43,35 @@ class RendererTests(unittest.TestCase):
     def render_model(
         self, source: Path, glb: Path, svg: Path, facts: Path
     ) -> str | None:
-        return render(source, glb, svg, facts, self.projection_paths(glb.parent))
+        library_root = source.parent / "libraries"
+        library_root.mkdir(exist_ok=True)
+        return render(
+            source.parent,
+            Path(source.name),
+            library_root,
+            glb,
+            svg,
+            facts,
+            self.projection_paths(glb.parent),
+        )
+
+    def render_project(
+        self,
+        project_root: Path,
+        entrypoint: str,
+        library_root: Path,
+        output_root: Path,
+    ) -> str | None:
+        glb, svg, facts = self.render_paths(output_root)
+        return render(
+            project_root,
+            Path(entrypoint),
+            library_root,
+            glb,
+            svg,
+            facts,
+            self.projection_paths(output_root),
+        )
 
     def test_supported_result_types_produce_all_outputs(self) -> None:
         sources = {
@@ -247,13 +275,16 @@ class RendererTests(unittest.TestCase):
                 "result = cq.Workplane('XY').box(1, 1, 1)\n",
                 encoding="utf-8",
             )
+            (root / "libraries").mkdir()
 
             completed = subprocess.run(
                 [
                     sys.executable,
                     "-m",
                     "renderer",
-                    str(source),
+                    str(root),
+                    source.name,
+                    str(root / "libraries"),
                     str(glb),
                     str(svg),
                     str(facts),
@@ -283,13 +314,16 @@ class RendererTests(unittest.TestCase):
                 "print('source text')\nraise RuntimeError('secret details')\n",
                 encoding="utf-8",
             )
+            (root / "libraries").mkdir()
 
             completed = subprocess.run(
                 [
                     sys.executable,
                     "-m",
                     "renderer",
-                    str(source),
+                    str(root),
+                    source.name,
+                    str(root / "libraries"),
                     *(str(path) for path in outputs),
                     *(str(path) for path in self.projection_paths(root)),
                 ],
@@ -310,7 +344,7 @@ class RendererTests(unittest.TestCase):
 
     def test_cli_rejects_wrong_argument_count(self) -> None:
         completed = subprocess.run(
-            [sys.executable, "-m", "renderer", "source.py", "model.glb"],
+            [sys.executable, "-m", "renderer", "project", "main.py"],
             check=False,
             capture_output=True,
             text=True,
@@ -334,6 +368,244 @@ class RendererTests(unittest.TestCase):
                     self.render_model(source, *self.render_paths(root)), expected
                 )
 
+    def test_project_sibling_and_nested_package_imports(self) -> None:
+        cases = {
+            "main.py": {
+                "main.py": "from shape import make\nresult = make()\n",
+                "shape.py": (
+                    "import cadquery as cq\n"
+                    "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n"
+                ),
+            },
+            "parts/main.py": {
+                "parts/__init__.py": "",
+                "parts/main.py": "from .shape import make\nresult = make()\n",
+                "parts/shape.py": (
+                    "import cadquery as cq\n"
+                    "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n"
+                ),
+            },
+        }
+        for entrypoint, files in cases.items():
+            with self.subTest(entrypoint=entrypoint), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                libraries = root / "libraries"
+                outputs = root / "outputs"
+                project.mkdir()
+                libraries.mkdir()
+                outputs.mkdir()
+                for relative, content in files.items():
+                    path = project / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+
+                self.assertIsNone(
+                    self.render_project(project, entrypoint, libraries, outputs)
+                )
+                facts = json.loads((outputs / "model.json").read_text(encoding="utf-8"))
+                self.assertEqual(facts["size_millimeters"], {"x": 2.0, "y": 3.0, "z": 4.0})
+
+    def test_exact_shared_library_import_wins_over_project_namespace_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            libraries = root / "libraries"
+            outputs = root / "outputs"
+            (project / "faktory_shared" / "gears").mkdir(parents=True)
+            (libraries / "faktory_shared" / "gears").mkdir(parents=True)
+            outputs.mkdir()
+            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
+            (libraries / "faktory_shared" / "gears" / "__init__.py").write_text(
+                "import cadquery as cq\n"
+                "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n",
+                encoding="utf-8",
+            )
+            (project / "faktory_shared" / "gears" / "__init__.py").write_text(
+                "raise RuntimeError('project collision executed')\n", encoding="utf-8"
+            )
+            (project / "main.py").write_text(
+                "from faktory_shared.gears import make\nresult = make()\n",
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(self.render_project(project, "main.py", libraries, outputs))
+            facts = json.loads((outputs / "model.json").read_text(encoding="utf-8"))
+            self.assertEqual(facts["size_millimeters"], {"x": 2.0, "y": 3.0, "z": 4.0})
+
+    def test_shared_library_rejects_multiline_and_aliased_cross_library_imports(self) -> None:
+        cases = {
+            "from": "from faktory_shared import (\n    wheels as other,\n)\n",
+            "import": "import faktory_shared.wheels as other\n",
+        }
+        for statement, library_source in cases.items():
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                libraries = root / "libraries"
+                outputs = root / "outputs"
+                project.mkdir()
+                (libraries / "faktory_shared" / "gears").mkdir(parents=True)
+                outputs.mkdir()
+                (libraries / "faktory_shared" / "__init__.py").write_text(
+                    "", encoding="utf-8"
+                )
+                (libraries / "faktory_shared" / "gears" / "__init__.py").write_text(
+                    library_source, encoding="utf-8"
+                )
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+
+                self.assertEqual(
+                    self.render_project(project, "main.py", libraries, outputs),
+                    "invalid_library_source",
+                )
+                self.assertFalse(any(outputs.iterdir()))
+
+    def test_shared_library_permits_same_library_relative_and_absolute_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            libraries = root / "libraries"
+            outputs = root / "outputs"
+            project.mkdir()
+            package = libraries / "faktory_shared" / "gears"
+            package.mkdir(parents=True)
+            outputs.mkdir()
+            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
+            (package / "helper.py").write_text(
+                "import cadquery as cq\n"
+                "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n",
+                encoding="utf-8",
+            )
+            (package / "__init__.py").write_text(
+                "from .helper import (\n    make as relative_make,\n)\n"
+                "from faktory_shared.gears.helper import make as absolute_make\n"
+                "assert relative_make is absolute_make\n"
+                "make = relative_make\n",
+                encoding="utf-8",
+            )
+            (project / "main.py").write_text(
+                "from faktory_shared.gears import make\nresult = make()\n",
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(self.render_project(project, "main.py", libraries, outputs))
+            facts = json.loads((outputs / "model.json").read_text(encoding="utf-8"))
+            self.assertEqual(facts["size_millimeters"], {"x": 2.0, "y": 3.0, "z": 4.0})
+
+    def test_invalid_library_syntax_has_stable_error_without_source_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            libraries = root / "libraries"
+            outputs = root / "outputs"
+            project.mkdir()
+            package = libraries / "faktory_shared" / "gears"
+            package.mkdir(parents=True)
+            outputs.mkdir()
+            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
+            (package / "__init__.py").write_text(
+                "TOP_SECRET = (\n", encoding="utf-8"
+            )
+            (project / "main.py").write_text("result = None\n", encoding="utf-8")
+            glb, svg, facts = self.render_paths(outputs)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "renderer",
+                    str(project),
+                    "main.py",
+                    str(libraries),
+                    str(glb),
+                    str(svg),
+                    str(facts),
+                    *(str(path) for path in self.projection_paths(outputs)),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(completed.stderr, "renderer_error=invalid_library_source\n")
+            self.assertNotIn("TOP_SECRET", completed.stderr)
+            self.assertFalse(any(outputs.iterdir()))
+
+    def test_missing_shared_library_has_stable_error_and_no_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            libraries = root / "libraries"
+            outputs = root / "outputs"
+            project.mkdir()
+            libraries.mkdir()
+            outputs.mkdir()
+            (project / "main.py").write_text(
+                "from faktory_shared.missing import make\nresult = make()\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                self.render_project(project, "main.py", libraries, outputs),
+                "source_execution_failed",
+            )
+            self.assertFalse(any(outputs.iterdir()))
+
+    def test_absolute_and_traversing_entrypoints_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            libraries = root / "libraries"
+            outputs = root / "outputs"
+            project.mkdir()
+            libraries.mkdir()
+            outputs.mkdir()
+            source = project / "main.py"
+            source.write_text("result = None\n", encoding="utf-8")
+            for entrypoint in (str(source), "../project/main.py"):
+                with self.subTest(entrypoint=entrypoint):
+                    self.assertEqual(
+                        self.render_project(project, entrypoint, libraries, outputs),
+                        "invalid_entrypoint",
+                    )
+                    self.assertFalse(any(outputs.iterdir()))
+
+    def test_repeated_project_execution_restores_globals_and_outputs_identically(self) -> None:
+        rendered: list[tuple[bytes, ...]] = []
+        original_cwd = Path.cwd()
+        original_path = sys.path.copy()
+        for _ in range(2):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                libraries = root / "libraries"
+                outputs = root / "outputs"
+                project.mkdir()
+                libraries.mkdir()
+                outputs.mkdir()
+                (project / "main.py").write_text(
+                    "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 2, 3)\n",
+                    encoding="utf-8",
+                )
+                self.assertIsNone(
+                    self.render_project(project, "main.py", libraries, outputs)
+                )
+                rendered.append(
+                    tuple(
+                        path.read_bytes()
+                        for path in (
+                            *self.render_paths(outputs),
+                            *self.projection_paths(outputs),
+                        )
+                    )
+                )
+                self.assertEqual(Path.cwd(), original_cwd)
+                self.assertEqual(sys.path, original_path)
+        self.assertEqual(rendered[0], rendered[1])
+
     def test_invalid_utf8_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -356,7 +628,7 @@ class RendererTests(unittest.TestCase):
 
             self.assertEqual(
                 self.render_model(root / "missing.py", glb, svg, facts),
-                "invalid_source_path",
+                "invalid_entrypoint",
             )
             self.assertEqual(
                 self.render_model(source, source, svg, facts), "invalid_output_path"

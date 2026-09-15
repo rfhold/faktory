@@ -2,6 +2,8 @@
 
 Read [the documentation index](docs/README.md) and the nearest contract before changing behavior. Keep source and generated protocol bindings in the same change.
 
+The implemented model-project hard cutover is defined by [Model Projects and Shared Libraries](docs/architecture/model-projects-libraries.md) and [Object-Store Migrations](docs/operations/object-store-migrations.md). Preserve its MCP schema replacement, canonical bundle, shared-library rollout, and legacy migration together; do not reintroduce a singular-source schema. This behavior adds no protobuf fields or browser source interface.
+
 ## Toolchains
 
 - Rust `1.96.0` with edition 2024.
@@ -90,8 +92,11 @@ docker run --rm --entrypoint /bin/sh faktory-renderer-verify:local -c '
 set -eu
 output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
 trap '\''rm -rf "$output_dir"'\'' EXIT
+mkdir "$output_dir/libraries"
 /opt/faktory/env/bin/python -m renderer \
-  /opt/faktory/renderer/examples/box.py \
+  /opt/faktory/renderer/examples \
+  box.py \
+  "$output_dir/libraries" \
   "$output_dir/model.glb" \
   "$output_dir/model.svg" \
   "$output_dir/model.json" \
@@ -127,13 +132,13 @@ Faktory uses `FAKTORY_VISUAL_RENDERER_URL=http://visual-renderer:8081` and `FAKT
 
 Faktory runs with exact `FAKTORY_AUTH_MODE=disabled`. The SPA, gRPC-web, artifact, and MCP routes require no cookie or bearer token. The Faktory image build selects the native Linux AMD64 or ARM64 renderer lock automatically.
 
-All fixed Compose credentials are local-development-only. Open `http://localhost:8080` directly; no sign-in or MCP OAuth flow is used locally. The Faktory port is published only on `127.0.0.1`. Never expose this unauthenticated topology beyond loopback:
+All fixed Compose credentials are local-development-only. Compose publishes Faktory on every host interface at `0.0.0.0:8080`, with canonical public base URL `http://172.16.1.40:8080`. Use this unauthenticated service only on a trusted private network, and restrict TCP 8080 with the host firewall. Garage remains bound to loopback, and the visual renderer has no host port. Exact `FAKTORY_AUTH_MODE=disabled` bypasses OAuth and redirect validation; generated absolute, callback, authorization, and resource URLs still use the configured public base. No sign-in or MCP OAuth flow runs locally:
 
 ```bash
 docker compose build
 docker compose up --wait --wait-timeout 180
-curl --fail http://localhost:8080/health
-curl --fail http://localhost:8080/ready
+curl --fail http://172.16.1.40:8080/health
+curl --fail http://172.16.1.40:8080/ready
 docker compose down --volumes --remove-orphans
 ```
 

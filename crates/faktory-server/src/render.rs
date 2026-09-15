@@ -1,9 +1,9 @@
 //! Bounded external renderer orchestration.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{BTreeSet, HashMap, hash_map::Entry},
     fmt,
-    path::Path,
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -15,6 +15,7 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use tokio::{
+    io::AsyncWriteExt as _,
     sync::{Semaphore, mpsc},
     task::AbortHandle,
 };
@@ -319,12 +320,9 @@ async fn render(
     visual: &VisualCoordinator,
     job: &RenderJob,
 ) -> Result<RenderedOutput, &'static str> {
-    let source = repository
-        .source(&job.model_id, &job.revision)
-        .await
-        .map_err(|_| "source unavailable")?;
     let directory = tempfile::tempdir().map_err(|_| "temporary storage unavailable")?;
-    let source_path = directory.path().join("source.py");
+    let (project_root, entrypoint, library_root) =
+        materialize_render_inputs(repository, directory.path(), job).await?;
     let glb_path = directory.path().join("model.glb");
     let preview_path = directory.path().join("preview.svg");
     let facts_path = directory.path().join("facts.json");
@@ -333,13 +331,12 @@ async fn render(
             .path()
             .join(format!("projection-{}.svg", projection.as_str()))
     });
-    tokio::fs::write(&source_path, source)
-        .await
-        .map_err(|_| "temporary storage unavailable")?;
     let mut command = tokio::process::Command::new(&config.command[0]);
     command
         .args(&config.command[1..])
-        .arg(&source_path)
+        .arg(&project_root)
+        .arg(&entrypoint)
+        .arg(&library_root)
         .arg(&glb_path)
         .arg(&preview_path)
         .arg(&facts_path)
@@ -387,6 +384,106 @@ async fn render(
         },
         shaded,
     })
+}
+
+async fn materialize_render_inputs(
+    repository: &Repository,
+    staging_root: &Path,
+    job: &RenderJob,
+) -> Result<(PathBuf, String, PathBuf), &'static str> {
+    let project = repository
+        .get_project(&job.model_id, &job.revision)
+        .await
+        .map_err(|_| "project unavailable")?;
+    let project_root = staging_root.join("project");
+    let library_root = staging_root.join("libraries");
+    tokio::fs::create_dir(&project_root)
+        .await
+        .map_err(|_| "temporary storage unavailable")?;
+    tokio::fs::create_dir(&library_root)
+        .await
+        .map_err(|_| "temporary storage unavailable")?;
+
+    let mut project_paths = BTreeSet::new();
+    for file in &project.files {
+        materialize_file(
+            &project_root,
+            &file.path,
+            file.content.as_bytes(),
+            &mut project_paths,
+        )
+        .await
+        .map_err(|()| "project unavailable")?;
+    }
+
+    let mut library_paths = BTreeSet::new();
+    materialize_file(
+        &library_root,
+        "faktory_shared/__init__.py",
+        b"",
+        &mut library_paths,
+    )
+    .await
+    .map_err(|()| "temporary storage unavailable")?;
+    for lock in &project.locks {
+        let release = repository
+            .get_library(&lock.name, &lock.version)
+            .await
+            .map_err(|_| "locked library unavailable")?;
+        if release.digest != lock.release_sha256 {
+            return Err("locked library unavailable");
+        }
+        for file in &release.files {
+            materialize_file(
+                &library_root,
+                &file.path,
+                file.content.as_bytes(),
+                &mut library_paths,
+            )
+            .await
+            .map_err(|()| "locked library unavailable")?;
+        }
+    }
+    safe_relative_path(&project.entrypoint).map_err(|()| "project unavailable")?;
+    Ok((project_root, project.entrypoint, library_root))
+}
+
+async fn materialize_file(
+    root: &Path,
+    relative: &str,
+    content: &[u8],
+    paths: &mut BTreeSet<PathBuf>,
+) -> Result<(), ()> {
+    let relative = safe_relative_path(relative)?;
+    if !paths.insert(relative.clone()) {
+        return Err(());
+    }
+    let destination = root.join(relative);
+    let parent = destination.parent().ok_or(())?;
+    tokio::fs::create_dir_all(parent).await.map_err(|_| ())?;
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .await
+        .map_err(|_| ())?;
+    output.write_all(content).await.map_err(|_| ())?;
+    output.flush().await.map_err(|_| ())
+}
+
+fn safe_relative_path(path: &str) -> Result<PathBuf, ()> {
+    if path.is_empty() {
+        return Err(());
+    }
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(());
+    }
+    Ok(path.to_owned())
 }
 
 async fn render_shaded(
@@ -759,6 +856,10 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+    use crate::model::{
+        library::LibraryRelease,
+        project::{DirectRequirement, ProjectFile},
+    };
     use crate::storage::{
         InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject,
     };
@@ -946,6 +1047,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accepts_only_normal_relative_staging_paths() {
+        assert_eq!(
+            safe_relative_path("parts/main.py"),
+            Ok(PathBuf::from("parts/main.py"))
+        );
+        for path in ["", ".", "../main.py", "parts/../main.py", "/main.py"] {
+            assert_eq!(safe_relative_path(path), Err(()), "accepted {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn materializes_exact_project_and_locked_library_code_only() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        repository
+            .publish_library(
+                LibraryRelease::new(
+                    "gears".to_owned(),
+                    semver::Version::new(1, 2, 3),
+                    vec![ProjectFile {
+                        path: "faktory_shared/gears/__init__.py".to_owned(),
+                        content: "VALUE = 123\n".to_owned(),
+                    }],
+                    "Import the locked package.".to_owned(),
+                    vec![ProjectFile {
+                        path: "docs/guide.md".to_owned(),
+                        content: "Private library documentation\n".to_owned(),
+                    }],
+                )
+                .expect("library release"),
+            )
+            .await
+            .expect("publish library");
+        let model = repository
+            .create_project_from_files(
+                "part",
+                "Part",
+                vec![
+                    ProjectFile {
+                        path: "parts/main.py".to_owned(),
+                        content: "from faktory_shared.gears import VALUE\nresult = VALUE\n"
+                            .to_owned(),
+                    },
+                    ProjectFile {
+                        path: "parts/helper.py".to_owned(),
+                        content: "HELPER = True\n".to_owned(),
+                    },
+                ],
+                "parts/main.py".to_owned(),
+                vec![DirectRequirement {
+                    name: "gears".to_owned(),
+                    range: ">=1.0.0,<2.0.0".to_owned(),
+                }],
+                "Project hints",
+            )
+            .await
+            .expect("create project");
+        let directory = tempfile::tempdir().expect("temp directory");
+
+        let (project_root, entrypoint, library_root) = materialize_render_inputs(
+            &repository,
+            directory.path(),
+            &RenderJob {
+                model_id: model.id,
+                revision: model.desired_source_revision,
+            },
+        )
+        .await
+        .expect("materialize render inputs");
+
+        assert_eq!(entrypoint, "parts/main.py");
+        assert_eq!(
+            tokio::fs::read_to_string(project_root.join("parts/helper.py"))
+                .await
+                .expect("project helper"),
+            "HELPER = True\n"
+        );
+        assert!(project_root.join("AGENTS.md").is_file());
+        assert_eq!(
+            tokio::fs::read_to_string(library_root.join("faktory_shared/gears/__init__.py"))
+                .await
+                .expect("locked package"),
+            "VALUE = 123\n"
+        );
+        assert!(library_root.join("faktory_shared/__init__.py").is_file());
+        assert!(!library_root.join("docs").exists());
+    }
+
     #[tokio::test]
     async fn validates_complete_glb_v2_chunk_structure() {
         let directory = tempfile::tempdir().expect("temp directory");
@@ -1100,7 +1289,7 @@ mod tests {
         let script_path = directory.path().join("renderer.sh");
         tokio::fs::write(
             &script_path,
-            b"test \"$#\" -eq 11 || exit 2\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$2\"\nprintf '<svg></svg>' > \"$3\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4\"\nfor output in \"$5\" \"$6\" \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
+            b"test \"$#\" -eq 13 || exit 2\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$4\"\nprintf '<svg></svg>' > \"$5\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$6\"\nfor output in \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\" \"${12}\" \"${13}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
         )
         .await
         .expect("write renderer");
@@ -1144,7 +1333,7 @@ mod tests {
         let script_path = directory.path().join("renderer.sh");
         tokio::fs::write(
             &script_path,
-            b"printf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$2\"\nprintf '<svg></svg>' > \"$3\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4\"\nfor output in \"$5\" \"$6\" \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
+            b"printf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$4\"\nprintf '<svg></svg>' > \"$5\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$6\"\nfor output in \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\" \"${12}\" \"${13}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
         )
         .await
         .expect("write renderer");

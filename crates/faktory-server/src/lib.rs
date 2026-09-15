@@ -6,6 +6,7 @@
 pub mod app;
 pub mod auth;
 pub mod mcp;
+pub mod migrations;
 pub mod model;
 pub mod observability;
 pub mod production;

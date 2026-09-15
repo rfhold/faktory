@@ -11,13 +11,16 @@ use mcp::{
         StreamableHttpOptions, streamable_http_router_with_options,
     },
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
     model::{
-        ModelRecord, Repository, RepositoryError, SourcePatch, TechnicalProjection,
-        ViewRenderIdentity,
+        ModelRecord, Repository, RepositoryError, TechnicalProjection, ViewRenderIdentity,
+        library::LibraryRelease,
+        project::{DirectRequirement, ProjectEdit, ProjectFile, ProjectOperation},
+        rollout::{LibraryRolloutRecord, RolloutModelState},
     },
     render::{
         PROJECTION_HEIGHT, PROJECTION_WIDTH, RenderQueue, validate_projection_png,
@@ -93,8 +96,8 @@ impl FaktoryMcp {
     #[tool(name = "model.get", definition = model_get_definition())]
     async fn model_get(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
         let input: ModelIdInput = parse(call)?;
-        match get_model_with_source(&self.repository, &input.model_id).await {
-            Ok((model, source)) => Ok(model_get_result(model, source)),
+        match get_model_with_project(&self.repository, &input.model_id).await {
+            Ok((model, project)) => Ok(result(json!({ "model": model, "project": project }))),
             Err(error) => Ok(tool_error(error)),
         }
     }
@@ -157,6 +160,51 @@ impl FaktoryMcp {
         let input: EditInput = parse(call)?;
         match edit_and_schedule(self.repository.clone(), self.renders.clone(), input).await {
             Ok(model) => Ok(result(json!({ "model": model }))),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "library.list", definition = library_list_definition())]
+    async fn library_list(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let _: EmptyInput = parse(call)?;
+        match self.repository.list_libraries().await {
+            Ok(libraries) => Ok(result(json!({ "libraries": libraries }))),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "library.get", definition = library_get_definition())]
+    async fn library_get(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: LibraryGetInput = parse(call)?;
+        match self
+            .repository
+            .get_library(&input.name, &input.version)
+            .await
+        {
+            Ok(release) => Ok(result(
+                json!({ "release": library_release_value(&release) }),
+            )),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "library.publish", definition = library_publish_definition())]
+    async fn library_publish(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: LibraryPublishInput = parse(call)?;
+        match publish_and_rollout(self.repository.clone(), self.renders.clone(), input).await {
+            Ok(output) => Ok(result(output)),
             Err(error) => Ok(tool_error(error)),
         }
     }
@@ -235,25 +283,20 @@ impl FaktoryMcp {
     }
 }
 
-async fn get_model_with_source(
+async fn get_model_with_project(
     repository: &Repository,
     model_id: &str,
-) -> Result<(ModelRecord, String), RepositoryError> {
+) -> Result<(ModelRecord, crate::model::project::ProjectBundle), RepositoryError> {
     let model = repository.get_model(model_id).await?.record;
-    let source = match repository
-        .source(&model.id, &model.desired_source_revision)
+    let project = match repository
+        .get_project(&model.id, &model.desired_source_revision)
         .await
     {
-        Ok(source) => source,
+        Ok(project) => project,
         Err(RepositoryError::NotFound) => return Err(RepositoryError::Corrupt),
         Err(error) => return Err(error),
     };
-    let source = String::from_utf8(source.to_vec()).map_err(|_| RepositoryError::Corrupt)?;
-    Ok((model, source))
-}
-
-fn model_get_result(model: ModelRecord, source: String) -> McpToolResult {
-    result(json!({ "model": model, "source": source }))
+    Ok((model, project))
 }
 
 async fn inspect_model(
@@ -421,7 +464,14 @@ async fn create_and_schedule(
     let task_repository = repository.clone();
     let task = tokio::spawn(async move {
         let model = task_repository
-            .create_model(&input.model_id, &input.name, input.source.as_bytes())
+            .create_project_from_files(
+                &input.model_id,
+                &input.name,
+                input.files,
+                input.entrypoint,
+                input.requirements,
+                &input.hints,
+            )
             .await?;
         reservation.submit(model.id.clone(), model.desired_source_revision.clone());
         Ok(model)
@@ -434,9 +484,10 @@ async fn edit_and_schedule(
     renders: RenderQueue,
     input: EditInput,
 ) -> Result<ModelRecord, RepositoryError> {
-    if input.patches.is_none() {
+    let project = input.operations.map(ProjectEdit::new).transpose()?;
+    if project.is_none() {
         return repository
-            .edit_model(
+            .edit_project(
                 &input.model_id,
                 &input.expected_revision,
                 input.name.as_deref(),
@@ -448,13 +499,12 @@ async fn edit_and_schedule(
     let reservation = renders.reserve().await?;
     let task_repository = repository.clone();
     let task = tokio::spawn(async move {
-        let patches = input.patches.as_deref();
         let edited = task_repository
-            .edit_model(
+            .edit_project(
                 &input.model_id,
                 &input.expected_revision,
                 input.name.as_deref(),
-                patches,
+                project.as_ref(),
             )
             .await?;
         debug_assert!(edited.source_changed);
@@ -465,6 +515,90 @@ async fn edit_and_schedule(
         Ok(edited.record)
     });
     join_scheduled(&repository, task).await
+}
+
+async fn publish_and_rollout(
+    repository: Repository,
+    renders: RenderQueue,
+    input: LibraryPublishInput,
+) -> Result<Value, RepositoryError> {
+    let task_repository = repository.clone();
+    let task = tokio::spawn(async move {
+        let release = task_repository
+            .publish_library(LibraryRelease::new(
+                input.name,
+                input.version,
+                input.files,
+                input.guidance,
+                input.docs,
+            )?)
+            .await?;
+        let compatible = task_repository
+            .list_library_releases(&release.name)
+            .await?
+            .iter()
+            .any(|candidate| {
+                candidate.version != release.version
+                    && candidate.version.major == release.version.major
+            });
+        let (rollout, scheduled) = if compatible {
+            let rollout = task_repository.rollout_library_release(&release).await?;
+            let scheduled = renders.reconcile(&task_repository).await?;
+            (rollout_value(&rollout), scheduled)
+        } else {
+            (
+                json!({
+                    "status": "not_applicable",
+                    "complete": true,
+                    "counts": {"updated": 0, "already_current": 0, "not_eligible": 0}
+                }),
+                0,
+            )
+        };
+        Ok(json!({
+            "release": {
+                "name": release.name,
+                "version": release.version,
+                "release_sha256": release.digest
+            },
+            "rollout": rollout,
+            "renders_scheduled": scheduled
+        }))
+    });
+    join_scheduled(&repository, task).await
+}
+
+fn library_release_value(release: &LibraryRelease) -> Value {
+    json!({
+        "name": release.name,
+        "version": release.version,
+        "release_sha256": release.digest,
+        "guidance": release.guidance,
+        "docs": release.docs,
+        "files": release.files
+    })
+}
+
+fn rollout_value(rollout: &LibraryRolloutRecord) -> Value {
+    let mut updated = 0;
+    let mut already_current = 0;
+    let mut not_eligible = 0;
+    for state in rollout.models.values() {
+        match state {
+            RolloutModelState::Updated => updated += 1,
+            RolloutModelState::AlreadyCurrent => already_current += 1,
+            RolloutModelState::NotEligible => not_eligible += 1,
+        }
+    }
+    json!({
+        "status": if rollout.complete { "complete" } else { "incomplete" },
+        "complete": rollout.complete,
+        "counts": {
+            "updated": updated,
+            "already_current": already_current,
+            "not_eligible": not_eligible
+        }
+    })
 }
 
 async fn retry_and_schedule(
@@ -501,6 +635,10 @@ struct ModelIdInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EmptyInput {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InspectInput {
     model_id: String,
     projection: TechnicalProjection,
@@ -521,7 +659,12 @@ enum RenderStyle {
 struct CreateInput {
     model_id: String,
     name: String,
-    source: String,
+    files: Vec<ProjectFile>,
+    entrypoint: String,
+    #[serde(default)]
+    requirements: Vec<DirectRequirement>,
+    #[serde(default)]
+    hints: String,
 }
 
 #[derive(Deserialize)]
@@ -530,7 +673,24 @@ struct EditInput {
     model_id: String,
     expected_revision: String,
     name: Option<String>,
-    patches: Option<Vec<SourcePatch>>,
+    operations: Option<Vec<ProjectOperation>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryGetInput {
+    name: String,
+    version: Version,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryPublishInput {
+    name: String,
+    version: Version,
+    files: Vec<ProjectFile>,
+    guidance: String,
+    docs: Vec<ProjectFile>,
 }
 
 #[derive(Deserialize)]
@@ -655,7 +815,7 @@ fn model_list_definition() -> McpToolDefinition {
 fn model_get_definition() -> McpToolDefinition {
     definition(
         "model.get",
-        "Get one model and its exact desired-revision source.",
+        "Get model metadata and the complete canonical desired-revision project, including every file (including generated AGENTS.md), the entrypoint, direct dependency requirements, and exact server-controlled locks. This is the hard-cutover multi-file contract; no legacy source field is returned.",
         true,
         model_id_schema(),
     )
@@ -721,7 +881,7 @@ fn view_list_definition() -> McpToolDefinition {
 fn model_create_definition() -> McpToolDefinition {
     definition(
         "model.create",
-        "Create a model with a caller-supplied kebab-case ID.",
+        "Create a canonical multi-file model project with a caller-supplied kebab-case ID. This hard cutover accepts no legacy source or dependencies field. Requirements are optional direct-only compatible ranges and resolve to exact server-controlled locks. Faktory generates AGENTS.md; callers provide only optional Hints content.",
         false,
         json!({
             "type": "object",
@@ -732,13 +892,33 @@ fn model_create_definition() -> McpToolDefinition {
                     "minLength": 1,
                     "description": "Display name, limited to 200 UTF-8 bytes."
                 },
-                "source": {
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "description": "Caller-owned UTF-8 project files in request order. AGENTS.md is reserved and generated by Faktory.",
+                    "items": project_file_schema()
+                },
+                "entrypoint": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "UTF-8 Python source, limited to 1048576 bytes."
+                    "maxLength": 1024,
+                    "description": "Relative POSIX path of the existing nonempty Python entrypoint."
+                },
+                "requirements": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "default": [],
+                    "description": "Optional direct-only shared-library requirements. Each stable range must be exactly >=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0; Faktory resolves and stores exact locks.",
+                    "items": dependency_schema()
+                },
+                "hints": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Optional model-specific body for generated AGENTS.md # Hints. Top-level headings are forbidden; Index and Dependency Guidance are protected and server-generated."
                 }
             },
-            "required": ["model_id", "name", "source"],
+            "required": ["model_id", "name", "files", "entrypoint"],
             "additionalProperties": false
         }),
     )
@@ -746,7 +926,7 @@ fn model_create_definition() -> McpToolDefinition {
 fn model_edit_definition() -> McpToolDefinition {
     definition(
         "model.edit",
-        "Conditionally edit model metadata and exact source matches on the desired revision.",
+        "Conditionally edit model metadata and/or one caller-ordered canonical project transaction. This hard cutover accepts no source, dependencies, or grouped project shape. Operations execute exactly in array order and may add, patch, delete, or rename caller files, set the entrypoint, replace direct requirements, or exactly patch only the AGENTS.md Hints body. Generated Index and Dependency Guidance and exact locks are protected and server-controlled.",
         false,
         json!({
             "type": "object",
@@ -755,36 +935,237 @@ fn model_edit_definition() -> McpToolDefinition {
                 "expected_revision": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{64}$",
-                    "description": "Exact desired source revision to edit."
+                    "description": "Exact desired project revision to edit."
                 },
                 "name": {
                     "type": "string",
                     "minLength": 1,
                     "description": "Display name, limited to 200 UTF-8 bytes."
                 },
-                "patches": {
+                "operations": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "Sequential exact patches; old must be non-empty and match exactly once at each step.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old": {"type": "string", "minLength": 1},
-                            "new": {"type": "string"}
-                        },
-                        "required": ["old", "new"],
-                        "additionalProperties": false
-                    }
+                    "maxItems": 256,
+                    "description": "Caller-ordered project operations executed exactly from first to last.",
+                    "items": project_operation_schema()
                 }
             },
             "required": ["model_id", "expected_revision"],
             "anyOf": [
                 {"required": ["name"]},
-                {"required": ["patches"]}
+                {"required": ["operations"]}
             ],
             "additionalProperties": false
         }),
     )
+}
+
+fn library_list_definition() -> McpToolDefinition {
+    definition(
+        "library.list",
+        "List shared-library catalog metadata only: names, import packages, and stable versions. Package code, guidance, and documentation remain available only through authenticated MCP library.get.",
+        true,
+        json!({"type": "object", "additionalProperties": false}),
+    )
+}
+
+fn library_get_definition() -> McpToolDefinition {
+    definition(
+        "library.get",
+        "Get one immutable shared-library release, including its exact identity, Python package files, nonempty guidance, and documentation. Versions are exact stable MAJOR.MINOR.PATCH values; library content is MCP-only.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "name": library_name_schema(),
+                "version": stable_version_schema()
+            },
+            "required": ["name", "version"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn library_publish_definition() -> McpToolDefinition {
+    definition(
+        "library.publish",
+        "Permanently publish one immutable MCP-only shared-library release. The version must be stable MAJOR.MINOR.PATCH and increase monotonically; package Python files must stay under faktory_shared/<name>/ and declare no shared-library dependencies. Minor and patch releases promise same-major compatibility and automatically roll compatible consumers to exact locks and rerender them; first and new-major releases do not alter consumers.",
+        false,
+        json!({
+            "type": "object",
+            "properties": {
+                "name": library_name_schema(),
+                "version": stable_version_schema(),
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "description": "Python package files under faktory_shared/<name>/; __init__.py is required.",
+                    "items": project_file_schema()
+                },
+                "guidance": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16384,
+                    "description": "Nonempty agent guidance; level-one and level-two headings are forbidden."
+                },
+                "docs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "description": "Documentation files under docs/.",
+                    "items": project_file_schema()
+                }
+            },
+            "required": ["name", "version", "files", "guidance", "docs"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn project_operation_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "file.add"},
+                    "path": project_path_schema(),
+                    "content": {"type": "string"}
+                },
+                "required": ["operation", "path", "content"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "file.patch"},
+                    "path": project_path_schema(),
+                    "patches": exact_patches_schema()
+                },
+                "required": ["operation", "path", "patches"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "file.delete"},
+                    "path": project_path_schema()
+                },
+                "required": ["operation", "path"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "file.rename"},
+                    "from": project_path_schema(),
+                    "to": project_path_schema()
+                },
+                "required": ["operation", "from", "to"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "entrypoint.set"},
+                    "path": project_path_schema()
+                },
+                "required": ["operation", "path"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "dependencies.set"},
+                    "requirements": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "description": "Complete direct-requirement replacement; empty removes all requirements.",
+                        "items": dependency_schema()
+                    }
+                },
+                "required": ["operation", "requirements"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "operation": {"const": "hints.patch"},
+                    "patches": exact_patches_schema()
+                },
+                "required": ["operation", "patches"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn project_path_schema() -> Value {
+    json!({"type": "string", "minLength": 1, "maxLength": 1024})
+}
+
+fn exact_patches_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 256,
+        "items": {
+            "type": "object",
+            "properties": {
+                "old": {"type": "string", "minLength": 1},
+                "new": {"type": "string"}
+            },
+            "required": ["old", "new"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn project_file_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "content": {"type": "string"}
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+    })
+}
+
+fn dependency_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": library_name_schema(),
+            "range": {
+                "type": "string",
+                "pattern": "^>=[0-9]+\\.[0-9]+\\.[0-9]+,<[0-9]+\\.0\\.0$",
+                "description": "Exact stable same-major range >=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0."
+            }
+        },
+        "required": ["name", "range"],
+        "additionalProperties": false
+    })
+}
+
+fn library_name_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z][a-z0-9_]{0,63}$",
+        "description": "Direct shared-library name imported as faktory_shared.<name>."
+    })
+}
+
+fn stable_version_schema() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+        "description": "Exact stable SemVer MAJOR.MINOR.PATCH with no prerelease, build suffix, or leading zero."
+    })
 }
 fn view_put_definition() -> McpToolDefinition {
     definition(
@@ -844,8 +1225,9 @@ mod tests {
     use super::*;
     use crate::{
         model::{
-            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, StoredRenderState,
-            TechnicalProjectionImages, source_key,
+            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, SourcePatch,
+            StoredRenderState, TechnicalProjectionImages,
+            project::{ExactPatch, project_key},
         },
         render::RenderConfig,
         storage::{InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject},
@@ -910,30 +1292,32 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct BlockingFirstSourceGet {
+    struct BlockingFirstProjectGet {
         inner: InMemoryObjectStore,
-        block_source_get: AtomicBool,
-        source_get_started: Semaphore,
-        release_source_get: Semaphore,
+        block_project_get: AtomicBool,
+        project_get_started: Semaphore,
+        release_project_get: Semaphore,
     }
 
-    impl BlockingFirstSourceGet {
+    impl BlockingFirstProjectGet {
         fn new() -> Self {
             Self {
                 inner: InMemoryObjectStore::default(),
-                block_source_get: AtomicBool::new(false),
-                source_get_started: Semaphore::new(0),
-                release_source_get: Semaphore::new(0),
+                block_project_get: AtomicBool::new(false),
+                project_get_started: Semaphore::new(0),
+                release_project_get: Semaphore::new(0),
             }
         }
     }
 
     #[async_trait]
-    impl ObjectStore for BlockingFirstSourceGet {
+    impl ObjectStore for BlockingFirstProjectGet {
         async fn get(&self, key: &str) -> Result<StoredObject, StorageError> {
-            if key.ends_with("/source.py") && self.block_source_get.swap(false, Ordering::SeqCst) {
-                self.source_get_started.add_permits(1);
-                self.release_source_get
+            if key.ends_with("/project.json")
+                && self.block_project_get.swap(false, Ordering::SeqCst)
+            {
+                self.project_get_started.add_permits(1);
+                self.release_project_get
                     .acquire()
                     .await
                     .expect("release semaphore open")
@@ -1018,6 +1402,23 @@ mod tests {
         }
     }
 
+    fn library_release(name: &str, version: &str, body: &str) -> LibraryRelease {
+        LibraryRelease::new(
+            name.to_owned(),
+            Version::parse(version).expect("version"),
+            vec![ProjectFile {
+                path: format!("faktory_shared/{name}/__init__.py"),
+                content: body.to_owned(),
+            }],
+            "Use this library through its documented public API.".to_owned(),
+            vec![ProjectFile {
+                path: "docs/guide.md".to_owned(),
+                content: "# API guide".to_owned(),
+            }],
+        )
+        .expect("library release")
+    }
+
     #[derive(Debug)]
     struct RecordingVisualRenderer {
         calls: AtomicUsize,
@@ -1084,24 +1485,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_get_returns_exact_source_with_matching_desired_revision() {
+    async fn model_get_returns_complete_canonical_project_with_matching_desired_revision() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
-        let exact_source = "# caf\u{e9}\nresult = box";
+        let files = vec![
+            ProjectFile {
+                path: "main.py".to_owned(),
+                content: "# caf\u{e9}\nfrom helper import box".to_owned(),
+            },
+            ProjectFile {
+                path: "helper.py".to_owned(),
+                content: "box = 1".to_owned(),
+            },
+        ];
         let created = repository
-            .create_model("part", "Part", exact_source.as_bytes())
+            .create_project_from_files(
+                "part",
+                "Part",
+                files,
+                "main.py".to_owned(),
+                Vec::new(),
+                "Keep dimensions parametric.",
+            )
             .await
             .expect("create model");
 
-        let (model, source) = get_model_with_source(&repository, "part")
+        let (model, project) = get_model_with_project(&repository, "part")
             .await
-            .expect("get model source");
-        let tool_result = model_get_result(model, source);
+            .expect("get model project");
+        let tool_result = result(json!({"model": model, "project": project}));
         let output = tool_result.raw["structuredContent"].clone();
         let text = tool_result.raw["content"][0]["text"]
             .as_str()
             .expect("text content");
 
-        assert_eq!(output["source"], exact_source);
+        assert!(output.get("source").is_none());
+        assert_eq!(output["project"]["entrypoint"], "main.py");
+        assert_eq!(output["project"]["requirements"], json!([]));
+        assert_eq!(output["project"]["locks"], json!([]));
+        assert_eq!(output["project"]["files"].as_array().map(Vec::len), Some(3));
+        assert!(output["project"]["files"].to_string().contains("AGENTS.md"));
+        assert!(
+            output["project"]["files"]
+                .to_string()
+                .contains("Keep dimensions parametric.")
+        );
         assert_eq!(
             output["model"]["desired_source_revision"],
             created.desired_source_revision
@@ -1114,7 +1541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_get_returns_desired_source_instead_of_current_successful_source() {
+    async fn model_get_returns_desired_project_instead_of_current_successful_project() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
         let created = repository
             .create_model("part", "Part", b"old source")
@@ -1154,11 +1581,18 @@ mod tests {
             .await
             .expect("edit model");
 
-        let (model, source) = get_model_with_source(&repository, "part")
+        let (model, project) = get_model_with_project(&repository, "part")
             .await
-            .expect("get desired source");
+            .expect("get desired project");
 
-        assert_eq!(source, "desired source");
+        assert_eq!(
+            project
+                .files
+                .iter()
+                .find(|file| file.path == "source.py")
+                .map(|file| file.content.as_str()),
+            Some("desired source")
+        );
         assert_eq!(
             model.current_successful_source_revision,
             created.desired_source_revision
@@ -1866,22 +2300,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_get_pairs_loaded_metadata_with_its_immutable_source_during_edit() {
-        let store = Arc::new(BlockingFirstSourceGet::new());
+    async fn model_get_pairs_loaded_metadata_with_its_immutable_project_during_edit() {
+        let store = Arc::new(BlockingFirstProjectGet::new());
         let repository = Repository::new(store.clone(), 1);
         let created = repository
             .create_model("part", "Part", b"old source")
             .await
             .expect("create model");
-        store.block_source_get.store(true, Ordering::SeqCst);
+        store.block_project_get.store(true, Ordering::SeqCst);
 
         let get_repository = repository.clone();
-        let get = tokio::spawn(async move { get_model_with_source(&get_repository, "part").await });
+        let get =
+            tokio::spawn(async move { get_model_with_project(&get_repository, "part").await });
         store
-            .source_get_started
+            .project_get_started
             .acquire()
             .await
-            .expect("source-start semaphore open")
+            .expect("project-start semaphore open")
             .forget();
 
         let edited = repository
@@ -1896,17 +2331,24 @@ mod tests {
             )
             .await
             .expect("edit model");
-        store.release_source_get.add_permits(1);
+        store.release_project_get.add_permits(1);
 
-        let (model, source) = get
+        let (model, project) = get
             .await
             .expect("model get task")
-            .expect("get model source");
+            .expect("get model project");
         assert_eq!(
             model.desired_source_revision,
             created.desired_source_revision
         );
-        assert_eq!(source, "old source");
+        assert_eq!(
+            project
+                .files
+                .iter()
+                .find(|file| file.path == "source.py")
+                .map(|file| file.content.as_str()),
+            Some("old source")
+        );
         assert_ne!(
             model.desired_source_revision,
             edited.record.desired_source_revision
@@ -1933,7 +2375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_get_maps_invalid_utf8_source_to_safe_invalid_state() {
+    async fn model_get_maps_corrupt_project_to_safe_invalid_state() {
         let store = Arc::new(InMemoryObjectStore::default());
         let repository = Repository::new(store.clone(), 1);
         let created = repository
@@ -1942,16 +2384,16 @@ mod tests {
             .expect("create model");
         store
             .put(
-                &source_key("part", &created.desired_source_revision),
+                &project_key("part", &created.desired_source_revision),
                 Bytes::from_static(b"\xff\xfe"),
                 PutCondition::Any,
             )
             .await
-            .expect("corrupt source");
+            .expect("corrupt project");
 
-        let error = get_model_with_source(&repository, "part")
+        let error = get_model_with_project(&repository, "part")
             .await
-            .expect_err("invalid UTF-8 must fail");
+            .expect_err("invalid project must fail");
         assert_eq!(error, RepositoryError::Corrupt);
 
         let output = tool_error(error);
@@ -1964,11 +2406,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_get_distinguishes_missing_model_from_missing_desired_source() {
+    async fn model_get_distinguishes_missing_model_from_missing_desired_project() {
         let store = Arc::new(InMemoryObjectStore::default());
         let repository = Repository::new(store.clone(), 1);
 
-        let absent = get_model_with_source(&repository, "absent")
+        let absent = get_model_with_project(&repository, "absent")
             .await
             .expect_err("absent model must fail");
         assert_eq!(absent, RepositoryError::NotFound);
@@ -1981,18 +2423,18 @@ mod tests {
             .create_model("part", "Part", b"source")
             .await
             .expect("create model");
-        let key = source_key("part", &created.desired_source_revision);
-        let source = store.get(&key).await.expect("stored source");
+        let key = project_key("part", &created.desired_source_revision);
+        let project = store.get(&key).await.expect("stored project");
         store
-            .delete(&key, &source.etag)
+            .delete(&key, &project.etag)
             .await
-            .expect("delete desired source");
+            .expect("delete desired project");
 
-        let missing_source = get_model_with_source(&repository, "part")
+        let missing_project = get_model_with_project(&repository, "part")
             .await
-            .expect_err("missing desired source must fail");
-        assert_eq!(missing_source, RepositoryError::Corrupt);
-        let output = tool_error(missing_source);
+            .expect_err("missing desired project must fail");
+        assert_eq!(missing_project, RepositoryError::Corrupt);
+        let output = tool_error(missing_project);
         assert_eq!(
             output.raw["structuredContent"]["error"]["code"],
             "invalid_state"
@@ -2001,6 +2443,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn create_and_edit_schemas_describe_slug_and_exact_patch_contracts() {
         let create = model_create_definition();
         assert_eq!(create.name, "model.create");
@@ -2010,14 +2453,60 @@ mod tests {
         );
         assert_eq!(
             create.input_schema["required"],
-            json!(["model_id", "name", "source"])
+            json!(["model_id", "name", "files", "entrypoint"])
         );
 
         let edit = model_edit_definition();
         assert_eq!(edit.name, "model.edit");
-        assert_eq!(edit.input_schema["properties"]["patches"]["minItems"], 1);
+        assert!(create.input_schema["properties"].get("source").is_none());
+        assert_eq!(create.input_schema["properties"]["files"]["minItems"], 1);
+        assert!(
+            create.input_schema["properties"]
+                .get("dependencies")
+                .is_none()
+        );
         assert_eq!(
-            edit.input_schema["properties"]["patches"]["items"]["properties"]["old"]["minLength"],
+            create.input_schema["properties"]["requirements"]["default"],
+            json!([])
+        );
+        assert_eq!(create.input_schema["properties"]["hints"]["default"], "");
+        assert_eq!(
+            create.input_schema["properties"]["files"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(edit.input_schema["properties"]["operations"]["minItems"], 1);
+        assert_eq!(
+            edit.input_schema["properties"]["operations"]["maxItems"],
+            256
+        );
+        let variants = edit.input_schema["properties"]["operations"]["items"]["oneOf"]
+            .as_array()
+            .expect("operation variants");
+        assert_eq!(variants.len(), 7);
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant["properties"]["operation"]["const"]
+                    .as_str()
+                    .expect("operation discriminator"))
+                .collect::<Vec<_>>(),
+            vec![
+                "file.add",
+                "file.patch",
+                "file.delete",
+                "file.rename",
+                "entrypoint.set",
+                "dependencies.set",
+                "hints.patch"
+            ]
+        );
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant["additionalProperties"] == false)
+        );
+        assert_eq!(
+            variants[1]["properties"]["patches"]["items"]["properties"]["old"]["minLength"],
             1
         );
         assert_eq!(
@@ -2045,6 +2534,365 @@ mod tests {
             json!(["model_id", "projection"])
         );
         assert_eq!(inspect.input_schema["additionalProperties"], false);
+
+        for definition in [
+            library_list_definition(),
+            library_get_definition(),
+            library_publish_definition(),
+        ] {
+            assert_eq!(definition.input_schema["additionalProperties"], false);
+        }
+        let publish = library_publish_definition();
+        assert_eq!(
+            publish.input_schema["properties"]["version"]["pattern"],
+            "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        );
+        assert_eq!(
+            publish.input_schema["properties"]["docs"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn project_and_library_inputs_reject_unknown_nested_fields() {
+        assert!(serde_json::from_value::<EmptyInput>(json!({"source": "secret"})).is_err());
+        let minimal = serde_json::from_value::<CreateInput>(json!({
+            "model_id": "part",
+            "name": "Part",
+            "files": [{"path": "main.py", "content": "part = 1"}],
+            "entrypoint": "main.py"
+        }))
+        .expect("requirements and hints are optional");
+        assert!(minimal.requirements.is_empty());
+        assert!(minimal.hints.is_empty());
+        assert!(
+            serde_json::from_value::<CreateInput>(json!({
+                "model_id": "part",
+                "name": "Part",
+                "files": [{"path": "main.py", "content": "part = 1"}],
+                "entrypoint": "main.py",
+                "requirements": [{"name": "gears", "range": ">=1.0.0,<2.0.0"}]
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<CreateInput>(json!({
+                "model_id": "part",
+                "name": "Part",
+                "files": [{"path": "main.py", "content": "part = 1", "secret": true}],
+                "entrypoint": "main.py"
+            }))
+            .is_err()
+        );
+        for obsolete in [json!({"source": "part = 1"}), json!({"dependencies": []})] {
+            let mut input = json!({
+                "model_id": "part",
+                "name": "Part",
+                "files": [{"path": "main.py", "content": "part = 1"}],
+                "entrypoint": "main.py"
+            });
+            input
+                .as_object_mut()
+                .expect("object")
+                .extend(obsolete.as_object().expect("obsolete fields").clone());
+            assert!(serde_json::from_value::<CreateInput>(input).is_err());
+        }
+        for obsolete in [
+            json!({"source": "part = 2"}),
+            json!({"dependencies": []}),
+            json!({"project": {"patches": []}}),
+        ] {
+            let mut input = json!({
+                "model_id": "part",
+                "expected_revision": "0".repeat(64),
+                "name": "Part"
+            });
+            input
+                .as_object_mut()
+                .expect("object")
+                .extend(obsolete.as_object().expect("obsolete fields").clone());
+            assert!(serde_json::from_value::<EditInput>(input).is_err());
+        }
+        assert!(
+            serde_json::from_value::<EditInput>(json!({
+                "model_id": "part",
+                "expected_revision": "0".repeat(64),
+                "operations": [{
+                    "operation": "file.patch",
+                    "path": "main.py",
+                    "patches": [{"old": "1", "new": "2", "extra": false}]
+                }]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<LibraryPublishInput>(json!({
+                "name": "gears",
+                "version": "1.0.0",
+                "files": [{"path": "faktory_shared/gears/__init__.py", "content": ""}],
+                "guidance": "Use gears.",
+                "docs": [{"path": "docs/guide.md", "content": "Guide", "extra": 1}]
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn project_edit_is_transactional_and_protects_generated_agents_sections() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        repository
+            .publish_library(library_release("gears", "1.0.0", "VALUE = 1"))
+            .await
+            .expect("publish dependency");
+        let created = repository
+            .create_project_from_files(
+                "part",
+                "Part",
+                vec![
+                    ProjectFile {
+                        path: "main.py".to_owned(),
+                        content: "from helper import value\npart = value".to_owned(),
+                    },
+                    ProjectFile {
+                        path: "helper.py".to_owned(),
+                        content: "value = 1".to_owned(),
+                    },
+                ],
+                "main.py".to_owned(),
+                vec![DirectRequirement {
+                    name: "gears".to_owned(),
+                    range: ">=1.0.0,<2.0.0".to_owned(),
+                }],
+                "Original hint",
+            )
+            .await
+            .expect("create project");
+        let edit_input = serde_json::from_value::<EditInput>(json!({
+            "model_id": "part",
+            "expected_revision": created.desired_source_revision.clone(),
+            "operations": [
+                {"operation": "file.add", "path": "dimensions.py", "content": "width = 2"},
+                {
+                    "operation": "file.patch",
+                    "path": "dimensions.py",
+                    "patches": [{"old": "width = 2", "new": "width = 3"}]
+                },
+                {"operation": "file.rename", "from": "helper.py", "to": "helpers/core.py"},
+                {
+                    "operation": "file.patch",
+                    "path": "helpers/core.py",
+                    "patches": [{"old": "value = 1", "new": "value = 4"}]
+                },
+                {
+                    "operation": "file.patch",
+                    "path": "main.py",
+                    "patches": [{"old": "from helper", "new": "from helpers.core"}]
+                },
+                {
+                    "operation": "hints.patch",
+                    "patches": [{"old": "Original hint", "new": "Updated hint"}]
+                }
+            ]
+        }))
+        .expect("deserialize ordered MCP edit");
+        let edit = ProjectEdit::new(edit_input.operations.expect("project operations"))
+            .expect("validate ordered MCP edit");
+        let edited = repository
+            .edit_project("part", &created.desired_source_revision, None, Some(&edit))
+            .await
+            .expect("edit project");
+        let project = repository
+            .get_project("part", &edited.record.desired_source_revision)
+            .await
+            .expect("edited project");
+        assert!(
+            project
+                .files
+                .iter()
+                .any(|file| file.path == "dimensions.py")
+        );
+        assert!(
+            project
+                .files
+                .iter()
+                .any(|file| file.path == "helpers/core.py")
+        );
+        assert!(!project.files.iter().any(|file| file.path == "helper.py"));
+        assert_eq!(
+            project
+                .files
+                .iter()
+                .find(|file| file.path == "dimensions.py")
+                .map(|file| file.content.as_str()),
+            Some("width = 3")
+        );
+        assert_eq!(
+            project
+                .files
+                .iter()
+                .find(|file| file.path == "helpers/core.py")
+                .map(|file| file.content.as_str()),
+            Some("value = 4")
+        );
+        assert!(
+            project
+                .agents_md()
+                .expect("AGENTS")
+                .contains("Updated hint")
+        );
+        assert!(
+            project
+                .agents_md()
+                .expect("AGENTS")
+                .starts_with("# Index\n")
+        );
+        assert_eq!(project.locks[0].version, Version::new(1, 0, 0));
+
+        let protected = ProjectEdit::new(vec![ProjectOperation::FilePatch {
+            path: "AGENTS.md".to_owned(),
+            patches: vec![ExactPatch {
+                old: "Index".to_owned(),
+                new: "Owned".to_owned(),
+            }],
+        }])
+        .expect("map protected edit");
+        assert!(matches!(
+            repository
+                .edit_project(
+                    "part",
+                    &edited.record.desired_source_revision,
+                    None,
+                    Some(&protected)
+                )
+                .await,
+            Err(RepositoryError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn library_tools_keep_list_metadata_only_and_roll_out_same_major_only() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let first = repository
+            .publish_library(library_release("gears", "1.0.0", "PRIVATE_VALUE = 1"))
+            .await
+            .expect("publish first release");
+        let consumer = repository
+            .create_project_from_files(
+                "consumer",
+                "Consumer",
+                vec![ProjectFile {
+                    path: "main.py".to_owned(),
+                    content: "from faktory_shared.gears import PRIVATE_VALUE".to_owned(),
+                }],
+                "main.py".to_owned(),
+                vec![DirectRequirement {
+                    name: "gears".to_owned(),
+                    range: ">=1.0.0,<2.0.0".to_owned(),
+                }],
+                "",
+            )
+            .await
+            .expect("create consumer");
+        repository
+            .complete_render(
+                "consumer",
+                &consumer.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete initial render");
+        let queue = RenderQueue::start(
+            repository.clone(),
+            RenderConfig {
+                command: vec!["/bin/false".to_owned()],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 12,
+            },
+        )
+        .expect("render queue");
+        let compatible = publish_and_rollout(
+            repository.clone(),
+            queue.clone(),
+            LibraryPublishInput {
+                name: "gears".to_owned(),
+                version: Version::new(1, 1, 0),
+                files: library_release("gears", "1.1.0", "PRIVATE_VALUE = 2").files,
+                guidance: "Use this compatible release.".to_owned(),
+                docs: vec![ProjectFile {
+                    path: "docs/guide.md".to_owned(),
+                    content: "Compatible API".to_owned(),
+                }],
+            },
+        )
+        .await
+        .expect("publish compatible release");
+        assert_eq!(compatible["rollout"]["status"], "complete");
+        assert_eq!(compatible["rollout"]["counts"]["updated"], 1);
+        assert_eq!(compatible["renders_scheduled"], 1);
+        let changed = repository
+            .get_model("consumer")
+            .await
+            .expect("consumer")
+            .record;
+        let project = repository
+            .get_project("consumer", &changed.desired_source_revision)
+            .await
+            .expect("rolled out project");
+        assert_eq!(project.locks[0].version, Version::new(1, 1, 0));
+        assert_eq!(
+            project.locks[0].release_sha256,
+            compatible["release"]["release_sha256"]
+        );
+        assert_eq!(
+            changed.current_successful_source_revision,
+            consumer.desired_source_revision
+        );
+
+        let major = publish_and_rollout(
+            repository.clone(),
+            queue,
+            LibraryPublishInput {
+                name: "gears".to_owned(),
+                version: Version::new(2, 0, 0),
+                files: library_release("gears", "2.0.0", "PRIVATE_VALUE = 3").files,
+                guidance: "Use this breaking release explicitly.".to_owned(),
+                docs: vec![ProjectFile {
+                    path: "docs/guide.md".to_owned(),
+                    content: "Breaking API".to_owned(),
+                }],
+            },
+        )
+        .await
+        .expect("publish major release");
+        assert_eq!(major["rollout"]["status"], "not_applicable");
+        let unchanged = repository
+            .get_model("consumer")
+            .await
+            .expect("consumer")
+            .record;
+        assert_eq!(
+            unchanged.desired_source_revision,
+            changed.desired_source_revision
+        );
+
+        let listed = json!({"libraries": repository.list_libraries().await.expect("list")});
+        assert!(!listed.to_string().contains("PRIVATE_VALUE"));
+        assert!(!listed.to_string().contains("compatible release"));
+        let fetched = repository
+            .get_library("gears", &Version::new(1, 0, 0))
+            .await
+            .expect("get release");
+        let fetched = library_release_value(&fetched);
+        assert!(fetched.to_string().contains("PRIVATE_VALUE"));
+        assert_eq!(fetched["release_sha256"], first.digest);
+
+        let safe = tool_error(RepositoryError::Conflict).raw.to_string();
+        assert!(!safe.contains("PRIVATE_VALUE"));
+        assert!(!safe.contains("Compatible API"));
     }
 
     #[tokio::test]
@@ -2076,7 +2924,7 @@ mod tests {
                     model_id: "part".to_owned(),
                     expected_revision: created.desired_source_revision,
                     name: Some("Renamed".to_owned()),
-                    patches: None,
+                    operations: None,
                 },
             ),
         )
@@ -2114,7 +2962,13 @@ mod tests {
             CreateInput {
                 model_id: "part".to_owned(),
                 name: "Part".to_owned(),
-                source: "source".to_owned(),
+                files: vec![ProjectFile {
+                    path: "main.py".to_owned(),
+                    content: "source".to_owned(),
+                }],
+                entrypoint: "main.py".to_owned(),
+                requirements: Vec::new(),
+                hints: String::new(),
             },
         ));
         store

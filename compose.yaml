@@ -91,7 +91,7 @@ services:
     environment:
       FAKTORY_AUTH_MODE: disabled
       FAKTORY_DEPLOYMENT_ENVIRONMENT: local
-      FAKTORY_PUBLIC_BASE_URL: http://localhost:8080
+      FAKTORY_PUBLIC_BASE_URL: http://172.16.1.40:8080
       FAKTORY_S3_ENDPOINT: http://garage:3900
       FAKTORY_S3_REGION: garage
       FAKTORY_S3_BUCKET: faktory
@@ -108,7 +108,7 @@ services:
       visual-renderer:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8080:8080"
+      - "0.0.0.0:8080:8080"
     user: "65532:65532"
     read_only: true
     tmpfs:

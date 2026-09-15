@@ -295,8 +295,14 @@ spec:
                 set -eu
                 output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
                 trap 'rm -rf "$output_dir"' EXIT
+                project_root="$output_dir/project"
+                library_root="$output_dir/libraries"
+                mkdir "$project_root" "$library_root"
+                cp /opt/faktory/renderer/examples/box.py "$project_root/main.py"
                 /opt/faktory/env/bin/python -m renderer \
-                  /opt/faktory/renderer/examples/box.py \
+                  "$project_root" \
+                  main.py \
+                  "$library_root" \
                   "$output_dir/model.glb" \
                   "$output_dir/model.svg" \
                   "$output_dir/model.json" \
@@ -341,8 +347,14 @@ spec:
                 set -eu
                 output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
                 trap 'rm -rf "$output_dir"' EXIT
+                project_root="$output_dir/project"
+                library_root="$output_dir/libraries"
+                mkdir "$project_root" "$library_root"
+                cp /opt/faktory/renderer/examples/box.py "$project_root/main.py"
                 /opt/faktory/env/bin/python -m renderer \
-                  /opt/faktory/renderer/examples/box.py \
+                  "$project_root" \
+                  main.py \
+                  "$library_root" \
                   "$output_dir/model.glb" \
                   "$output_dir/model.svg" \
                   "$output_dir/model.json" \

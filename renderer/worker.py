@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import math
 import os
 import struct
 import sys
+import sysconfig
+import types
+import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
@@ -105,23 +110,207 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
 
-def _validate_paths(source_path: Path, output_paths: tuple[Path, ...]) -> str | None:
+def _is_relative_to(path: Path, root: Path) -> bool:
     try:
-        if not source_path.is_file():
-            return "invalid_source_path"
-        resolved_paths = [source_path.resolve(), *(path.resolve() for path in output_paths)]
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_paths(
+    project_root: Path,
+    entrypoint: Path,
+    library_root: Path,
+    output_paths: tuple[Path, ...],
+) -> tuple[str | None, Path | None, Path | None, Path | None]:
+    try:
+        if not project_root.is_dir() or project_root.is_symlink():
+            return "invalid_project_root", None, None, None
+        if not library_root.is_dir() or library_root.is_symlink():
+            return "invalid_library_root", None, None, None
+        if entrypoint.is_absolute() or ".." in entrypoint.parts:
+            return "invalid_entrypoint", None, None, None
+        resolved_project_root = project_root.resolve(strict=True)
+        resolved_library_root = library_root.resolve(strict=True)
+        lexical_entrypoint = resolved_project_root / entrypoint
+        current = resolved_project_root
+        for part in entrypoint.parts:
+            current /= part
+            if current.is_symlink():
+                return "invalid_entrypoint", None, None, None
+        if not lexical_entrypoint.is_file():
+            return "invalid_entrypoint", None, None, None
+        resolved_entrypoint = lexical_entrypoint.resolve(strict=True)
+        if (
+            not _is_relative_to(resolved_entrypoint, resolved_project_root)
+            or not resolved_entrypoint.is_file()
+            or resolved_entrypoint.suffix != ".py"
+        ):
+            return "invalid_entrypoint", None, None, None
+        resolved_paths = [
+            resolved_entrypoint,
+            resolved_project_root,
+            resolved_library_root,
+            *(path.resolve() for path in output_paths),
+        ]
         if len(set(resolved_paths)) != len(resolved_paths):
-            return "invalid_output_path"
+            return "invalid_output_path", None, None, None
         for output_path in output_paths:
             if (
                 not output_path.parent.is_dir()
                 or output_path.exists()
                 or output_path.is_symlink()
             ):
-                return "invalid_output_path"
-    except OSError:
-        return "invalid_path"
+                return "invalid_output_path", None, None, None
+    except (OSError, RuntimeError):
+        return "invalid_path", None, None, None
+    return (
+        None,
+        resolved_project_root,
+        resolved_entrypoint,
+        resolved_library_root,
+    )
+
+
+def _interpreter_paths(original: list[str]) -> list[str]:
+    prefixes = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+    configured = {
+        Path(path).resolve()
+        for path in sysconfig.get_paths().values()
+        if path
+    }
+    retained: list[str] = []
+    for item in original:
+        if not item:
+            continue
+        try:
+            candidate = Path(item).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if candidate in configured or any(_is_relative_to(candidate, root) for root in prefixes):
+            value = str(candidate)
+            if value not in retained:
+                retained.append(value)
+    return retained
+
+
+def _shared_target_allowed(target: str, own_namespace: str) -> bool:
+    return target == own_namespace or target.startswith(f"{own_namespace}.")
+
+
+def _from_import_allowed(
+    target: str, names: list[ast.alias], own_namespace: str
+) -> bool:
+    if target == "faktory_shared":
+        return all(
+            name.name != "*"
+            and _shared_target_allowed(f"{target}.{name.name}", own_namespace)
+            for name in names
+        )
+    return _shared_target_allowed(target, own_namespace)
+
+
+def _library_imports_allowed(
+    tree: ast.AST, package: str, own_namespace: str
+) -> bool:
+    package_parts = package.split(".")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                if name.name == "faktory_shared" or name.name.startswith(
+                    "faktory_shared."
+                ):
+                    if not _shared_target_allowed(name.name, own_namespace):
+                        return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parent_count = node.level - 1
+                if parent_count >= len(package_parts):
+                    return False
+                base = package_parts[: len(package_parts) - parent_count]
+                target = ".".join((*base, *(node.module or "").split("."))).rstrip(".")
+                if not _from_import_allowed(target, node.names, own_namespace):
+                    return False
+            elif node.module == "faktory_shared" or (
+                node.module is not None
+                and node.module.startswith("faktory_shared.")
+            ):
+                if not _from_import_allowed(node.module, node.names, own_namespace):
+                    return False
+    return True
+
+
+def _validate_library_sources(library_root: Path) -> str | None:
+    shared_root = library_root / "faktory_shared"
+    if not shared_root.exists():
+        return None
+    try:
+        for source_path in sorted(shared_root.rglob("*.py")):
+            relative = source_path.relative_to(library_root)
+            if source_path.is_symlink() or len(relative.parts) < 3:
+                if relative != Path("faktory_shared/__init__.py"):
+                    return "invalid_library_source"
+                own_namespace = "faktory_shared"
+            else:
+                own_namespace = f"faktory_shared.{relative.parts[1]}"
+            resolved_source = source_path.resolve(strict=True)
+            if not _is_relative_to(resolved_source, library_root):
+                return "invalid_library_source"
+            source = source_path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(source_path))
+            package_parts = relative.with_suffix("").parts[:-1]
+            package = ".".join(package_parts)
+            if not _library_imports_allowed(tree, package, own_namespace):
+                return "invalid_library_source"
+    except (OSError, RuntimeError, SyntaxError, UnicodeError):
+        return "invalid_library_source"
     return None
+
+
+@contextlib.contextmanager
+def _execution_environment(
+    project_root: Path, library_root: Path, entrypoint: Path
+) -> Iterator[dict[str, object]]:
+    original_cwd = Path.cwd()
+    original_path = sys.path.copy()
+    original_modules = sys.modules.copy()
+    original_importer_cache = sys.path_importer_cache.copy()
+    package_parts = entrypoint.relative_to(project_root).parent.parts
+    package = ".".join(package_parts)
+    namespace: dict[str, object] = {
+        "__file__": str(entrypoint),
+        "__name__": "__main__",
+        "__package__": package,
+        "__spec__": None,
+    }
+    main_module = types.ModuleType("__main__")
+    main_module.__dict__.update(namespace)
+    project_names = {
+        path.stem if path.is_file() else path.name
+        for path in project_root.iterdir()
+        if (path.is_file() and path.suffix == ".py") or path.is_dir()
+    }
+    try:
+        os.chdir(project_root)
+        sys.path[:] = [
+            str(library_root),
+            str(project_root),
+            *_interpreter_paths(original_path),
+        ]
+        for name in tuple(sys.modules):
+            top_level = name.partition(".")[0]
+            if top_level == "faktory_shared" or top_level in project_names:
+                del sys.modules[name]
+        sys.modules["__main__"] = main_module
+        yield main_module.__dict__
+    finally:
+        os.chdir(original_cwd)
+        sys.path[:] = original_path
+        sys.modules.clear()
+        sys.modules.update(original_modules)
+        sys.path_importer_cache.clear()
+        sys.path_importer_cache.update(original_importer_cache)
 
 
 def _validate_glb(output_path: Path) -> bool:
@@ -218,8 +407,24 @@ def _remove_outputs(output_paths: tuple[Path, ...]) -> None:
             pass
 
 
+def _stabilize_assembly_names(assembly: cq.Assembly) -> None:
+    def visit(current: cq.Assembly, stable_name: str) -> None:
+        try:
+            uuid.UUID(current.name)
+        except (ValueError, AttributeError):
+            pass
+        else:
+            current.name = stable_name
+        for index, child in enumerate(current.children):
+            visit(child, f"{stable_name}_{index}")
+
+    visit(assembly, "result")
+
+
 def render(
-    source_path: Path,
+    project_root: Path,
+    entrypoint: Path,
+    library_root: Path,
     glb_path: Path,
     svg_path: Path,
     facts_path: Path,
@@ -228,9 +433,19 @@ def render(
     if len(projection_paths) != len(PROJECTIONS):
         return "invalid_arguments"
     output_paths = (glb_path, svg_path, facts_path, *projection_paths)
-    path_error = _validate_paths(source_path, output_paths)
+    path_error, project_root, source_path, library_root = _validate_paths(
+        project_root, entrypoint, library_root, output_paths
+    )
     if path_error is not None:
         return path_error
+    assert project_root is not None
+    assert source_path is not None
+    assert library_root is not None
+
+    library_error = _validate_library_sources(library_root)
+    if library_error is not None:
+        _remove_outputs(output_paths)
+        return library_error
 
     try:
         source = source_path.read_text(encoding="utf-8")
@@ -241,16 +456,14 @@ def render(
         _remove_outputs(output_paths)
         return "source_read_failed"
 
-    namespace = {
-        "__file__": str(source_path),
-        "__name__": "__main__",
-        "__package__": None,
-    }
     try:
         code = compile(source, str(source_path), "exec")
         with open(os.devnull, "w", encoding="utf-8") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                exec(code, namespace)
+                with _execution_environment(
+                    project_root, library_root, source_path
+                ) as namespace:
+                    exec(code, namespace)
     except BaseException:
         _remove_outputs(output_paths)
         return "source_execution_failed"
@@ -264,13 +477,14 @@ def render(
         assembly = result
     elif isinstance(result, (cq.Workplane, cq.Shape)):
         try:
-            assembly = cq.Assembly(result)
+            assembly = cq.Assembly(result, name="result")
         except Exception:
             _remove_outputs(output_paths)
             return "unsupported_result"
     else:
         _remove_outputs(output_paths)
         return "unsupported_result"
+    _stabilize_assembly_names(assembly)
 
     try:
         compound = assembly.toCompound()
@@ -340,7 +554,7 @@ def render(
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 11:
+    if len(args) != 13:
         print(f"{ERROR_PREFIX}invalid_arguments", file=sys.stderr)
         return 2
 
@@ -349,7 +563,9 @@ def main(argv: list[str] | None = None) -> int:
         Path(args[1]),
         Path(args[2]),
         Path(args[3]),
-        tuple(Path(path) for path in args[4:]),
+        Path(args[4]),
+        Path(args[5]),
+        tuple(Path(path) for path in args[6:]),
     )
     if error is not None:
         print(f"{ERROR_PREFIX}{error}", file=sys.stderr)
