@@ -271,6 +271,103 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_accepts_legacy_success_without_projection_artifacts() {
+        let store = Arc::new(InMemoryObjectStore::default());
+        let legacy_revision = "3".repeat(64);
+        for (key, bytes) in [
+            (
+                source_key("legacy", &legacy_revision),
+                b"part = 1".as_slice(),
+            ),
+            (
+                geometry_key("legacy", &legacy_revision),
+                b"legacy-glb".as_slice(),
+            ),
+            (
+                preview_key("legacy", &legacy_revision),
+                b"legacy-svg".as_slice(),
+            ),
+        ] {
+            store
+                .put(&key, Bytes::copy_from_slice(bytes), PutCondition::Absent)
+                .await
+                .expect("legacy object");
+        }
+        let legacy = ModelRecord {
+            id: "legacy".to_owned(),
+            name: "Legacy".to_owned(),
+            desired_source_revision: legacy_revision.clone(),
+            current_successful_source_revision: legacy_revision.clone(),
+            render_state: StoredRenderState::Ready,
+            render_error: String::new(),
+            default_view_id: String::new(),
+            current_successful_facts: Some(GeometryFactsRecord {
+                volume_cubic_millimeters: 1.0,
+                size_millimeters: GeometrySizeRecord {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 1.0,
+                },
+            }),
+            updated_at: TimestampRecord {
+                seconds: 1,
+                nanos: 0,
+            },
+        };
+        store
+            .put(
+                &model_key("legacy"),
+                Bytes::from(serde_json::to_vec(&legacy).expect("JSON")),
+                PutCondition::Absent,
+            )
+            .await
+            .expect("legacy model");
+
+        run(store.clone()).await.expect("migration");
+        let migrated: ModelRecord = serde_json::from_slice(
+            &store
+                .get(&model_key("legacy"))
+                .await
+                .expect("migrated model")
+                .bytes,
+        )
+        .expect("JSON");
+        assert_ne!(migrated.desired_source_revision, legacy_revision);
+        assert_eq!(
+            migrated.desired_source_revision,
+            migrated.current_successful_source_revision
+        );
+        assert_eq!(
+            store
+                .get(&source_key("legacy", &migrated.desired_source_revision))
+                .await
+                .expect("copied source")
+                .bytes,
+            Bytes::from_static(b"part = 1")
+        );
+        assert_eq!(
+            store
+                .get(&geometry_key("legacy", &migrated.desired_source_revision))
+                .await
+                .expect("copied geometry")
+                .bytes,
+            Bytes::from_static(b"legacy-glb")
+        );
+        assert_eq!(
+            store
+                .get(&preview_key("legacy", &migrated.desired_source_revision))
+                .await
+                .expect("copied preview")
+                .bytes,
+            Bytes::from_static(b"legacy-svg")
+        );
+        let first_keys = store.list("").await.expect("keys");
+        run(store.clone()).await.expect("idempotent rerun");
+        assert_eq!(store.list("").await.expect("keys"), first_keys);
+    }
+
+    #[tokio::test]
     async fn unknown_completed_migration_fails_closed() {
         let store = Arc::new(InMemoryObjectStore::default());
         store

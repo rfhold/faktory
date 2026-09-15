@@ -9,10 +9,9 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     migrations::{put_immutable, put_immutable_json},
     model::{
-        ModelRecord, RepositoryError, TechnicalProjection, ViewRecord, geometry_key, preview_key,
+        ModelRecord, RepositoryError, ViewRecord, geometry_key, preview_key,
         project::{ProjectBundle, hex_digest, project_key},
-        projection_key, shaded_projection_key, source_key, validate_model_record,
-        validate_view_record,
+        source_key, validate_model_record, validate_view_record,
     },
     storage::{ObjectStore, PutCondition},
 };
@@ -320,14 +319,6 @@ async fn verify_serving_revision(
 ) -> Result<(), RepositoryError> {
     store.get(&geometry_key(model_id, revision)).await?;
     store.get(&preview_key(model_id, revision)).await?;
-    for projection in TechnicalProjection::ALL {
-        store
-            .get(&projection_key(model_id, revision, projection))
-            .await?;
-        store
-            .get(&shaded_projection_key(model_id, revision, projection))
-            .await?;
-    }
     Ok(())
 }
 
