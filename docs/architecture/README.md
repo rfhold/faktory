@@ -5,7 +5,7 @@ These documents define MVP behavior implemented by the server, renderer, SPA, MC
 | Document | Covers |
 | --- | --- |
 | [Overview](overview.md) | Components, request flows, trust boundaries, and exclusions. |
-| [Protocol](protocol.md) | gRPC-web methods, watch ordering, view concurrency, and HTTP geometry. |
-| [Storage and rendering](storage-rendering.md) | Garage keys, source contract, revision state, and render failures. |
-| [Access and authentication](access-authentication.md) | Explicit local disabled mode, production Authentik browser sessions, hosted MCP OAuth, and shared authority. |
+| [Protocol](protocol.md) | gRPC-web, MCP inspect tools, internal visual RPC, view concurrency, and HTTP geometry. |
+| [Storage and rendering](storage-rendering.md) | Garage keys, render recipes, projection semantics, revision state, and render caches. |
+| [Access and authentication](access-authentication.md) | Browser and MCP authentication, visual-worker isolation, and data boundaries. |
 | [Observability and browser telemetry](observability.md) | Server logs, OTLP traces and metrics, Pyroscope profiling, and Faro collection. |

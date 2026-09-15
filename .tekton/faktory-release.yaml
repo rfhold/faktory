@@ -20,6 +20,22 @@ spec:
             operator: Equal
             value: gpu-inference
             effect: NoSchedule
+    - pipelineTaskName: verify-visual-renderer-amd64
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: amd64
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          fsGroup: 65532
+          seccompProfile:
+            type: Unconfined
+        volumes:
+          - name: tmp
+            emptyDir:
+              medium: Memory
+              sizeLimit: 256Mi
     - pipelineTaskName: deploy-production
       podTemplate:
         nodeSelector:
@@ -35,12 +51,15 @@ spec:
       value: "{{ source_branch }}"
     - name: base-image
       value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/faktory"
+    - name: visual-renderer-base-image
+      value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/faktory-visual-renderer"
   pipelineSpec:
     params:
       - { name: repo-url, type: string }
       - { name: revision, type: string }
       - { name: source-branch, type: string }
       - { name: base-image, type: string }
+      - { name: visual-renderer-base-image, type: string }
     workspaces:
       - name: source
     tasks:
@@ -225,6 +244,43 @@ spec:
         workspaces:
           - { name: source, workspace: source }
 
+      - name: build-visual-renderer-amd64
+        runAfter: [validate-release, scan-private-material]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: image, type: string }
+            - { name: revision, type: string }
+            - { name: buildkit-addr, type: string }
+          workspaces:
+            - name: source
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: build
+              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
+              workingDir: $(workspaces.source.path)
+              volumeMounts:
+                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=visual-renderer-runtime --opt platform=linux/amd64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --secret id=gitconfig,src=/etc/git-auth/.gitconfig \
+                  --secret id=git-credentials,src=/etc/git-auth/.git-credentials \
+                  --output "type=image,name=$(params.image),push=true"
+        params:
+          - { name: image, value: "$(params.visual-renderer-base-image):sha-$(params.revision)-amd64" }
+          - { name: revision, value: $(params.revision) }
+          - { name: buildkit-addr, value: "{{ BUILDKIT_AMD64_ADDR }}" }
+        workspaces:
+          - { name: source, workspace: source }
+
       - name: verify-amd64
         runAfter: [build-amd64]
         taskSpec:
@@ -317,6 +373,46 @@ spec:
         params:
           - { name: image, value: "$(params.base-image):sha-$(params.revision)-arm64" }
 
+      - name: verify-visual-renderer-amd64
+        runAfter: [build-visual-renderer-amd64]
+        taskSpec:
+          params:
+            - { name: image, type: string }
+          workspaces:
+            - name: source
+          steps:
+            - name: render-seven-images
+              image: $(params.image)
+              imagePullPolicy: Always
+              workingDir: /opt/visual-renderer
+              env:
+                - { name: HOME, value: /tmp }
+                - { name: TMPDIR, value: /tmp }
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 65532
+                runAsGroup: 65532
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+                seccompProfile: { type: Unconfined }
+              computeResources:
+                requests: { cpu: 250m, memory: 512Mi }
+                limits: { cpu: "1", memory: 1Gi }
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+              script: |
+                #!/bin/sh
+                set -eu
+                node /opt/visual-renderer/dist/index.js &
+                server_pid=$!
+                trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+                node "$(workspaces.source.path)/.tekton/verify-visual-renderer.mjs"
+        params:
+          - { name: image, value: "$(params.visual-renderer-base-image):sha-$(params.revision)-amd64" }
+        workspaces:
+          - { name: source, workspace: source }
+
       - name: publish-manifest
         runAfter: [verify-amd64, verify-arm64]
         retries: 1
@@ -385,12 +481,51 @@ spec:
           - { name: source-tag, value: sha-$(params.revision) }
           - { name: release-tag, value: $(tasks.validate-release.results.tag) }
 
+      - name: promote-visual-renderer-release
+        runAfter: [verify-visual-renderer-amd64]
+        retries: 1
+        taskSpec:
+          params:
+            - { name: base-image, type: string }
+            - { name: source-tag, type: string }
+            - { name: release-tag, type: string }
+            - { name: revision, type: string }
+          results:
+            - { name: image, type: string }
+          steps:
+            - name: promote-and-verify
+              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
+              script: |
+                #!/busybox/sh
+                set -eu
+                source="$(params.base-image):$(params.source-tag)"
+                digest="$(crane digest "$source")"
+                printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+                immutable="$(params.base-image)@$digest"
+                config="$(crane config "$immutable")"
+                printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
+                printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
+                release="$(params.base-image):$(params.release-tag)"
+                if existing="$(crane digest "$release" 2>/dev/null)"; then
+                  test "$existing" = "$digest"
+                else
+                  crane copy "$immutable" "$release"
+                fi
+                test "$(crane digest "$release")" = "$digest"
+                printf '%s' "$immutable" > "$(results.image.path)"
+        params:
+          - { name: base-image, value: $(params.visual-renderer-base-image) }
+          - { name: source-tag, value: sha-$(params.revision)-amd64 }
+          - { name: release-tag, value: $(tasks.validate-release.results.tag) }
+          - { name: revision, value: $(params.revision) }
+
       - name: deploy-production
-        runAfter: [promote-release]
+        runAfter: [promote-release, promote-visual-renderer-release]
         retries: 1
         taskSpec:
           params:
             - { name: image, type: string }
+            - { name: visual-renderer-image, type: string }
           workspaces:
             - name: source
           volumes:
@@ -415,10 +550,11 @@ spec:
                 test "`bun --version`" = "1.3.5"
                 test "`pulumi version`" = "v3.253.0"
                 bun install --frozen-lockfile
-                pulumi preview --stack prod --diff --config "image=$(params.image)"
-                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)"
+                pulumi preview --stack prod --diff --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)"
+                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)"
         params:
           - { name: image, value: $(tasks.promote-release.results.image) }
+          - { name: visual-renderer-image, value: $(tasks.promote-visual-renderer-release.results.image) }
         workspaces:
           - { name: source, workspace: source }
   workspaces:

@@ -11,26 +11,36 @@ use mcp::{
         StreamableHttpOptions, streamable_http_router_with_options,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    model::{ModelRecord, Repository, RepositoryError, SourcePatch, TechnicalProjection},
-    render::{PROJECTION_HEIGHT, PROJECTION_WIDTH, RenderQueue, validate_projection_png},
+    model::{
+        ModelRecord, Repository, RepositoryError, SourcePatch, TechnicalProjection,
+        ViewRenderIdentity,
+    },
+    render::{
+        PROJECTION_HEIGHT, PROJECTION_WIDTH, RenderQueue, validate_projection_png,
+        validate_visual_png,
+    },
+    visual::{VISUAL_RECIPE, VisualCoordinator, VisualRenderSpec, VisualRendererError},
 };
 
 #[derive(Clone, Debug)]
 pub struct FaktoryMcp {
     repository: Repository,
     renders: RenderQueue,
+    visual: VisualCoordinator,
 }
 
 impl FaktoryMcp {
     #[must_use]
-    pub const fn new(repository: Repository, renders: RenderQueue) -> Self {
+    pub fn new(repository: Repository, renders: RenderQueue) -> Self {
+        let visual = renders.visual();
         Self {
             repository,
             renders,
+            visual,
         }
     }
 
@@ -96,7 +106,34 @@ impl FaktoryMcp {
         _: ServerContext,
     ) -> ServerResult<McpToolResult> {
         let input: InspectInput = parse(call)?;
-        match inspect_model(&self.repository, &input.model_id, input.projection).await {
+        match inspect_model(
+            &self.repository,
+            &input.model_id,
+            input.projection,
+            input.render_style,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "view.inspect", definition = view_inspect_definition())]
+    async fn view_inspect(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: ViewIdInput = parse(call)?;
+        match inspect_view(
+            &self.repository,
+            &self.visual,
+            &input.model_id,
+            &input.view_id,
+        )
+        .await
+        {
             Ok(result) => Ok(result),
             Err(error) => Ok(tool_error(error)),
         }
@@ -223,26 +260,45 @@ async fn inspect_model(
     repository: &Repository,
     model_id: &str,
     projection: TechnicalProjection,
+    render_style: RenderStyle,
 ) -> Result<McpToolResult, RepositoryError> {
     let model = repository.get_model(model_id).await?.record;
     let rendered_revision = model.current_successful_source_revision.clone();
     if rendered_revision.is_empty() {
         return Err(RepositoryError::NotFound);
     }
-    let image = repository
-        .projection_image(model_id, &rendered_revision, projection)
-        .await?;
-    validate_projection_png(&image).map_err(|_| RepositoryError::Corrupt)?;
+    let image = match render_style {
+        RenderStyle::Technical => {
+            let image = repository
+                .projection_image(model_id, &rendered_revision, projection)
+                .await?;
+            validate_projection_png(&image).map_err(|_| RepositoryError::Corrupt)?;
+            image
+        }
+        RenderStyle::Shaded => {
+            let image = repository
+                .shaded_projection_image(model_id, &rendered_revision, projection)
+                .await?;
+            validate_visual_png(&image).map_err(|_| RepositoryError::Corrupt)?;
+            image
+        }
+    };
     let stale = model.desired_source_revision != rendered_revision;
-    let text = if stale {
-        format!(
+    let text = match (render_style, stale) {
+        (RenderStyle::Technical, true) => format!(
             "Warning: showing the last successful {} projection; the desired revision is not rendered.",
             projection.as_str()
-        )
-    } else {
-        format!("{} technical projection.", projection.as_str())
+        ),
+        (RenderStyle::Technical, false) => {
+            format!("{} technical projection.", projection.as_str())
+        }
+        (RenderStyle::Shaded, true) => format!(
+            "Warning: showing the last successful shaded {} projection; the desired revision is not rendered.",
+            projection.as_str()
+        ),
+        (RenderStyle::Shaded, false) => format!("{} shaded projection.", projection.as_str()),
     };
-    let metadata = json!({
+    let mut metadata = json!({
         "model_id": model.id,
         "projection": projection,
         "width": PROJECTION_WIDTH,
@@ -250,6 +306,92 @@ async fn inspect_model(
         "desired_revision": model.desired_source_revision,
         "rendered_revision": rendered_revision,
         "render_state": model.render_state,
+        "mime_type": "image/png",
+        "stale": stale
+    });
+    if matches!(render_style, RenderStyle::Shaded) {
+        metadata["style"] = json!(render_style);
+        metadata["recipe"] = json!(VISUAL_RECIPE);
+    }
+    Ok(McpToolResult::new(json!({
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "image", "data": BASE64.encode(image), "mimeType": "image/png" }
+        ],
+        "structuredContent": { "metadata": metadata },
+        "isError": false
+    })))
+}
+
+async fn inspect_view(
+    repository: &Repository,
+    visual: &VisualCoordinator,
+    model_id: &str,
+    view_id: &str,
+) -> Result<McpToolResult, RepositoryError> {
+    let model = repository.get_model(model_id).await?.record;
+    let revision = model.current_successful_source_revision.clone();
+    if revision.is_empty() {
+        return Err(RepositoryError::NotFound);
+    }
+    let view = repository.get_view(model_id, view_id).await?.record;
+    let identity = ViewRenderIdentity {
+        revision: revision.clone(),
+        view_id: view.id.clone(),
+        view_etag: view.etag.clone(),
+    };
+    let image = match repository.cached_view_image(model_id, &identity).await {
+        Ok(image) => {
+            validate_visual_png(&image).map_err(|_| RepositoryError::Corrupt)?;
+            image
+        }
+        Err(RepositoryError::NotFound) => {
+            let glb = repository.geometry(model_id, &revision).await?;
+            let spec = VisualRenderSpec::from_view(&view).map_err(map_visual_error)?;
+            let rendered = visual
+                .render_view(identity.clone(), glb, spec)
+                .await
+                .map_err(map_visual_error)?;
+            let [(name, image)] = rendered
+                .images
+                .try_into()
+                .map_err(|_| RepositoryError::Corrupt)?;
+            if name != "view" {
+                return Err(RepositoryError::Corrupt);
+            }
+            validate_visual_png(&image).map_err(|_| RepositoryError::Corrupt)?;
+            repository
+                .complete_view_render(model_id, &identity, image.clone())
+                .await?;
+            image
+        }
+        Err(error) => return Err(error),
+    };
+    let current = repository.get_model(model_id).await?.record;
+    if current.current_successful_source_revision != revision {
+        return Err(RepositoryError::Conflict);
+    }
+    let current_view = repository.get_view(model_id, view_id).await?.record;
+    if current_view.etag != view.etag {
+        return Err(RepositoryError::Conflict);
+    }
+    let stale = current.desired_source_revision != revision;
+    let text = if stale {
+        "Warning: showing the saved view from the last successful revision; the desired revision is not rendered."
+    } else {
+        "Saved shaded view."
+    };
+    let metadata = json!({
+        "model_id": current.id,
+        "view_id": current_view.id,
+        "view_etag": current_view.etag,
+        "style": "shaded",
+        "recipe": VISUAL_RECIPE,
+        "width": PROJECTION_WIDTH,
+        "height": PROJECTION_HEIGHT,
+        "desired_revision": current.desired_source_revision,
+        "rendered_revision": revision,
+        "render_state": current.render_state,
         "mime_type": "image/png",
         "stale": stale
     });
@@ -261,6 +403,13 @@ async fn inspect_model(
         "structuredContent": { "metadata": metadata },
         "isError": false
     })))
+}
+
+const fn map_visual_error(error: VisualRendererError) -> RepositoryError {
+    match error {
+        VisualRendererError::Unavailable => RepositoryError::Unavailable,
+        VisualRendererError::InvalidResponse => RepositoryError::Corrupt,
+    }
 }
 
 async fn create_and_schedule(
@@ -355,6 +504,16 @@ struct ModelIdInput {
 struct InspectInput {
     model_id: String,
     projection: TechnicalProjection,
+    #[serde(default)]
+    render_style: RenderStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RenderStyle {
+    #[default]
+    Technical,
+    Shaded,
 }
 
 #[derive(Deserialize)]
@@ -456,7 +615,7 @@ fn tool_error(error: RepositoryError) -> McpToolResult {
         RepositoryError::NotFound => ("not_found", "The requested record was not found.", false),
         RepositoryError::Conflict => ("conflict", "The record changed concurrently.", true),
         RepositoryError::Unavailable => {
-            ("unavailable", "Faktory persistence is unavailable.", true)
+            ("unavailable", "Faktory is temporarily unavailable.", true)
         }
         RepositoryError::Corrupt => ("invalid_state", "Stored state is invalid.", false),
     };
@@ -504,7 +663,7 @@ fn model_get_definition() -> McpToolDefinition {
 fn model_inspect_definition() -> McpToolDefinition {
     definition(
         "model.inspect",
-        "Return one bounded technical projection from the current successful render.",
+        "Return one bounded technical or shaded projection from the current successful render.",
         true,
         json!({
             "type": "object",
@@ -514,9 +673,31 @@ fn model_inspect_definition() -> McpToolDefinition {
                     "type": "string",
                     "enum": ["isometric", "front", "back", "left", "right", "top", "bottom"],
                     "description": "Canonical technical projection."
+                },
+                "render_style": {
+                    "type": "string",
+                    "enum": ["technical", "shaded"],
+                    "default": "technical",
+                    "description": "Projection rendering style."
                 }
             },
             "required": ["model_id", "projection"],
+            "additionalProperties": false
+        }),
+    )
+}
+fn view_inspect_definition() -> McpToolDefinition {
+    definition(
+        "view.inspect",
+        "Render one exact saved named view from the current successful model revision.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "model_id": model_id_property(),
+                "view_id": {"type": "string", "minLength": 1, "maxLength": 64}
+            },
+            "required": ["model_id", "view_id"],
             "additionalProperties": false
         }),
     )
@@ -645,7 +826,10 @@ fn model_id_property() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -665,7 +849,9 @@ mod tests {
         },
         render::RenderConfig,
         storage::{InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject},
+        visual::{VisualRenderResult, VisualRenderer},
     };
+    use faktory_proto::v1::{NamedView, Projection, Quaternion, Vector3};
 
     #[derive(Debug)]
     struct BlockingCommittedPut {
@@ -805,6 +991,80 @@ mod tests {
                 },
             },
             projections: TechnicalProjectionImages::all(image),
+            shaded: TechnicalProjectionImages::all(valid_projection_png()),
+        }
+    }
+
+    fn named_view(id: String, projection: Projection) -> NamedView {
+        NamedView {
+            id,
+            name: "Saved camera".to_owned(),
+            target: Some(Vector3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            }),
+            rotation: Some(Quaternion {
+                x: 0.1,
+                y: 0.2,
+                z: 0.3,
+                w: 0.9,
+            }),
+            projection: projection.into(),
+            distance: 12.0,
+            field_of_view_degrees: 55.0,
+            orthographic_scale: 7.0,
+            etag: String::new(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingVisualRenderer {
+        calls: AtomicUsize,
+        specs: Mutex<Vec<VisualRenderSpec>>,
+        started: Semaphore,
+        release: Semaphore,
+        blocking: bool,
+    }
+
+    impl RecordingVisualRenderer {
+        fn immediate() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                specs: Mutex::new(Vec::new()),
+                started: Semaphore::new(0),
+                release: Semaphore::new(0),
+                blocking: false,
+            }
+        }
+
+        fn blocking() -> Self {
+            Self {
+                blocking: true,
+                ..Self::immediate()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VisualRenderer for RecordingVisualRenderer {
+        async fn render(
+            &self,
+            _glb: Bytes,
+            spec: VisualRenderSpec,
+        ) -> Result<VisualRenderResult, VisualRendererError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.specs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(spec);
+            self.started.add_permits(1);
+            if self.blocking {
+                self.release.acquire().await.expect("release open").forget();
+            }
+            Ok(VisualRenderResult {
+                images: vec![("view".to_owned(), valid_projection_png())],
+            })
         }
     }
 
@@ -876,6 +1136,7 @@ mod tests {
                         },
                     },
                     projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+                    shaded: TechnicalProjectionImages::all(Bytes::from_static(b"shaded-png")),
                 },
             )
             .await
@@ -928,11 +1189,15 @@ mod tests {
             )
             .await
             .expect("complete render");
-
-        let output = inspect_model(&repository, "part", TechnicalProjection::Front)
-            .await
-            .expect("inspect result")
-            .raw;
+        let output = inspect_model(
+            &repository,
+            "part",
+            TechnicalProjection::Front,
+            RenderStyle::Technical,
+        )
+        .await
+        .expect("inspect result")
+        .raw;
 
         assert_eq!(output["isError"], false);
         assert_eq!(output["content"].as_array().unwrap().len(), 2);
@@ -968,6 +1233,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn streamable_http_tools_call_preserves_semantic_image_block() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
         let model = repository
@@ -982,6 +1248,26 @@ mod tests {
             )
             .await
             .expect("complete render");
+        let view = repository
+            .put_view(
+                "part",
+                named_view(String::new(), Projection::Perspective),
+                None,
+            )
+            .await
+            .expect("create saved view");
+        repository
+            .complete_view_render(
+                "part",
+                &ViewRenderIdentity {
+                    revision: model.desired_source_revision.clone(),
+                    view_id: view.id.clone(),
+                    view_etag: view.etag.clone(),
+                },
+                valid_projection_png(),
+            )
+            .await
+            .expect("cache saved view");
         let renders = RenderQueue::start(
             repository.clone(),
             RenderConfig {
@@ -1024,7 +1310,7 @@ mod tests {
             ))
             .expect("MCP request");
 
-        let response = router.oneshot(request).await.expect("MCP response");
+        let response = router.clone().oneshot(request).await.expect("MCP response");
         let status = response.status();
         let body = to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -1046,6 +1332,389 @@ mod tests {
             .decode(content[1]["data"].as_str().expect("image data"))
             .expect("base64 image");
         validate_projection_png(&image).expect("transported projection PNG");
+
+        let discovery = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/list")
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{
+                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{},
+                    "io.modelcontextprotocol/clientInfo":{"name":"faktory-test","version":"1.0.0"}
+                }}})
+                .to_string(),
+            ))
+            .expect("discovery request");
+        let discovery = router
+            .clone()
+            .oneshot(discovery)
+            .await
+            .expect("discovery response");
+        let body = to_bytes(discovery.into_body(), 1024 * 1024)
+            .await
+            .expect("discovery body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("UTF-8 discovery")
+                .contains("view.inspect"),
+            "discovery response: {body:?}"
+        );
+
+        let view_call = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "view.inspect")
+            .body(Body::from(
+                json!({
+                    "jsonrpc":"2.0", "id":3, "method":"tools/call",
+                    "params":{"name":"view.inspect","arguments":{"model_id":"part","view_id":view.id},"_meta":{
+                        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities":{},
+                        "io.modelcontextprotocol/clientInfo":{"name":"faktory-test","version":"1.0.0"}
+                    }}
+                })
+                .to_string(),
+            ))
+            .expect("view call request");
+        let response = router.oneshot(view_call).await.expect("view call response");
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("view call body");
+        let body = std::str::from_utf8(&body).expect("UTF-8 view response");
+        assert!(body.contains("\"style\":\"shaded\""));
+        assert!(body.contains("\"type\":\"image\""));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn shaded_model_inspect_returns_stored_semantic_image_and_legacy_is_safe() {
+        let store = Arc::new(InMemoryObjectStore::default());
+        let repository = Repository::new(store.clone(), 1);
+        let created = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        let image = valid_projection_png();
+        repository
+            .complete_render(
+                &created.id,
+                &created.desired_source_revision,
+                rendered_output(image.clone()),
+            )
+            .await
+            .expect("complete render");
+
+        let output = inspect_model(
+            &repository,
+            "part",
+            TechnicalProjection::Top,
+            RenderStyle::Shaded,
+        )
+        .await
+        .expect("shaded inspect");
+        assert_eq!(output.raw["content"][1]["type"], "image");
+        assert_eq!(
+            output.raw["structuredContent"]["metadata"]["style"],
+            "shaded"
+        );
+        assert_eq!(
+            output.raw["structuredContent"]["metadata"]["recipe"],
+            VISUAL_RECIPE
+        );
+        repository
+            .edit_model(
+                "part",
+                &created.desired_source_revision,
+                None,
+                Some(&[SourcePatch {
+                    old: "source".to_owned(),
+                    new: "changed".to_owned(),
+                }]),
+            )
+            .await
+            .expect("make shaded render stale");
+        let stale = inspect_model(
+            &repository,
+            "part",
+            TechnicalProjection::Top,
+            RenderStyle::Shaded,
+        )
+        .await
+        .expect("stale shaded inspect");
+        assert_eq!(stale.raw["structuredContent"]["metadata"]["stale"], true);
+
+        let key = crate::model::shaded_projection_key(
+            "part",
+            &created.desired_source_revision,
+            TechnicalProjection::Top,
+        );
+        let stored = store.get(&key).await.expect("stored shaded image");
+        store
+            .delete(&key, &stored.etag)
+            .await
+            .expect("remove legacy image");
+        assert_eq!(
+            inspect_model(
+                &repository,
+                "part",
+                TechnicalProjection::Top,
+                RenderStyle::Shaded,
+            )
+            .await
+            .expect_err("legacy render lacks shaded image"),
+            RepositoryError::NotFound
+        );
+
+        let corrupt_repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let corrupt = corrupt_repository
+            .create_model("corrupt", "Corrupt", b"source")
+            .await
+            .expect("create corrupt model");
+        let mut output = rendered_output(valid_projection_png());
+        output.shaded = TechnicalProjectionImages::all(pseudo_projection_png());
+        corrupt_repository
+            .complete_render(&corrupt.id, &corrupt.desired_source_revision, output)
+            .await
+            .expect("store corrupt shaded fixture");
+        assert_eq!(
+            inspect_model(
+                &corrupt_repository,
+                "corrupt",
+                TechnicalProjection::Top,
+                RenderStyle::Shaded,
+            )
+            .await
+            .expect_err("corrupt shaded projection rejected"),
+            RepositoryError::Corrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn view_inspect_converts_exact_camera_then_caches_the_result() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let created = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        repository
+            .complete_render(
+                &created.id,
+                &created.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete render");
+        let view = repository
+            .put_view(
+                "part",
+                named_view(String::new(), Projection::Orthographic),
+                None,
+            )
+            .await
+            .expect("create view");
+        let renderer = Arc::new(RecordingVisualRenderer::immediate());
+        let visual = VisualCoordinator::new(renderer.clone(), Duration::from_secs(1));
+        let persisted_view = repository
+            .get_view("part", &view.id)
+            .await
+            .expect("load persisted view")
+            .record;
+
+        for _ in 0..2 {
+            let output = inspect_view(&repository, &visual, "part", &view.id)
+                .await
+                .expect("inspect view");
+            let metadata = &output.raw["structuredContent"]["metadata"];
+            assert_eq!(metadata["view_id"], view.id);
+            assert_eq!(metadata["view_etag"], view.etag);
+            assert_eq!(metadata["style"], "shaded");
+            assert_eq!(metadata["recipe"], VISUAL_RECIPE);
+            assert_eq!(metadata["stale"], false);
+            assert_eq!(output.raw["content"][1]["mimeType"], "image/png");
+        }
+        assert_eq!(renderer.calls.load(Ordering::SeqCst), 1);
+        let specs = renderer
+            .specs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            specs.as_slice(),
+            &[VisualRenderSpec::View {
+                recipe: VISUAL_RECIPE,
+                camera: crate::visual::VisualCamera {
+                    target: [1.0, 2.0, 3.0],
+                    rotation: persisted_view.rotation,
+                    projection: crate::visual::VisualProjection::Orthographic,
+                    distance: 12.0,
+                    field_of_view_degrees: 55.0,
+                    orthographic_scale: 7.0,
+                },
+            }]
+        );
+        drop(specs);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn view_inspect_rejects_view_races_and_corrupt_cache() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let created = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        repository
+            .complete_render(
+                &created.id,
+                &created.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete render");
+        let view = repository
+            .put_view(
+                "part",
+                named_view(String::new(), Projection::Perspective),
+                None,
+            )
+            .await
+            .expect("create view");
+        let renderer = Arc::new(RecordingVisualRenderer::blocking());
+        let visual = VisualCoordinator::new(renderer.clone(), Duration::from_secs(1));
+        let call_repository = repository.clone();
+        let call_visual = visual.clone();
+        let view_id = view.id.clone();
+        let call = tokio::spawn(async move {
+            inspect_view(&call_repository, &call_visual, "part", &view_id).await
+        });
+        renderer
+            .started
+            .acquire()
+            .await
+            .expect("render started")
+            .forget();
+        let mut changed = named_view(view.id.clone(), Projection::Perspective);
+        changed.name = "Changed".to_owned();
+        let changed = repository
+            .put_view("part", changed, Some(&view.etag))
+            .await
+            .expect("change view");
+        renderer.release.add_permits(1);
+        assert_eq!(
+            call.await
+                .expect("inspection task")
+                .expect_err("etag race conflicts"),
+            RepositoryError::Conflict
+        );
+
+        repository
+            .complete_view_render(
+                "part",
+                &ViewRenderIdentity {
+                    revision: created.desired_source_revision.clone(),
+                    view_id: changed.id.clone(),
+                    view_etag: changed.etag.clone(),
+                },
+                pseudo_projection_png(),
+            )
+            .await
+            .expect("store corrupt cache fixture");
+        assert_eq!(
+            inspect_view(&repository, &visual, "part", &changed.id)
+                .await
+                .expect_err("corrupt cache rejected"),
+            RepositoryError::Corrupt
+        );
+
+        let deleted_view = repository
+            .put_view(
+                "part",
+                named_view(String::new(), Projection::Perspective),
+                None,
+            )
+            .await
+            .expect("create view for deletion race");
+        let call_repository = repository.clone();
+        let call_visual = visual.clone();
+        let deleted_view_id = deleted_view.id.clone();
+        let deleted_call = tokio::spawn(async move {
+            inspect_view(&call_repository, &call_visual, "part", &deleted_view_id).await
+        });
+        renderer
+            .started
+            .acquire()
+            .await
+            .expect("deletion render started")
+            .forget();
+        repository
+            .delete_view("part", &deleted_view.id, &deleted_view.etag)
+            .await
+            .expect("delete view during render");
+        renderer.release.add_permits(1);
+        assert_eq!(
+            deleted_call
+                .await
+                .expect("deletion inspection task")
+                .expect_err("deleted view rejected"),
+            RepositoryError::NotFound
+        );
+
+        let revision_view = repository
+            .put_view(
+                "part",
+                named_view(String::new(), Projection::Perspective),
+                None,
+            )
+            .await
+            .expect("create view for revision race");
+        let call_repository = repository.clone();
+        let call_visual = visual.clone();
+        let revision_view_id = revision_view.id.clone();
+        let revision_call = tokio::spawn(async move {
+            inspect_view(&call_repository, &call_visual, "part", &revision_view_id).await
+        });
+        renderer
+            .started
+            .acquire()
+            .await
+            .expect("revision render started")
+            .forget();
+        let edited = repository
+            .edit_model(
+                "part",
+                &created.desired_source_revision,
+                None,
+                Some(&[SourcePatch {
+                    old: "source".to_owned(),
+                    new: "replacement".to_owned(),
+                }]),
+            )
+            .await
+            .expect("edit source during view render")
+            .record;
+        repository
+            .complete_render(
+                "part",
+                &edited.desired_source_revision,
+                rendered_output(valid_projection_png()),
+            )
+            .await
+            .expect("complete replacement render");
+        renderer.release.add_permits(1);
+        assert_eq!(
+            revision_call
+                .await
+                .expect("revision inspection task")
+                .expect_err("revision race rejected"),
+            RepositoryError::Conflict
+        );
     }
 
     #[tokio::test]
@@ -1077,10 +1746,15 @@ mod tests {
             .expect("edit model")
             .record;
 
-        let output = inspect_model(&repository, "part", TechnicalProjection::Top)
-            .await
-            .expect("last-good inspect")
-            .raw;
+        let output = inspect_model(
+            &repository,
+            "part",
+            TechnicalProjection::Top,
+            RenderStyle::Technical,
+        )
+        .await
+        .expect("last-good inspect")
+        .raw;
         assert!(
             output["content"][0]["text"]
                 .as_str()
@@ -1110,9 +1784,14 @@ mod tests {
             .await
             .expect("create model");
 
-        let error = inspect_model(&repository, "part", TechnicalProjection::Bottom)
-            .await
-            .expect_err("no successful render");
+        let error = inspect_model(
+            &repository,
+            "part",
+            TechnicalProjection::Bottom,
+            RenderStyle::Technical,
+        )
+        .await
+        .expect_err("no successful render");
         let output = tool_error(error).raw;
         assert_eq!(output["isError"], true);
         assert_eq!(output["structuredContent"]["error"]["code"], "not_found");
@@ -1139,9 +1818,14 @@ mod tests {
         );
         let image = store.get(&key).await.expect("stored image");
         store.delete(&key, &image.etag).await.expect("remove image");
-        let missing = inspect_model(&legacy_repository, "legacy", TechnicalProjection::Bottom)
-            .await
-            .expect_err("legacy image absent");
+        let missing = inspect_model(
+            &legacy_repository,
+            "legacy",
+            TechnicalProjection::Bottom,
+            RenderStyle::Technical,
+        )
+        .await
+        .expect_err("legacy image absent");
         assert_eq!(
             tool_error(missing).raw["structuredContent"]["error"]["code"],
             "not_found"
@@ -1164,9 +1848,14 @@ mod tests {
             .await
             .expect("complete corrupt fixture");
 
-        let error = inspect_model(&repository, "corrupt", TechnicalProjection::Isometric)
-            .await
-            .expect_err("corrupt image rejected");
+        let error = inspect_model(
+            &repository,
+            "corrupt",
+            TechnicalProjection::Isometric,
+            RenderStyle::Technical,
+        )
+        .await
+        .expect_err("corrupt image rejected");
         let output = tool_error(error).raw;
         assert_eq!(output["isError"], true);
         assert_eq!(

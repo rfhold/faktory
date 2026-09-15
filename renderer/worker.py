@@ -11,19 +11,94 @@ from pathlib import Path
 from typing import Final
 
 import cadquery as cq
-from cadquery.occ_impl.exporters import getSVG
+from cadquery.occ_impl.exporters import svg as cq_svg
 from cadquery.occ_impl.exporters.assembly import exportGLTF
+from OCP.BRepLib import BRepLib
+from OCP.HLRAlgo import HLRAlgo_Projector
+from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
+from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
 
 ERROR_PREFIX: Final = "renderer_error="
 PROJECTIONS: Final = (
-    ("isometric", (1, -1, 1)),
-    ("front", (0, -1, 0)),
-    ("back", (0, 1, 0)),
-    ("left", (-1, 0, 0)),
-    ("right", (1, 0, 0)),
-    ("top", (0, 0, 1)),
-    ("bottom", (0, 0, -1)),
+    ("isometric", (1, -1, 1), (1, 1, 0)),
+    ("front", (0, -1, 0), (1, 0, 0)),
+    ("back", (0, 1, 0), (-1, 0, 0)),
+    ("left", (-1, 0, 0), (0, -1, 0)),
+    ("right", (1, 0, 0), (0, 1, 0)),
+    ("top", (0, 0, 1), (1, 0, 0)),
+    ("bottom", (0, 0, -1), (1, 0, 0)),
 )
+
+
+def _get_svg(
+    shape: cq.Shape,
+    projection_direction: tuple[int, int, int],
+    screen_right: tuple[int, int, int],
+) -> str:
+    # CadQuery 2.6.1's getSVG does not expose gp_Ax2's X direction. Keep this
+    # bounded adapter aligned with its HLR and SVG helpers while fixing the roll.
+    hlr = HLRBRep_Algo()
+    hlr.Add(shape.wrapped)
+    coordinate_system = gp_Ax2(
+        gp_Pnt(), gp_Dir(*projection_direction), gp_Dir(*screen_right)
+    )
+    hlr.Projector(HLRAlgo_Projector(coordinate_system))
+    hlr.Update()
+    hlr.Hide()
+
+    hlr_shapes = HLRBRep_HLRToShape(hlr)
+    visible = [
+        edge_set
+        for edge_set in (
+            hlr_shapes.VCompound(),
+            hlr_shapes.Rg1LineVCompound(),
+            hlr_shapes.OutLineVCompound(),
+        )
+        if not edge_set.IsNull()
+    ]
+    hidden = [
+        edge_set
+        for edge_set in (hlr_shapes.HCompound(), hlr_shapes.OutLineHCompound())
+        if not edge_set.IsNull()
+    ]
+
+    for edge_set in (*visible, *hidden):
+        BRepLib.BuildCurves3d_s(edge_set, cq_svg.TOLERANCE)
+
+    visible_shapes = list(map(cq_svg.Shape, visible))
+    hidden_shapes = list(map(cq_svg.Shape, hidden))
+    _, visible_paths = cq_svg.getPaths(visible_shapes, hidden_shapes)
+    bounding_box = cq_svg.Compound.makeCompound(
+        hidden_shapes + visible_shapes
+    ).BoundingBox()
+
+    width = 640.0
+    height = 480.0
+    margin_left = 32.0
+    margin_top = 32.0
+    bounding_box_scale = 0.75
+    unit_scale = min(
+        width / bounding_box.xlen * bounding_box_scale,
+        height / bounding_box.ylen * bounding_box_scale,
+    )
+    x_translate = -bounding_box.xmin + margin_left / unit_scale
+    y_translate = -bounding_box.ymax - margin_top / unit_scale
+    stroke_width = 1.0 / unit_scale
+    visible_content = "".join(cq_svg.PATHTEMPLATE % path for path in visible_paths)
+
+    return cq_svg.SVG_TEMPLATE % {
+        "unitScale": str(unit_scale),
+        "strokeWidth": str(stroke_width),
+        "strokeColor": "24,24,24",
+        "hiddenColor": "160,160,160",
+        "hiddenContent": "",
+        "visibleContent": visible_content,
+        "xTranslate": str(x_translate),
+        "yTranslate": str(y_translate),
+        "width": str(width),
+        "height": str(height),
+        "axesIndicator": "",
+    }
 
 
 def _reject_json_constant(value: str) -> None:
@@ -229,23 +304,11 @@ def render(
         _remove_outputs(output_paths)
         return "invalid_facts"
 
-    for (name, direction), projection_path in zip(
+    for (name, direction, screen_right), projection_path in zip(
         PROJECTIONS, projection_paths, strict=True
     ):
         try:
-            svg = getSVG(
-                compound,
-                {
-                    "width": 640,
-                    "height": 480,
-                    "marginLeft": 32,
-                    "marginTop": 32,
-                    "projectionDir": direction,
-                    "showAxes": False,
-                    "showHidden": False,
-                    "strokeColor": (24, 24, 24),
-                },
-            )
+            svg = _get_svg(compound, direction, screen_right)
             projection_path.write_text(svg, encoding="utf-8")
             if name == "isometric":
                 svg_path.write_text(svg, encoding="utf-8")

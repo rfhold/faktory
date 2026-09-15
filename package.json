@@ -8,7 +8,10 @@
     "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module preserve --target ES2022 proto/gen/ts/faktory/v1/faktory_pb.ts",
     "web:dev": "pnpm --filter @rfhold/faktory-web dev",
     "web:build": "pnpm --filter @rfhold/faktory-web build",
-    "web:test": "pnpm --filter @rfhold/faktory-web test"
+    "web:test": "pnpm --filter @rfhold/faktory-web test",
+    "visual-renderer:build": "pnpm --filter @rfhold/faktory-visual-renderer build",
+    "visual-renderer:typecheck": "pnpm --filter @rfhold/faktory-visual-renderer typecheck",
+    "visual-renderer:test": "pnpm --filter @rfhold/faktory-visual-renderer test"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.15.0",

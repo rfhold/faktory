@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -41,6 +41,7 @@ use crate::{
     render::{RenderConfig, RenderQueue},
     service::FaktoryGrpcService,
     storage::ObjectStore,
+    visual::{HttpVisualRenderer, UnavailableVisualRenderer, VisualCoordinator, VisualRenderer},
 };
 
 #[derive(Clone, Debug)]
@@ -49,7 +50,26 @@ pub struct AppConfig {
     pub public_base_url: String,
     pub static_directory: Option<PathBuf>,
     pub render: RenderConfig,
+    pub visual: VisualRendererConfig,
     pub watch_capacity: usize,
+}
+
+#[derive(Clone)]
+pub enum VisualRendererConfig {
+    Disabled,
+    Http { base_url: String, timeout: Duration },
+}
+
+impl std::fmt::Debug for VisualRendererConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("Disabled"),
+            Self::Http { timeout, .. } => formatter
+                .debug_struct("Http")
+                .field("timeout", timeout)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -241,8 +261,34 @@ pub async fn build_runtime(
     store: Arc<dyn ObjectStore>,
     config: AppConfig,
 ) -> Result<Runtime, String> {
+    let visual: Arc<dyn VisualRenderer> = match &config.visual {
+        VisualRendererConfig::Disabled => {
+            if matches!(config.auth, AuthConfig::Production(_)) {
+                return Err("visual renderer is required in production".to_owned());
+            }
+            Arc::new(UnavailableVisualRenderer)
+        }
+        VisualRendererConfig::Http { base_url, timeout } => Arc::new(
+            HttpVisualRenderer::new(base_url, *timeout)
+                .map_err(|_| "invalid visual renderer configuration".to_owned())?,
+        ),
+    };
+    let wait_timeout = match &config.visual {
+        VisualRendererConfig::Disabled => Duration::from_secs(1),
+        VisualRendererConfig::Http { timeout, .. } => *timeout,
+    };
+    build_runtime_with_visual_renderer(store, config, visual, wait_timeout).await
+}
+
+pub async fn build_runtime_with_visual_renderer(
+    store: Arc<dyn ObjectStore>,
+    config: AppConfig,
+    visual_renderer: Arc<dyn VisualRenderer>,
+    visual_timeout: Duration,
+) -> Result<Runtime, String> {
     let repository = Repository::new(store, config.watch_capacity);
-    let renders = RenderQueue::start(repository.clone(), config.render.clone())
+    let visual = VisualCoordinator::new(visual_renderer, visual_timeout);
+    let renders = RenderQueue::start_with_visual(repository.clone(), config.render.clone(), visual)
         .map_err(|_| "invalid render configuration".to_owned())?;
     renders
         .reconcile(&repository)
@@ -769,6 +815,9 @@ mod tests {
             projections: crate::model::TechnicalProjectionImages::all(bytes::Bytes::from_static(
                 b"png",
             )),
+            shaded: crate::model::ShadedProjectionImages::all(bytes::Bytes::from_static(
+                b"shaded-png",
+            )),
         }
     }
 
@@ -1197,8 +1246,20 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 max_output_bytes: 1024,
             },
+            visual: VisualRendererConfig::Disabled,
             watch_capacity: 4,
         }
+    }
+
+    #[test]
+    fn visual_configuration_debug_omits_internal_endpoint() {
+        let config = VisualRendererConfig::Http {
+            base_url: "http://private-renderer.internal:9876".to_owned(),
+            timeout: Duration::from_secs(3),
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("3s"));
+        assert!(!debug.contains("private-renderer"));
     }
 
     async fn artifact_request(router: Router, path: String) -> Response {

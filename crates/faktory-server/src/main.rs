@@ -5,7 +5,7 @@ use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Du
 use faktory_server::production::parse_cimd_trusted_private_origins;
 use faktory_server::{
     AppConfig, AuthConfig, AwsObjectStore, ProductionAuthConfig, RenderConfig, S3AccessKeyId,
-    Secret, build_runtime, observability, profiling,
+    Secret, VisualRendererConfig, build_runtime, observability, profiling,
 };
 
 #[tokio::main]
@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     .await?;
     let command: Vec<String> = serde_json::from_str(&required("FAKTORY_RENDER_COMMAND_JSON")?)
         .map_err(|_| "FAKTORY_RENDER_COMMAND_JSON must be a JSON string array")?;
+    let visual = visual_renderer_from_env(&auth)?;
     let runtime = build_runtime(
         Arc::new(store),
         AppConfig {
@@ -37,6 +38,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 timeout: Duration::from_secs(parse("FAKTORY_RENDER_TIMEOUT_SECONDS", 120)?),
                 max_output_bytes: parse("FAKTORY_RENDER_MAX_OUTPUT_BYTES", 64 * 1024 * 1024)?,
             },
+            visual,
             watch_capacity: parse("FAKTORY_WATCH_CAPACITY", 128)?,
         },
     )
@@ -55,6 +57,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     observability.shutdown();
     server_result?;
     Ok(())
+}
+
+fn visual_renderer_from_env(
+    auth: &AuthConfig,
+) -> Result<VisualRendererConfig, Box<dyn Error + Send + Sync>> {
+    let timeout = Duration::from_secs(parse("FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS", 30)?);
+    match env::var("FAKTORY_VISUAL_RENDERER_URL") {
+        Ok(base_url) => Ok(VisualRendererConfig::Http { base_url, timeout }),
+        Err(env::VarError::NotPresent) if matches!(auth, AuthConfig::Disabled) => {
+            Ok(VisualRendererConfig::Disabled)
+        }
+        Err(env::VarError::NotPresent) => Err("FAKTORY_VISUAL_RENDERER_URL is required".into()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn auth_from_env() -> Result<AuthConfig, Box<dyn Error + Send + Sync>> {

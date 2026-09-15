@@ -4,4 +4,4 @@ This domain defines focused and full local implementation, integration, privacy,
 
 | Document | Covers |
 | --- | --- |
-| [Testing](testing.md) | Contract checks, required implementation coverage, and evidence boundaries. |
+| [Testing](testing.md) | Protocol, render, camera, worker-isolation, storage, and evidence contracts. |

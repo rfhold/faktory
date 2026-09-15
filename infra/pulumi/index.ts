@@ -13,6 +13,7 @@ const hostname = validateHostname(config.require("hostname"));
 const displayName = config.require("displayName");
 const slug = validateSegment(config.require("slug"), "slug");
 const image = requireImmutableImage(config.require("image"));
+const visualRendererImage = requireImmutableImage(config.require("visualRendererImage"));
 const authentikBaseUrl = validateHttpsOrigin(config.require("authentikBaseUrl"), "authentikBaseUrl");
 const s3Endpoint = validateHttpsOrigin(config.require("s3Endpoint"), "s3Endpoint");
 const backupEndpoint = validateHttpsOrigin(config.require("backupEndpoint"), "backupEndpoint");
@@ -33,6 +34,7 @@ const labels = {
   "app.kubernetes.io/managed-by": "pulumi",
 };
 const workloadLabels = { ...labels, "app.kubernetes.io/component": "server" };
+const visualRendererLabels = { ...labels, "app.kubernetes.io/component": "visual-renderer" };
 
 const namespace = new k8s.core.v1.Namespace("faktory-namespace", {
   metadata: { name: namespaceName, labels },
@@ -172,6 +174,63 @@ const wrappingKeySecret = new k8s.core.v1.Secret("faktory-oauth-wrapping-keys", 
   stringData: { "keyring.json": wrappingKeyring },
 });
 
+const visualRendererService = new k8s.core.v1.Service("faktory-visual-renderer", {
+  metadata: { name: "visual-renderer", namespace: namespace.metadata.name, labels: visualRendererLabels },
+  spec: {
+    type: "ClusterIP",
+    selector: visualRendererLabels,
+    ports: [{ name: "http", port: 8081, targetPort: "http", protocol: "TCP" }],
+  },
+});
+
+const visualRendererDeployment = new k8s.apps.v1.Deployment("faktory-visual-renderer", {
+  metadata: { name: "visual-renderer", namespace: namespace.metadata.name, labels: visualRendererLabels },
+  spec: {
+    replicas: 1,
+    strategy: { type: "Recreate" },
+    selector: { matchLabels: visualRendererLabels },
+    template: {
+      metadata: { labels: visualRendererLabels },
+      spec: {
+        automountServiceAccountToken: false,
+        nodeSelector: { "kubernetes.io/arch": "amd64" },
+        securityContext: {
+          runAsNonRoot: true,
+          runAsUser: 65532,
+          runAsGroup: 65532,
+          fsGroup: 65532,
+          seccompProfile: { type: "Unconfined" },
+        },
+        terminationGracePeriodSeconds: 30,
+        containers: [{
+          name: "visual-renderer",
+          image: visualRendererImage,
+          imagePullPolicy: "IfNotPresent",
+          ports: [{ name: "http", containerPort: 8081, protocol: "TCP" }],
+          securityContext: {
+            runAsNonRoot: true,
+            runAsUser: 65532,
+            runAsGroup: 65532,
+            allowPrivilegeEscalation: false,
+            readOnlyRootFilesystem: true,
+            capabilities: { drop: ["ALL"] },
+            seccompProfile: { type: "Unconfined" },
+          },
+          resources: {
+            requests: { cpu: "250m", memory: "512Mi" },
+            limits: { cpu: "1", memory: "1Gi" },
+          },
+          startupProbe: { httpGet: { path: "/health/ready", port: "http" }, periodSeconds: 2, failureThreshold: 60 },
+          readinessProbe: { httpGet: { path: "/health/ready", port: "http" }, periodSeconds: 5, failureThreshold: 3 },
+          livenessProbe: { httpGet: { path: "/health/live", port: "http" }, periodSeconds: 10, failureThreshold: 3 },
+          volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+        }],
+        volumes: [{ name: "tmp", emptyDir: { medium: "Memory", sizeLimit: "256Mi" } }],
+      },
+    },
+  },
+}, { dependsOn: [visualRendererService] });
+
 const appSecret = new k8s.core.v1.Secret("faktory-app", {
   metadata: { name: "faktory-app", namespace: namespace.metadata.name, labels },
   type: "Opaque",
@@ -202,6 +261,8 @@ const appSecret = new k8s.core.v1.Secret("faktory-app", {
     FAKTORY_S3_BUCKET: artifactsConfig.data.apply((values) => values.BUCKET_NAME),
     FAKTORY_S3_ACCESS_KEY: decodeArtifactsSecret("AWS_ACCESS_KEY_ID"),
     FAKTORY_S3_SECRET_KEY: decodeArtifactsSecret("AWS_SECRET_ACCESS_KEY"),
+    FAKTORY_VISUAL_RENDERER_URL: `http://visual-renderer.${namespaceName}.svc.cluster.local:8081`,
+    FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS: "30",
     FAKTORY_RENDER_COMMAND_JSON: '["/opt/faktory/env/bin/python","-m","renderer"]',
     FAKTORY_STATIC_DIR: "/opt/faktory/web",
   },
@@ -262,7 +323,7 @@ new k8s.apps.v1.Deployment("faktory", {
       },
     },
   },
-}, { dependsOn: [appSecret, wrappingKeySecret] });
+}, { dependsOn: [appSecret, wrappingKeySecret, visualRendererDeployment] });
 
 new k8s.networking.v1.NetworkPolicy("faktory-network", {
   metadata: { name: "faktory", namespace: namespace.metadata.name, labels },
@@ -277,7 +338,21 @@ new k8s.networking.v1.NetworkPolicy("faktory-network", {
       { to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } } }], ports: [{ port: 53, protocol: "UDP" }, { port: 53, protocol: "TCP" }] },
       { ports: [{ port: 443, protocol: "TCP" }, { port: 4040, protocol: "TCP" }, { port: 4318, protocol: "TCP" }] },
       { to: [{ podSelector: { matchLabels: { "cnpg.io/cluster": "faktory-postgres" } } }], ports: [{ port: 5432, protocol: "TCP" }] },
+      { to: [{ podSelector: { matchLabels: visualRendererLabels } }], ports: [{ port: 8081, protocol: "TCP" }] },
     ],
+  },
+});
+
+new k8s.networking.v1.NetworkPolicy("faktory-visual-renderer-network", {
+  metadata: { name: "visual-renderer", namespace: namespace.metadata.name, labels: visualRendererLabels },
+  spec: {
+    podSelector: { matchLabels: visualRendererLabels },
+    policyTypes: ["Ingress", "Egress"],
+    ingress: [{
+      from: [{ podSelector: { matchLabels: workloadLabels } }],
+      ports: [{ port: 8081, protocol: "TCP" }],
+    }],
+    egress: [],
   },
 });
 

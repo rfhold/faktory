@@ -10,6 +10,7 @@ import { modelKeys, setViewsDefault, upsertModel } from "../api/queries";
 import { StatusBadge } from "../components/StatusBadge";
 import { artifactUrl, modelAvailability } from "../model";
 import { ModelViewer, type CameraSnapshot } from "../viewer/ModelViewer";
+import { convertCameraProjection } from "../viewer/threeRecipe";
 import {
   initializeDefaultView,
   skipDefaultViewInitialization,
@@ -307,7 +308,7 @@ export function ModelPage() {
                         onClick={() => {
                           const current = camera();
                           if (!current) return;
-                          const next = { ...current, projection: Projection.PERSPECTIVE };
+                          const next = convertCameraProjection(current, Projection.PERSPECTIVE);
                           setCamera(next);
                           setAppliedView(next);
                         }}
@@ -319,7 +320,7 @@ export function ModelPage() {
                         onClick={() => {
                           const current = camera();
                           if (!current) return;
-                          const next = { ...current, projection: Projection.ORTHOGRAPHIC };
+                          const next = convertCameraProjection(current, Projection.ORTHOGRAPHIC);
                           setCamera(next);
                           setAppliedView(next);
                         }}

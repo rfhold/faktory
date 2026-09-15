@@ -7,6 +7,7 @@ Read [the documentation index](docs/README.md) and the nearest contract before c
 - Rust `1.96.0` with edition 2024.
 - Buf v2.
 - Node.js with pnpm `10.34.3`.
+- Chromium for visual renderer browser tests. The production worker image installs its pinned Playwright Chromium build.
 - Python `>=3.12,<3.13` managed by uv for native renderer development and tests.
 - conda-lock `3.0.4` and micromamba `2.3.3` for the production image's Linux AMD64 and ARM64 renderer environments.
 - Bun `1.3.5` for Pulumi declaration tests and deployment.
@@ -36,8 +37,12 @@ pnpm install --frozen-lockfile
 pnpm run typecheck
 pnpm run web:build
 pnpm run web:test
+pnpm run visual-renderer:typecheck
+pnpm run visual-renderer:build
+pnpm run visual-renderer:test
 uv sync --frozen
 uv run python -m unittest discover
+python -m unittest discover .tekton -p '*_test.py'
 cd infra/pulumi
 bun install --frozen-lockfile
 bun run build
@@ -47,13 +52,17 @@ docker compose config --quiet
 git diff --check
 ```
 
-Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks but do not repeat the local quality suite. After each architecture-specific runtime image is built, its matching-architecture pipeline task runs the packaged renderer against `renderer/examples/box.py` and validates the generated GLB header before manifest publication.
+Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Each Faktory image receives a matching native renderer check before manifest publication.
+
+The pipelines build `faktory-visual-renderer` only for AMD64 from the `visual-renderer-runtime` target. A native AMD64 task starts the packaged service under the production hardening policy. It renders a colored GLB and validates all seven PNG responses. Deployment receives the worker image by immutable digest.
 
 ## Releases
 
 A release requires a committed remote `main` branch and an annotated, signed `vX.Y.Z` tag. The tag must point to a commit in `origin/main`. The version must equal both `[workspace.package].version` in `Cargo.toml` and `version` in `web/package.json`.
 
-The release pipeline accepts only an exact stable semantic-version tag. It verifies the webhook SHA, tag signature, trusted signer, and `origin/main` ancestry. It publishes AMD64 and ARM64 images, promotes only the immutable manifest digest to `vX.Y.Z`, and deploys that digest to the Pulumi `prod` stack. It does not publish a floating alias.
+The release pipeline accepts only an exact stable semantic-version tag. It verifies the webhook SHA, tag signature, trusted signer, and `origin/main` ancestry. It publishes the Faktory AMD64 and ARM64 images. It promotes the immutable Faktory manifest digest to `vX.Y.Z`.
+
+The same release gate publishes the AMD64-only `faktory-visual-renderer` image. It promotes that image's immutable digest to `vX.Y.Z`. Pulumi receives both digests for the `prod` stack. The pipeline does not publish a floating alias.
 
 ## Renderer Environments
 
@@ -112,7 +121,11 @@ This local command validates only the architecture executed by the local Docker 
 
 ## Local Compose Integration
 
-Compose initializes Garage and Faktory PostgreSQL from named volumes. Faktory runs with exact `FAKTORY_AUTH_MODE=disabled`, so the SPA, gRPC-web, artifact, and MCP routes require no cookie or bearer token. The Docker build selects the native Linux AMD64 or ARM64 renderer lock automatically.
+Compose initializes Garage and Faktory PostgreSQL from named volumes. It also starts one AMD64 visual renderer on internal service port `8081`. The worker has no host port.
+
+Faktory uses `FAKTORY_VISUAL_RENDERER_URL=http://visual-renderer:8081` and `FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS=30`. Faktory waits for the worker readiness check before startup.
+
+Faktory runs with exact `FAKTORY_AUTH_MODE=disabled`. The SPA, gRPC-web, artifact, and MCP routes require no cookie or bearer token. The Faktory image build selects the native Linux AMD64 or ARM64 renderer lock automatically.
 
 All fixed Compose credentials are local-development-only. Open `http://localhost:8080` directly; no sign-in or MCP OAuth flow is used locally. The Faktory port is published only on `127.0.0.1`. Never expose this unauthenticated topology beyond loopback:
 
@@ -124,6 +137,38 @@ curl --fail http://localhost:8080/ready
 docker compose down --volumes --remove-orphans
 ```
 
-Use `docker compose logs faktory garage garage-init postgres` to inspect startup failures. The cleanup command removes all local application and storage state.
+Use `docker compose logs faktory visual-renderer garage garage-init postgres` to inspect startup failures. The cleanup command removes all local application and storage state.
 
 Tests and checks prove local source and declaration consistency. Compose exercises only explicit disabled authentication mode; it does not exercise or prove production Authentik, hosted MCP OAuth, Ceph, ingress, TLS, or deployed behavior. When `FAKTORY_AUTH_MODE` is absent, the server defaults to production authentication and fails closed if its required production configuration is missing or invalid.
+
+## Visual Renderer Worker
+
+The visual renderer supports only Linux AMD64. Its package checks run through the workspace commands in the validation sequence.
+
+Build and verify the dedicated image from the repository root:
+
+```bash
+docker build --platform linux/amd64 --target visual-renderer-runtime --tag faktory-visual-renderer:local .
+docker run --rm --detach --name faktory-visual-renderer-verify \
+  --platform linux/amd64 \
+  --user 65532:65532 \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
+  --cpus 1 \
+  --memory 1g \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --security-opt seccomp=unconfined \
+  --volume "$PWD/.tekton/verify-visual-renderer.mjs:/verify-visual-renderer.mjs:ro" \
+  faktory-visual-renderer:local
+docker exec faktory-visual-renderer-verify node /verify-visual-renderer.mjs
+docker rm --force faktory-visual-renderer-verify
+```
+
+The verifier submits a colored GLB to `POST /v1/render`. It checks the seven canonical PNG images, dimensions, names, and visible color.
+
+The worker runs as UID and GID `65532`. It has a read-only root filesystem, no capabilities, and no privilege escalation. Its memory-backed `/tmp` has a `256MiB` limit and no executable permission.
+
+The outer worker container uses an unconfined seccomp profile because Chromium requires syscalls outside the default profile. Chromium keeps its own sandbox enabled. Faktory keeps the `RuntimeDefault` seccomp profile. Never disable the Chromium sandbox.
+
+Preview and production expose the worker only through a ClusterIP Service. NetworkPolicy accepts port `8081` only from Faktory pods. The worker has no egress access, public route, ingress route, or authentication sidecar.

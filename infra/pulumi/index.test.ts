@@ -17,6 +17,7 @@ before(async () => {
     "faktory:displayName": "Faktory Test",
     "faktory:slug": "faktory-test",
     "faktory:image": `registry.example.test/faktory@sha256:${"a".repeat(64)}`,
+    "faktory:visualRendererImage": `registry.example.test/faktory-visual-renderer@sha256:${"b".repeat(64)}`,
     "faktory:authentikBaseUrl": "https://auth.example.test",
     "faktory:s3Endpoint": "https://app-s3.example.test",
     "faktory:backupEndpoint": "https://backup-s3.example.test",
@@ -113,6 +114,7 @@ describe("configuration policy", () => {
       assert.match(stack, /^\s*faktory:backupStorageClass: default-bucket$/m);
       assert.doesNotMatch(stack, /^\s*faktory:(?:s3Region|externalHttpsCidrs):/m);
       assert.doesNotMatch(stack, /^\s*faktory:image:/m);
+      assert.doesNotMatch(stack, /^\s*faktory:visualRendererImage:/m);
       assert.match(stack, /^\s*faktory:oauthWrappingKeyVersions: \[v1\]$/m);
       assert.match(stack, /^\s*faktory:oauthActiveWrappingKeyVersion: v1$/m);
       assert.doesNotMatch(stack, /(?:accessKey|secretKey|password|clientSecret)\s*:/i);
@@ -156,7 +158,9 @@ describe("preview declarations", () => {
     const pod = deployment.template.spec;
     assert.equal(pod.automountServiceAccountToken, false);
     assert.equal(pod.nodeSelector, undefined);
+    assert.equal(pod.securityContext.seccompProfile.type, "RuntimeDefault");
     const container = pod.containers[0];
+    assert.equal(container.securityContext.seccompProfile, undefined);
     assert.equal(container.securityContext.readOnlyRootFilesystem, true);
     assert.deepEqual(container.securityContext.capabilities.drop, ["ALL"]);
     assert.equal(container.startupProbe.httpGet.path, "/health");
@@ -180,6 +184,53 @@ describe("preview declarations", () => {
     assert.equal(secret.FAKTORY_S3_ACCESS_KEY, "generated-access");
     assert.equal(secret.FAKTORY_S3_SECRET_KEY, "generated-secret");
     assert.equal(secret.FAKTORY_S3_REGION, "us-east-1");
+    assert.equal(secret.FAKTORY_VISUAL_RENDERER_URL, "http://visual-renderer.faktory-test.svc.cluster.local:8081");
+    assert.equal(secret.FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS, "30");
+  });
+
+  test("declares one isolated amd64 visual renderer", () => {
+    const deployment = resource("kubernetes:apps/v1:Deployment", "faktory-visual-renderer").inputs.spec;
+    assert.equal(deployment.replicas, 1);
+    assert.equal(deployment.strategy.type, "Recreate");
+    const pod = deployment.template.spec;
+    assert.equal(pod.automountServiceAccountToken, false);
+    assert.deepEqual(pod.nodeSelector, { "kubernetes.io/arch": "amd64" });
+    assert.equal(pod.securityContext.runAsNonRoot, true);
+    assert.equal(pod.securityContext.runAsUser, 65532);
+    assert.equal(pod.securityContext.runAsGroup, 65532);
+    assert.equal(pod.securityContext.seccompProfile.type, "Unconfined");
+    const container = pod.containers[0];
+    assert.equal(container.image, `registry.example.test/faktory-visual-renderer@sha256:${"b".repeat(64)}`);
+    assert.equal(container.securityContext.runAsNonRoot, true);
+    assert.equal(container.securityContext.runAsUser, 65532);
+    assert.equal(container.securityContext.runAsGroup, 65532);
+    assert.equal(container.securityContext.allowPrivilegeEscalation, false);
+    assert.equal(container.securityContext.readOnlyRootFilesystem, true);
+    assert.deepEqual(container.securityContext.capabilities.drop, ["ALL"]);
+    assert.equal(container.securityContext.seccompProfile.type, "Unconfined");
+    assert.deepEqual(container.resources, {
+      requests: { cpu: "250m", memory: "512Mi" },
+      limits: { cpu: "1", memory: "1Gi" },
+    });
+    assert.deepEqual(container.volumeMounts, [{ name: "tmp", mountPath: "/tmp" }]);
+    assert.deepEqual(pod.volumes, [{ name: "tmp", emptyDir: { medium: "Memory", sizeLimit: "256Mi" } }]);
+    assert.equal(container.startupProbe.httpGet.path, "/health/ready");
+    assert.equal(container.readinessProbe.httpGet.path, "/health/ready");
+    assert.equal(container.livenessProbe.httpGet.path, "/health/live");
+
+    const service = resource("kubernetes:core/v1:Service", "faktory-visual-renderer").inputs.spec;
+    assert.equal(service.type, "ClusterIP");
+    assert.equal(service.externalIPs, undefined);
+    assert.equal(service.externalName, undefined);
+    assert.equal(service.loadBalancerIP, undefined);
+    assert.equal(service.ports[0].port, 8081);
+    assert.equal(service.ports[0].nodePort, undefined);
+    for (const candidate of resources.filter(({ type }) => type === "kubernetes:apps/v1:Deployment")) {
+      if (candidate.name === "faktory-visual-renderer") continue;
+      assert.doesNotMatch(JSON.stringify(candidate.inputs), /Unconfined/);
+    }
+    assert.equal(resources.some(({ inputs }) => inputs.kind === "HTTPRoute"
+      && inputs.spec?.rules?.some((rule: any) => rule.backendRefs?.some((backend: any) => backend.name === "visual-renderer"))), false);
   });
 
   test("declares separate artifact and backup buckets with CNPG backups", () => {
@@ -247,7 +298,32 @@ describe("preview declarations", () => {
         to: [{ podSelector: { matchLabels: { "cnpg.io/cluster": "faktory-postgres" } } }],
         ports: [{ port: 5432, protocol: "TCP" }],
       },
+      {
+        to: [{ podSelector: { matchLabels: {
+          "app.kubernetes.io/name": "faktory",
+          "app.kubernetes.io/instance": "faktory-test",
+          "app.kubernetes.io/managed-by": "pulumi",
+          "app.kubernetes.io/component": "visual-renderer",
+        } } }],
+        ports: [{ port: 8081, protocol: "TCP" }],
+      },
     ]);
+
+    const rendererNetwork = resource(
+      "kubernetes:networking.k8s.io/v1:NetworkPolicy",
+      "faktory-visual-renderer-network",
+    ).inputs.spec;
+    assert.deepEqual(rendererNetwork.policyTypes, ["Ingress", "Egress"]);
+    assert.deepEqual(rendererNetwork.ingress, [{
+      from: [{ podSelector: { matchLabels: {
+        "app.kubernetes.io/name": "faktory",
+        "app.kubernetes.io/instance": "faktory-test",
+        "app.kubernetes.io/managed-by": "pulumi",
+        "app.kubernetes.io/component": "server",
+      } } }],
+      ports: [{ port: 8081, protocol: "TCP" }],
+    }]);
+    assert.deepEqual(rendererNetwork.egress, []);
   });
 
   test("wires stack-aware telemetry and Kubernetes identity metadata", () => {

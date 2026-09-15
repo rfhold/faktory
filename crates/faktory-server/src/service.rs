@@ -197,6 +197,7 @@ mod tests {
                 },
             },
             projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+            shaded: TechnicalProjectionImages::all(Bytes::from_static(b"shaded-png")),
         }
     }
 

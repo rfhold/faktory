@@ -20,13 +20,15 @@ use tokio::{
 };
 
 use crate::model::{
-    GeometryFactsRecord, RenderedOutput, Repository, RepositoryError, TechnicalProjection,
-    TechnicalProjectionImages, validate_geometry_facts,
+    GeometryFactsRecord, RenderedOutput, Repository, RepositoryError, ShadedProjectionImages,
+    TechnicalProjection, TechnicalProjectionImages, validate_geometry_facts,
 };
+use crate::visual::{UnavailableVisualRenderer, VisualCoordinator, VisualRendererError};
 
 pub(crate) const PROJECTION_WIDTH: u32 = 640;
 pub(crate) const PROJECTION_HEIGHT: u32 = 480;
 pub(crate) const MAX_PROJECTION_IMAGE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_VISUAL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RenderConfig {
@@ -60,6 +62,7 @@ pub struct RenderQueue {
     sender: mpsc::Sender<RenderJob>,
     admitted: Arc<Mutex<HashMap<RenderJob, usize>>>,
     repository: Repository,
+    visual: VisualCoordinator,
     feeder: Arc<Mutex<Option<AbortHandle>>>,
     #[cfg(test)]
     worker: AbortHandle,
@@ -98,6 +101,18 @@ impl RenderReservation {
 
 impl RenderQueue {
     pub fn start(repository: Repository, config: RenderConfig) -> Result<Self, RepositoryError> {
+        Self::start_with_visual(
+            repository,
+            config,
+            VisualCoordinator::new(Arc::new(UnavailableVisualRenderer), Duration::from_secs(1)),
+        )
+    }
+
+    pub fn start_with_visual(
+        repository: Repository,
+        config: RenderConfig,
+        visual: VisualCoordinator,
+    ) -> Result<Self, RepositoryError> {
         if config.command.is_empty()
             || config.queue_capacity == 0
             || config.concurrency == 0
@@ -111,6 +126,7 @@ impl RenderQueue {
         let admitted = Arc::new(Mutex::new(HashMap::new()));
         let worker_admitted = admitted.clone();
         let worker_repository = repository.clone();
+        let worker_visual = visual.clone();
         let worker = tokio::spawn(async move {
             loop {
                 let Ok(permit) = semaphore.clone().acquire_owned().await else {
@@ -122,9 +138,10 @@ impl RenderQueue {
                 let repository = worker_repository.clone();
                 let config = config.clone();
                 let admitted = worker_admitted.clone();
+                let visual = worker_visual.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    run_job(&repository, &config, &job).await;
+                    run_job(&repository, &config, &visual, &job).await;
                     let mut admitted = admitted
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -146,10 +163,16 @@ impl RenderQueue {
             sender,
             admitted,
             repository,
+            visual,
             feeder: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             worker,
         })
+    }
+
+    #[must_use]
+    pub fn visual(&self) -> VisualCoordinator {
+        self.visual.clone()
     }
 
     pub async fn reserve(&self) -> Result<RenderReservation, RepositoryError> {
@@ -206,11 +229,16 @@ impl RenderQueue {
     }
 }
 
-async fn run_job(repository: &Repository, config: &RenderConfig, job: &RenderJob) {
+async fn run_job(
+    repository: &Repository,
+    config: &RenderConfig,
+    visual: &VisualCoordinator,
+    job: &RenderJob,
+) {
     if !claim_render(repository, job).await {
         return;
     }
-    let result = render(repository, config, job).await;
+    let result = render(repository, config, visual, job).await;
     persist_terminal(repository, job, &result).await;
 }
 
@@ -288,6 +316,7 @@ async fn persist_terminal(
 async fn render(
     repository: &Repository,
     config: &RenderConfig,
+    visual: &VisualCoordinator,
     job: &RenderJob,
 ) -> Result<RenderedOutput, &'static str> {
     let source = repository
@@ -342,6 +371,7 @@ async fn render(
     let [isometric, front, back, left, right, top, bottom] = projection_images
         .try_into()
         .map_err(|_| "renderer produced incomplete projections")?;
+    let shaded = render_shaded(visual, glb.clone()).await?;
     Ok(RenderedOutput {
         glb,
         preview,
@@ -355,6 +385,44 @@ async fn render(
             top,
             bottom,
         },
+        shaded,
+    })
+}
+
+async fn render_shaded(
+    visual: &VisualCoordinator,
+    glb: Bytes,
+) -> Result<ShadedProjectionImages, &'static str> {
+    let shaded = visual
+        .render_canonical(glb)
+        .await
+        .map_err(|error| match error {
+            VisualRendererError::Unavailable => "visual renderer unavailable",
+            VisualRendererError::InvalidResponse => "visual renderer returned invalid output",
+        })?;
+    let [
+        shaded_isometric,
+        shaded_front,
+        shaded_back,
+        shaded_left,
+        shaded_right,
+        shaded_top,
+        shaded_bottom,
+    ] = shaded
+        .images
+        .into_iter()
+        .map(|(_, image)| image)
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| "visual renderer produced incomplete projections")?;
+    Ok(ShadedProjectionImages {
+        isometric: shaded_isometric,
+        front: shaded_front,
+        back: shaded_back,
+        left: shaded_left,
+        right: shaded_right,
+        top: shaded_top,
+        bottom: shaded_bottom,
     })
 }
 
@@ -382,7 +450,15 @@ fn rasterize_projection(svg: &[u8]) -> Result<Bytes, &'static str> {
 }
 
 pub(crate) fn validate_projection_png(png: &[u8]) -> Result<(), &'static str> {
-    if png.len() > MAX_PROJECTION_IMAGE_BYTES
+    validate_png(png, MAX_PROJECTION_IMAGE_BYTES)
+}
+
+pub(crate) fn validate_visual_png(png: &[u8]) -> Result<(), &'static str> {
+    validate_png(png, MAX_VISUAL_IMAGE_BYTES)
+}
+
+fn validate_png(png: &[u8], max_bytes: usize) -> Result<(), &'static str> {
+    if png.len() > max_bytes
         || png.len() < 24
         || &png[..8] != b"\x89PNG\r\n\x1a\n"
         || &png[12..16] != b"IHDR"
@@ -686,8 +762,43 @@ mod tests {
     use crate::storage::{
         InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject,
     };
+    use crate::visual::{VisualRenderResult, VisualRenderSpec, VisualRenderer};
 
     const PRIVATE_SENTINEL: &str = "private-render-repository-material";
+
+    #[derive(Debug)]
+    struct SuccessfulVisualRenderer;
+
+    #[async_trait]
+    impl VisualRenderer for SuccessfulVisualRenderer {
+        async fn render(
+            &self,
+            _glb: Bytes,
+            spec: VisualRenderSpec,
+        ) -> Result<VisualRenderResult, VisualRendererError> {
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(PROJECTION_WIDTH, PROJECTION_HEIGHT)
+                .expect("visual pixmap");
+            pixmap.fill(resvg::tiny_skia::Color::WHITE);
+            let image = Bytes::from(pixmap.encode_png().expect("visual PNG"));
+            let names: Vec<&str> = match spec {
+                VisualRenderSpec::Canonical { .. } => TechnicalProjection::ALL
+                    .into_iter()
+                    .map(TechnicalProjection::as_str)
+                    .collect(),
+                VisualRenderSpec::View { .. } => vec!["view"],
+            };
+            Ok(VisualRenderResult {
+                images: names
+                    .into_iter()
+                    .map(|name| (name.to_owned(), image.clone()))
+                    .collect(),
+            })
+        }
+    }
+
+    fn visual() -> VisualCoordinator {
+        VisualCoordinator::new(Arc::new(SuccessfulVisualRenderer), Duration::from_secs(1))
+    }
 
     #[derive(Debug, Default)]
     struct TransientPutFailures {
@@ -831,6 +942,7 @@ mod tests {
                 },
             },
             projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+            shaded: ShadedProjectionImages::all(Bytes::from_static(b"shaded-png")),
         }
     }
 
@@ -1009,6 +1121,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_output_bytes: 1024,
             },
+            &visual(),
             &RenderJob {
                 model_id: model.id,
                 revision: model.desired_source_revision,
@@ -1022,6 +1135,81 @@ mod tests {
         }
         assert_eq!(output.preview, Bytes::from_static(b"<svg></svg>"));
         assert!((output.facts.volume_cubic_millimeters - 24.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn visual_failure_fails_desired_render_and_preserves_last_good_revision() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let script_path = directory.path().join("renderer.sh");
+        tokio::fs::write(
+            &script_path,
+            b"printf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$2\"\nprintf '<svg></svg>' > \"$3\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4\"\nfor output in \"$5\" \"$6\" \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
+        )
+        .await
+        .expect("write renderer");
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let first = repository
+            .create_model("part", "Part", b"first")
+            .await
+            .expect("create model");
+        repository
+            .complete_render(
+                &first.id,
+                &first.desired_source_revision,
+                rendered_output(b"old"),
+            )
+            .await
+            .expect("complete old render");
+        let edited = repository
+            .edit_model(
+                &first.id,
+                &first.desired_source_revision,
+                None,
+                Some(&[crate::model::SourcePatch {
+                    old: "first".to_owned(),
+                    new: "second".to_owned(),
+                }]),
+            )
+            .await
+            .expect("edit model")
+            .record;
+        let config = RenderConfig {
+            command: vec![
+                "/bin/sh".to_owned(),
+                script_path.to_string_lossy().into_owned(),
+            ],
+            queue_capacity: 1,
+            concurrency: 1,
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 1024,
+        };
+        let unavailable =
+            VisualCoordinator::new(Arc::new(UnavailableVisualRenderer), Duration::from_secs(1));
+        run_job(
+            &repository,
+            &config,
+            &unavailable,
+            &RenderJob {
+                model_id: edited.id.clone(),
+                revision: edited.desired_source_revision,
+            },
+        )
+        .await;
+
+        let failed = repository.get_model("part").await.expect("model").record;
+        assert_eq!(failed.render_state, crate::model::StoredRenderState::Failed);
+        assert_eq!(
+            failed.current_successful_source_revision,
+            first.desired_source_revision
+        );
+        assert_eq!(
+            repository
+                .geometry("part", &first.desired_source_revision)
+                .await
+                .expect("last-good geometry"),
+            Bytes::from_static(b"old")
+        );
     }
 
     #[tokio::test]
@@ -1481,7 +1669,7 @@ mod tests {
         };
 
         assert_eq!(
-            render(&repository, &config, &job).await,
+            render(&repository, &config, &visual(), &job).await,
             Err("render timed out")
         );
         let pid = tokio::fs::read_to_string(&pid_path)

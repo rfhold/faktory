@@ -17,6 +17,27 @@ COPY proto/gen/ts proto/gen/ts
 COPY web web
 RUN pnpm run web:build
 
+FROM node:${NODE_VERSION}-bookworm-slim AS visual-renderer-build
+
+ARG TARGETARCH
+ENV COREPACK_HOME=/corepack \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+WORKDIR /workspace
+RUN case "${TARGETARCH}" in amd64) ;; *) echo "visual renderer supports only TARGETARCH=amd64" >&2; exit 1 ;; esac && \
+    corepack enable && corepack prepare pnpm@10.34.3 --activate
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY web/package.json web/package.json
+COPY apps/visual-renderer/package.json apps/visual-renderer/package.json
+RUN --mount=type=cache,id=faktory-visual-pnpm,target=/pnpm/store \
+    pnpm config set store-dir /pnpm/store && pnpm install --frozen-lockfile
+COPY proto/gen/ts proto/gen/ts
+COPY web/src/viewer/threeRecipe.ts web/src/viewer/threeRecipe.ts
+COPY apps/visual-renderer apps/visual-renderer
+RUN pnpm run visual-renderer:build && \
+    pnpm --filter @rfhold/faktory-visual-renderer exec playwright-core install chromium && \
+    pnpm --filter @rfhold/faktory-visual-renderer deploy --prod --legacy /opt/visual-renderer && \
+    cp -R apps/visual-renderer/dist /opt/visual-renderer/dist
+
 FROM rust:${RUST_VERSION}-slim-bookworm AS rust-build
 
 ARG TARGETARCH
@@ -86,3 +107,26 @@ COPY renderer /opt/faktory/renderer
 EXPOSE 8080
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/faktory-server"]
+
+FROM node:${NODE_VERSION}-bookworm-slim AS visual-renderer-runtime
+
+ARG TARGETARCH
+ARG REVISION
+LABEL org.opencontainers.image.source="https://git.holdenitdown.net/rfhold/faktory" \
+      org.opencontainers.image.revision="${REVISION}"
+
+ENV HOME=/tmp \
+    TMPDIR=/tmp \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    NODE_ENV=production
+WORKDIR /opt/visual-renderer
+COPY --from=visual-renderer-build /opt/visual-renderer /opt/visual-renderer
+RUN case "${TARGETARCH}" in amd64) ;; *) echo "visual renderer supports only TARGETARCH=amd64" >&2; exit 1 ;; esac && \
+    node_modules/.bin/playwright-core install-deps chromium && \
+    groupadd --gid 65532 faktory-renderer && \
+    useradd --uid 65532 --gid 65532 --home-dir /tmp --no-create-home --shell /usr/sbin/nologin faktory-renderer
+COPY --from=visual-renderer-build /ms-playwright /ms-playwright
+
+EXPOSE 8081
+USER 65532:65532
+ENTRYPOINT ["node", "/opt/visual-renderer/dist/index.js"]

@@ -54,6 +54,36 @@ services:
       start_period: 2s
     restart: unless-stopped
 
+  visual-renderer:
+    platform: linux/amd64
+    build:
+      context: .
+      target: visual-renderer-runtime
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777,nosuid,nodev,noexec
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8081/health/ready').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+    deploy:
+      replicas: 1
+      resources:
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    restart: unless-stopped
+
   faktory:
     build:
       context: .
@@ -67,11 +97,15 @@ services:
       FAKTORY_S3_BUCKET: faktory
       FAKTORY_S3_ACCESS_KEY: GK0123456789abcdef0123456789abcdef
       FAKTORY_S3_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      FAKTORY_VISUAL_RENDERER_URL: http://visual-renderer:8081
+      FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS: "30"
       RUST_LOG: faktory_server=info,kuri_server=info,mcp=info,tower_http=info
     depends_on:
       garage-init:
         condition: service_completed_successfully
       postgres:
+        condition: service_healthy
+      visual-renderer:
         condition: service_healthy
     ports:
       - "127.0.0.1:8080:8080"

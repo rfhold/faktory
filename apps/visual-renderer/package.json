@@ -1,0 +1,25 @@
+{
+  "name": "@rfhold/faktory-visual-renderer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && esbuild src/harness.ts --bundle --format=esm --platform=browser --target=chrome153 --outfile=dist/harness.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0",
+    "pngjs": "7.0.0",
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "@types/pngjs": "6.0.5",
+    "@types/three": "0.180.0",
+    "esbuild": "0.25.12",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  }
+}

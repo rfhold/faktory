@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -11,6 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from renderer.worker import PROJECTIONS, _validate_facts, _validate_glb, _validate_svg, render
+
+SVG_PATH_POINT = re.compile(r"[ML]([^, ]+),([^ ]+)")
 
 
 def make_glb(json_payload: bytes, bin_payload: bytes | None = None) -> bytes:
@@ -24,12 +27,18 @@ def set_declared_glb_size(content: bytes) -> bytes:
     return content[:8] + struct.pack("<I", len(content)) + content[12:]
 
 
+def svg_path_points(content: str) -> list[tuple[float, float]]:
+    return [
+        (float(x), float(y)) for x, y in SVG_PATH_POINT.findall(content)
+    ]
+
+
 class RendererTests(unittest.TestCase):
     def render_paths(self, root: Path) -> tuple[Path, Path, Path]:
         return root / "model.glb", root / "model.svg", root / "model.json"
 
     def projection_paths(self, root: Path) -> tuple[Path, ...]:
-        return tuple(root / f"{name}.svg" for name, _ in PROJECTIONS)
+        return tuple(root / f"{name}.svg" for name, _, _ in PROJECTIONS)
 
     def render_model(
         self, source: Path, glb: Path, svg: Path, facts: Path
@@ -152,13 +161,13 @@ class RendererTests(unittest.TestCase):
 
     def test_projection_names_and_directions_are_fixed_and_complete(self) -> None:
         expected = (
-            ("isometric", (1, -1, 1)),
-            ("front", (0, -1, 0)),
-            ("back", (0, 1, 0)),
-            ("left", (-1, 0, 0)),
-            ("right", (1, 0, 0)),
-            ("top", (0, 0, 1)),
-            ("bottom", (0, 0, -1)),
+            ("isometric", (1, -1, 1), (1, 1, 0)),
+            ("front", (0, -1, 0), (1, 0, 0)),
+            ("back", (0, 1, 0), (-1, 0, 0)),
+            ("left", (-1, 0, 0), (0, -1, 0)),
+            ("right", (1, 0, 0), (0, 1, 0)),
+            ("top", (0, 0, 1), (1, 0, 0)),
+            ("bottom", (0, 0, -1), (1, 0, 0)),
         )
         self.assertEqual(PROJECTIONS, expected)
 
@@ -171,15 +180,62 @@ class RendererTests(unittest.TestCase):
             )
             glb, svg, facts = self.render_paths(root)
             generated = '<svg width="640.0" height="480.0"></svg>'
-            with mock.patch("renderer.worker.getSVG", return_value=generated) as get_svg:
+            with mock.patch("renderer.worker._get_svg", return_value=generated) as get_svg:
                 self.assertIsNone(self.render_model(source, glb, svg, facts))
 
             self.assertEqual(get_svg.call_count, 7)
             self.assertEqual(
-                [call.args[1]["projectionDir"] for call in get_svg.call_args_list],
-                [direction for _, direction in expected],
+                [call.args[1:] for call in get_svg.call_args_list],
+                [(direction, screen_right) for _, direction, screen_right in expected],
             )
             self.assertEqual(svg.read_text(encoding="utf-8"), generated)
+
+    def test_principal_views_have_conventional_roll_and_handedness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "model.py"
+            source.write_text(
+                "import cadquery as cq\n"
+                "result = cq.Assembly(\n"
+                "    cq.Workplane('XY').box(12, 8, 6, centered=(True, True, True))\n"
+                ")\n"
+                "result.add(cq.Workplane('XY').box(3, 2, 2, "
+                "centered=(True, True, True)).translate((7.5, 0, 4)))\n"
+                "result.add(cq.Workplane('XY').box(2, 3, 2, "
+                "centered=(True, True, True)).translate((0, 5.5, 4)))\n"
+                "result.add(cq.Workplane('XY').box(3, 3, 2, "
+                "centered=(True, True, True)).translate((7.5, 5.5, 0)))\n",
+                encoding="utf-8",
+            )
+            glb, svg, facts = self.render_paths(root)
+
+            self.assertIsNone(self.render_model(source, glb, svg, facts))
+            views = {
+                path.stem: svg_path_points(path.read_text(encoding="utf-8"))
+                for path in self.projection_paths(root)
+            }
+
+            expected_marker_corners = {
+                "front": (9.0, 5.0),
+                "back": (-9.0, 5.0),
+                "left": (-7.0, 5.0),
+                "right": (7.0, 5.0),
+                "top": (9.0, 7.0),
+                "bottom": (9.0, -7.0),
+            }
+            for name, expected_corner in expected_marker_corners.items():
+                with self.subTest(view=name):
+                    points = views[name]
+                    xs = [point[0] for point in points]
+                    ys = [point[1] for point in points]
+                    self.assertGreater(max(xs) - min(xs), 1.2 * (max(ys) - min(ys)))
+                    self.assertTrue(
+                        any(
+                            abs(x - expected_corner[0]) < 1e-9
+                            and abs(y - expected_corner[1]) < 1e-9
+                            for x, y in points
+                        )
+                    )
 
     def test_cli_suppresses_source_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

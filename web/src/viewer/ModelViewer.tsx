@@ -1,18 +1,10 @@
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import {
-  AmbientLight,
   Box3,
-  Color,
-  DirectionalLight,
   Group,
-  HemisphereLight,
-  MathUtils,
   OrthographicCamera,
   PerspectiveCamera,
-  Quaternion,
   Scene,
-  SRGBColorSpace,
-  Vector3,
   WebGLRenderer,
   type Camera,
   type Material,
@@ -21,16 +13,19 @@ import {
 } from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { Projection } from "../../../proto/gen/ts/faktory/v1/faktory_pb";
+import {
+  THREE_V2_RECIPE,
+  applyCameraSnapshot,
+  autoframeCameraRig,
+  createCameraRig,
+  createRecipeRenderer,
+  createRecipeScene,
+  resizeCameraRig,
+  snapshotCamera,
+  type CameraSnapshot,
+} from "./threeRecipe";
 
-export interface CameraSnapshot {
-  target: { x: number; y: number; z: number };
-  rotation: { x: number; y: number; z: number; w: number };
-  projection: Projection;
-  distance: number;
-  fieldOfViewDegrees: number;
-  orthographicScale: number;
-}
+export type { CameraSnapshot } from "./threeRecipe";
 
 interface ModelViewerProps {
   url: string;
@@ -73,50 +68,31 @@ export function ModelViewer(props: ModelViewerProps) {
 
   const emitCamera = () => {
     if (!controls || !activeCamera || !perspective || !orthographic) return;
-    const isOrthographic = activeCamera === orthographic;
-    props.onCameraChange({
-      target: { x: controls.target.x, y: controls.target.y, z: controls.target.z },
-      rotation: {
-        x: activeCamera.quaternion.x,
-        y: activeCamera.quaternion.y,
-        z: activeCamera.quaternion.z,
-        w: activeCamera.quaternion.w,
-      },
-      projection: isOrthographic ? Projection.ORTHOGRAPHIC : Projection.PERSPECTIVE,
-      distance: activeCamera.position.distanceTo(controls.target),
-      fieldOfViewDegrees: perspective.fov,
-      orthographicScale: orthographic.top - orthographic.bottom,
-    });
+    props.onCameraChange(snapshotCamera(activeCamera, { perspective, orthographic }, controls.target));
   };
 
   const resize = () => {
     if (!renderer || !perspective || !orthographic || !activeCamera) return;
     const width = Math.max(host.clientWidth, 1);
     const height = Math.max(host.clientHeight, 1);
-    const aspect = width / height;
-    perspective.aspect = aspect;
-    perspective.updateProjectionMatrix();
-    const scale = orthographic.top - orthographic.bottom;
-    orthographic.left = (-scale * aspect) / 2;
-    orthographic.right = (scale * aspect) / 2;
-    orthographic.top = scale / 2;
-    orthographic.bottom = -scale / 2;
-    orthographic.updateProjectionMatrix();
+    resizeCameraRig({ perspective, orthographic }, width, height);
     renderer.setSize(width, height, false);
   };
 
   onMount(() => {
-    scene = new Scene();
-    scene.background = new Color(0x11150f);
-    perspective = new PerspectiveCamera(42, 1, 0.01, 100_000);
-    orthographic = new OrthographicCamera(-1, 1, 1, -1, 0.01, 100_000);
-    orthographic.position.set(3, 2, 4);
-    perspective.position.set(3, 2, 4);
+    const recipeScene = createRecipeScene();
+    scene = recipeScene.scene;
+    softLights = recipeScene.softLights;
+    studioLights = recipeScene.studioLights;
+    const cameraRig = createCameraRig();
+    perspective = cameraRig.perspective;
+    orthographic = cameraRig.orthographic;
     activeCamera = perspective;
 
-    renderer = new WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-    renderer.outputColorSpace = SRGBColorSpace;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer = createRecipeRenderer();
+    renderer.setPixelRatio(
+      Math.min(window.devicePixelRatio, THREE_V2_RECIPE.interactiveDevicePixelRatioLimit),
+    );
     renderer.domElement.setAttribute("aria-label", "Interactive 3D model viewer");
     renderer.domElement.setAttribute("role", "img");
     renderer.domElement.tabIndex = 0;
@@ -125,25 +101,6 @@ export function ModelViewer(props: ModelViewerProps) {
     controls = new OrbitControls(activeCamera, renderer.domElement);
     controls.enableDamping = true;
     controls.addEventListener("change", emitCamera);
-    softLights = new Group();
-    softLights.add(new AmbientLight(0xdde5d7, 1.4));
-    softLights.add(new HemisphereLight(0xf4f7ed, 0x68705f, 2.2));
-    for (const position of [new Vector3(4, 5, 6), new Vector3(-4, 3, -6)]) {
-      const light = new DirectionalLight(0xe8eee2, 0.9);
-      light.position.copy(position);
-      softLights.add(light);
-    }
-    scene.add(softLights);
-
-    studioLights = new Group();
-    studioLights.add(new AmbientLight(0xdde5d7, 1.8));
-    const keyLight = new DirectionalLight(0xfff1cd, 3.5);
-    keyLight.position.set(4, 8, 6);
-    studioLights.add(keyLight);
-    const fillLight = new DirectionalLight(0xc9dcff, 1.4);
-    fillLight.position.set(-5, 3, -4);
-    studioLights.add(fillLight);
-    scene.add(studioLights);
     selectScenePreset(scenePreset());
 
     const observer = new ResizeObserver(resize);
@@ -186,14 +143,13 @@ export function ModelViewer(props: ModelViewerProps) {
         model = gltf.scene;
         scene.add(model);
         const bounds = new Box3().setFromObject(model);
-        if (!bounds.isEmpty()) {
-          const center = bounds.getCenter(new Vector3());
-          const size = bounds.getSize(new Vector3()).length();
-          controls.target.copy(center);
-          activeCamera.position.copy(center).add(new Vector3(size || 1, size * 0.65 || 0.65, size || 1));
-          activeCamera.lookAt(center);
-          controls.update();
-          emitCamera();
+        if (perspective && orthographic) {
+          const center = autoframeCameraRig(bounds, { perspective, orthographic });
+          if (center) {
+            controls.target.copy(center);
+            controls.update();
+            emitCamera();
+          }
         }
         props.onLoadState("ready");
       },
@@ -209,21 +165,15 @@ export function ModelViewer(props: ModelViewerProps) {
   createEffect(() => {
     const view = props.appliedView;
     if (!view || !controls || !perspective || !orthographic || !renderer) return;
-    const nextCamera = view.projection === Projection.ORTHOGRAPHIC ? orthographic : perspective;
+    const aspect = Math.max(host.clientWidth, 1) / Math.max(host.clientHeight, 1);
+    const nextCamera = applyCameraSnapshot(
+      view,
+      { perspective, orthographic },
+      controls.target,
+      aspect,
+    );
     activeCamera = nextCamera;
     controls.object = nextCamera;
-    controls.target.set(view.target.x, view.target.y, view.target.z);
-    nextCamera.quaternion.copy(
-      new Quaternion(view.rotation.x, view.rotation.y, view.rotation.z, view.rotation.w).normalize(),
-    );
-    nextCamera.position
-      .copy(controls.target)
-      .add(new Vector3(0, 0, Math.max(view.distance, 0.01)).applyQuaternion(nextCamera.quaternion));
-    perspective.fov = MathUtils.clamp(view.fieldOfViewDegrees || 42, 1, 179);
-    perspective.updateProjectionMatrix();
-    const scale = Math.max(view.orthographicScale, 0.01);
-    orthographic.top = scale / 2;
-    orthographic.bottom = -scale / 2;
     resize();
     controls.update();
     emitCamera();

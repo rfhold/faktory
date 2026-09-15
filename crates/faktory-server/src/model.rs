@@ -121,6 +121,16 @@ pub struct RenderedOutput {
     pub preview: Bytes,
     pub facts: GeometryFactsRecord,
     pub projections: TechnicalProjectionImages,
+    pub shaded: ShadedProjectionImages,
+}
+
+pub type ShadedProjectionImages = TechnicalProjectionImages;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ViewRenderIdentity {
+    pub revision: String,
+    pub view_id: String,
+    pub view_etag: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -634,6 +644,13 @@ impl Repository {
             )
             .await?;
         }
+        for projection in TechnicalProjection::ALL {
+            self.put_immutable(
+                &shaded_projection_key(model_id, revision, projection),
+                output.shaded.get(projection).clone(),
+            )
+            .await?;
+        }
         let loaded = self.get_model(model_id).await?;
         if !can_complete_render(&loaded.record, revision, output.facts) {
             return Ok(());
@@ -734,6 +751,80 @@ impl Repository {
             .get(&projection_key(model_id, revision, projection))
             .await?
             .bytes)
+    }
+
+    pub async fn shaded_projection_image(
+        &self,
+        model_id: &str,
+        revision: &str,
+        projection: TechnicalProjection,
+    ) -> Result<Bytes, RepositoryError> {
+        validate_revision(revision)?;
+        let model = self.get_model(model_id).await?.record;
+        if model.current_successful_source_revision != revision {
+            return Err(RepositoryError::NotFound);
+        }
+        Ok(self
+            .store
+            .get(&shaded_projection_key(model_id, revision, projection))
+            .await?
+            .bytes)
+    }
+
+    pub async fn cached_view_image(
+        &self,
+        model_id: &str,
+        identity: &ViewRenderIdentity,
+    ) -> Result<Bytes, RepositoryError> {
+        validate_revision(&identity.revision)?;
+        validate_model_id(model_id)?;
+        validate_id(&identity.view_id)?;
+        validate_id(&identity.view_etag)?;
+        let model = self.get_model(model_id).await?.record;
+        if model.current_successful_source_revision != identity.revision {
+            return Err(RepositoryError::NotFound);
+        }
+        Ok(self
+            .store
+            .get(&view_render_key(
+                model_id,
+                &identity.revision,
+                &identity.view_id,
+                &identity.view_etag,
+            ))
+            .await?
+            .bytes)
+    }
+
+    pub async fn complete_view_render(
+        &self,
+        model_id: &str,
+        identity: &ViewRenderIdentity,
+        image: Bytes,
+    ) -> Result<(), RepositoryError> {
+        validate_revision(&identity.revision)?;
+        validate_model_id(model_id)?;
+        validate_id(&identity.view_id)?;
+        validate_id(&identity.view_etag)?;
+        let _guard = self.mutations.lock().await;
+        let model = self.get_model(model_id).await?.record;
+        if model.current_successful_source_revision != identity.revision {
+            return Err(RepositoryError::Conflict);
+        }
+        let view = self.get_view(model_id, &identity.view_id).await?.record;
+        if view.etag != identity.view_etag {
+            return Err(RepositoryError::Conflict);
+        }
+        self.put_immutable(
+            &view_render_key(
+                model_id,
+                &identity.revision,
+                &identity.view_id,
+                &identity.view_etag,
+            ),
+            image,
+        )
+        .await
     }
 
     pub async fn reconcile(&self) -> Result<Vec<(String, String)>, RepositoryError> {
@@ -1191,6 +1282,21 @@ pub fn projection_key(model_id: &str, revision: &str, projection: TechnicalProje
     )
 }
 #[must_use]
+pub fn shaded_projection_key(
+    model_id: &str,
+    revision: &str,
+    projection: TechnicalProjection,
+) -> String {
+    format!(
+        "models/{model_id}/revisions/{revision}/renders/three-v2/canonical/{}.png",
+        projection.as_str()
+    )
+}
+#[must_use]
+pub fn view_render_key(model_id: &str, revision: &str, view_id: &str, etag: &str) -> String {
+    format!("models/{model_id}/revisions/{revision}/renders/three-v2/views/{view_id}/{etag}.png")
+}
+#[must_use]
 pub fn view_key(model_id: &str, view_id: &str) -> String {
     format!("models/{model_id}/views/{view_id}.json")
 }
@@ -1212,6 +1318,7 @@ mod tests {
         inner: InMemoryObjectStore,
         fail_model_put: AtomicBool,
         fail_projection_put: AtomicBool,
+        fail_shaded_put: AtomicBool,
         fail_delete: AtomicBool,
     }
 
@@ -1236,6 +1343,11 @@ mod tests {
             }
             if key.contains("/projections/")
                 && self.fail_projection_put.swap(false, Ordering::SeqCst)
+            {
+                return Err(StorageError::Unavailable);
+            }
+            if key.contains("/renders/three-v2/canonical/")
+                && self.fail_shaded_put.swap(false, Ordering::SeqCst)
             {
                 return Err(StorageError::Unavailable);
             }
@@ -1271,6 +1383,7 @@ mod tests {
                 },
             },
             projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+            shaded: ShadedProjectionImages::all(Bytes::from_static(b"shaded-png")),
         }
     }
 
@@ -1874,6 +1987,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn projections_are_complete_immutable_and_current_success_gated() {
         let repository = repository();
         let first = repository
@@ -1899,6 +2013,7 @@ mod tests {
             .record;
         let mut replacement = rendered(b"new");
         replacement.projections = TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
+        replacement.shaded = ShadedProjectionImages::all(Bytes::from_static(b"new-shaded"));
         repository
             .complete_render(&second.id, &second.desired_source_revision, replacement)
             .await
@@ -1925,10 +2040,44 @@ mod tests {
                     .bytes,
                 Bytes::from_static(b"png")
             );
+            assert_eq!(
+                repository
+                    .shaded_projection_image(
+                        &second.id,
+                        &second.desired_source_revision,
+                        projection,
+                    )
+                    .await
+                    .expect("current shaded projection"),
+                Bytes::from_static(b"new-shaded")
+            );
+            assert_eq!(
+                repository
+                    .store
+                    .get(&shaded_projection_key(
+                        &first.id,
+                        &first.desired_source_revision,
+                        projection,
+                    ))
+                    .await
+                    .expect("immutable old shaded projection")
+                    .bytes,
+                Bytes::from_static(b"shaded-png")
+            );
         }
         assert_eq!(
             repository
                 .projection_image(
+                    &first.id,
+                    &first.desired_source_revision,
+                    TechnicalProjection::Front,
+                )
+                .await,
+            Err(RepositoryError::NotFound)
+        );
+        assert_eq!(
+            repository
+                .shaded_projection_image(
                     &first.id,
                     &first.desired_source_revision,
                     TechnicalProjection::Front,
@@ -1992,6 +2141,62 @@ mod tests {
         let unchanged = repository.get_model(&model.id).await.expect("model").record;
         assert_eq!(unchanged.render_state, StoredRenderState::Pending);
         assert!(unchanged.current_successful_source_revision.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shaded_storage_failure_and_immutable_conflict_cannot_advance_current_success() {
+        let store = Arc::new(FailingStore::default());
+        let repository = Repository::new(store.clone(), 8);
+        let model = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("create model");
+        store.fail_shaded_put.store(true, Ordering::SeqCst);
+        assert_eq!(
+            repository
+                .complete_render(&model.id, &model.desired_source_revision, rendered(b"glb"))
+                .await,
+            Err(RepositoryError::Unavailable)
+        );
+        assert!(
+            repository
+                .get_model("part")
+                .await
+                .expect("model")
+                .record
+                .current_successful_source_revision
+                .is_empty()
+        );
+
+        let output = rendered(b"glb");
+        store
+            .inner
+            .put(
+                &shaded_projection_key(
+                    &model.id,
+                    &model.desired_source_revision,
+                    TechnicalProjection::Isometric,
+                ),
+                Bytes::from_static(b"different-shaded"),
+                PutCondition::Absent,
+            )
+            .await
+            .expect("store conflicting shaded image");
+        assert_eq!(
+            repository
+                .complete_render(&model.id, &model.desired_source_revision, output)
+                .await,
+            Err(RepositoryError::Conflict)
+        );
+        assert!(
+            repository
+                .get_model("part")
+                .await
+                .expect("model")
+                .record
+                .current_successful_source_revision
+                .is_empty()
+        );
     }
 
     #[tokio::test]
