@@ -2,53 +2,74 @@
 
 ## Scope
 
-Object-store migrations convert durable repository formats before normal runtime code reads them. They do not authorize a live migration. The first migration converts legacy one-file model revisions into the canonical project bundles defined by [`../architecture/model-projects-libraries.md`](../architecture/model-projects-libraries.md).
+Object-store migrations change durable repository formats before normal runtime code reads them. They do not authorize deployment or a live migration.
 
-The multipart output contract does not add a destructive migration. [`../architecture/design-bundles.md`](../architecture/design-bundles.md) and the compatibility rules below define how the repository interprets revisions without an output manifest.
+The permanent migration sequence contains `0001-model-project-bundles` followed by `0002-model-dependency-cutover`. Migration `0001` retains its identity and historical implementation. Migration `0002` deliberately deletes all current product data instead of converting it.
+
+[`../architecture/model-projects-dependencies.md`](../architecture/model-projects-dependencies.md) defines the v2 project and model-release contract. [`../architecture/design-bundles.md`](../architecture/design-bundles.md) defines multipart outputs created after the cutover.
 
 ## Framework and Ordering
 
-Each migration is one source module with one permanent identifier matching `^[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*$` and one description. The legacy conversion is `0001-model-project-bundles`. A single compile-time registry lists modules in ascending numeric-prefix order. Identifiers are never reused, reordered, or removed. The one server process is the sole migration owner. At startup it reads the durable migration ledger, rejects an unknown completed identifier or a binary older than the ledger, and runs every missing migration in order.
+Each migration has one permanent identifier that matches `^[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*$`. A compile-time registry lists modules in ascending numeric-prefix order. Identifiers cannot be reused, reordered, rewritten, or removed.
 
-Migrations finish before repository schema validation, model enumeration, render reconciliation, API readiness, or request serving. A failed migration keeps readiness false and prevents later migrations and rendering. Each migration must tolerate restart at every write boundary. Immutable writes accept existing identical bytes, mutable updates use the repository's guarded mutation path, and a durable completion record is written only after every item and verification step succeeds.
+The single server process owns migration execution. At startup, it reads the durable migration ledgers and runs each missing migration in order. It rejects an unknown completed identifier. A binary whose migration registry ends before a completed ledger fails closed. Therefore, an old binary cannot start after `0002` completes.
 
-The ledger lives under `system/migrations/{migration_id}.json`. Per-item checkpoints live under `system/migrations/{migration_id}/items/{model_id}.json`; recovery backups live under `system/migrations/{migration_id}/backup/{model_id}/`. These keys are implementation authority for migration state and are not exposed through MCP, protobuf, browser APIs, logs, or telemetry.
+Migrations finish before repository validation, model enumeration, render reconciliation, API readiness, or request service. A failed migration keeps readiness false. It prevents later migrations and render work.
 
-## Legacy Project Migration
+Each migration tolerates restart at every write boundary. A migration writes its immutable completion ledger only after all mutation and verification steps succeed. Completion ledgers live at `system/migrations/{migration_id}.json`. MCP, protobuf, browser APIs, logs, and telemetry never expose migration object contents.
 
-The legacy migration performs these steps for each model in deterministic model-ID byte order:
+## Permanent 0001 History
 
-1. Read and validate the legacy `model.json`, every referenced `source.py`, every immutable artifact required by the recorded state, and named-view metadata without changing current records.
-2. Write a recovery backup containing the exact pre-migration `model.json` and an inventory of every legacy object key, ETag, size, and SHA-256. Copy each referenced legacy `source.py` into the backup. Never include source bytes in diagnostics.
-3. For each referenced legacy revision, create a project containing `source.py` as its entrypoint, no library requirements or locks, generated `# Index` and empty `# Dependency Guidance` sections, and an empty `# Hints` section. Canonicalize it and write the immutable project bundle under its new project revision.
-4. Copy, rather than move, each existing GLB, preview, technical projection, canonical shaded render, and named-view render-cache object to a key under the new revision. Require the complete serving set for the current-successful revision. Verify every copied object's bytes and metadata needed for serving before recording the old-to-new revision mapping.
-5. Write migrated model metadata that remaps desired and current-successful revisions together with every artifact reference. Preserve display name, render state, safe error, facts, timestamps, views, default view, and the distinction between desired and last-good revisions.
-6. Re-read the migrated model and all selectable desired and current-successful objects through the new repository format. Then mark the model checkpoint complete.
-7. After every model checkpoint is complete and verified, mark the migration complete. Normal repository validation and render reconciliation may then start.
+Migration `0001-model-project-bundles` converts the former one-file format to project bundles. Its completion ledger remains permanent. Its historical per-model checkpoints and recovery copies use these prefixes:
 
-Orphaned immutable legacy objects are inventoried but do not become selectable. Existing legacy objects, backups, and source files are never deleted. Copy collisions accept byte-identical objects and fail closed on different bytes. On restart, the migration recognizes both legacy and already-migrated model metadata and verifies the durable backup and revision mapping before continuing. A failed model leaves either its original metadata or its fully written migrated metadata authoritative; no partial metadata object is accepted. No migration queues a render merely to convert storage.
+```text
+system/migrations/0001-model-project-bundles/items/
+system/migrations/0001-model-project-bundles/backup/
+```
 
-## Multipart Manifest Compatibility
+Migration `0002` deletes those obsolete product-data objects. It preserves `system/migrations/0001-model-project-bundles.json` and every other completion ledger.
 
-A project revision that lacks `outputs.json` is a valid legacy artifact revision when its required fixed-key serving set passes current validation. The repository exposes that set as one synthetic primary output with ID `primary`, role `assembly`, and the recorded legacy facts. Primary HTTP aliases, output-aware routes for `primary`, technical inspection, canonical shaded inspection when present, and named-view renders all select those fixed keys.
+The target contract does not retain `0001` conversion output, rollback data, or compatibility behavior. Those objects exist only until `0002` removes them.
 
-The repository returns not found for every other output ID on that revision. Startup does not create `outputs.json`, copy fixed keys into `outputs/primary/`, alter metadata, enqueue a render, or delete an object. A later successful project revision writes only the multipart layout. Current-successful advancement then switches the complete selectable set atomically.
+## Destructive 0002 Cutover
 
-## Last-Good and Retry Behavior
+Migration `0002-model-dependency-cutover` is an authorized, irreversible product-data reset. Current product data has no preservation requirement. The migration performs no conversion and creates no backup.
 
-Migration does not collapse desired and current-successful identity. If they differed before startup, each legacy revision maps independently, the migrated desired revision retains its state, and the migrated current-successful project keeps its complete serving artifacts and facts. Failed and interrupted renders remain failed or pending according to their prior state. Later startup reconciliation applies only after migration completion.
+It deletes every object under these prefixes:
 
-Render retry uses the migrated desired bundle and exact empty or populated lock set. Artifact HTTP and MCP inspection continue to select only the remapped current-successful revision. Migration errors are safe and bounded and do not reveal source, paths inside project files, dependency guidance, object keys, or artifact bytes.
+```text
+models/
+libraries/
+system/library-rollouts/
+system/migrations/0001-model-project-bundles/items/
+system/migrations/0001-model-project-bundles/backup/
+```
+
+It never deletes any `system/migrations/{migration_id}.json` completion ledger.
+
+The migration uses this restart-safe sequence:
+
+1. Enumerate every target prefix with complete pagination.
+2. Delete each listed object with missing-object success semantics.
+3. Repeat enumeration and deletion until every target prefix returns empty.
+4. Verify each target prefix through a fresh complete listing.
+5. Write the immutable `system/migrations/0002-model-dependency-cutover.json` completion ledger.
+
+A process crash can leave a partial deletion. Restart repeats the same sequence and converges on empty target prefixes. The migration needs no per-item checkpoint because deletion is idempotent. A list or delete error stops the migration and keeps readiness false.
+
+The completion ledger cannot exist unless all target prefixes are empty. An existing completion ledger skips deletion under normal startup rules. Repository validation then accepts only `faktory-project-v2` bundles and the model-release storage contract.
 
 ## Recovery and Rollback Boundary
 
-The migration is forward-only after any model metadata points at a project revision. Rolling back to a binary that understands only legacy source revisions is unsupported, even though legacy objects remain. Before deploying the cutover binary, take and verify a database backup and an independent artifact-bucket recovery copy, record the pre-migration image digest, and stop all other writers.
+The deletion has no rollback path. Migration `0002` creates no recovery copy, compatibility alias, object remap, or conversion output. Operators must not repoint metadata, reconstruct deleted objects, or remove the completion ledger.
 
-Before metadata cutover, an operator may stop the new binary and return to the old binary without object deletion. After metadata cutover begins, recovery means restoring both database and artifact storage to the same verified pre-migration point or completing the forward migration with a corrected newer binary. Never reconstruct rollback state by deleting project objects or manually repointing individual models. Any live backup, restore, bucket copy, deployment, or retry requires explicit target authorization.
+Recovery from interruption means restart with the same or a newer binary and complete the deletion. Recovery from a software defect means deploy a corrected newer binary that recognizes the immutable ledger sequence. An older binary fails closed when it sees the newer completion ledger.
+
+Any live deployment, migration execution, object deletion, ledger repair, or restore requires separate target-specific authorization. This documentation grants no external action authority. No external deployment or migration execution is authorized by this cutover specification.
 
 ## Framework Rules
 
-- Migrations are deterministic, bounded, ordered, observable by safe counts and identifiers, and idempotent under restart.
-- One migration module owns one format transition; fixes ship as a later migration instead of rewriting a completed module.
-- Migration code does not delete, yank, compact, render, resolve dependencies, or call external services.
-- The single-server-replica constraint applies throughout migration; multi-replica migration and serving are unsupported.
+- Migrations are deterministic, bounded by complete pagination, ordered, and restart-safe.
+- One migration module owns one transition. A fix ships as a later migration instead of changing a completed module.
+- Migration errors expose only safe counts, identifiers, and bounded summaries.
+- The single-server-replica constraint applies throughout migration and service.

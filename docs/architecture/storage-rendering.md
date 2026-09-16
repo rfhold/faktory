@@ -1,6 +1,6 @@
 # Storage and Rendering
 
-The current project-key layout, project mutation language, and ordered legacy migration exist in the repository. The multipart layout and advancement rules below define approved behavior under implementation. This repository does not prove a preview or production deployment. [`design-bundles.md`](design-bundles.md) owns output semantics. [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) defines conversion before repository validation or render reconciliation.
+The repository implements the v2 project, model-release, and multipart layouts below. Repository state does not prove a preview or production deployment. [`design-bundles.md`](design-bundles.md) owns output semantics. [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) defines the destructive cutover before repository validation or render reconciliation.
 
 ## Object Layout
 
@@ -16,23 +16,23 @@ models/{model_id}/revisions/{project_sha256}/outputs/{output_id}/projections/{pr
 models/{model_id}/revisions/{project_sha256}/outputs/{primary_output_id}/renders/three-v2/canonical/{projection}.png
 models/{model_id}/revisions/{project_sha256}/outputs/{primary_output_id}/renders/three-v2/views/{view_id}/{etag}.png
 models/{model_id}/views/{view_id}.json
-libraries/{library_name}/releases/{version}/release.json
-libraries/{library_name}/index.json
-system/library-rollouts/{library_name}/{version}/{release_sha256}.json
+models/{model_id}/releases/{version}/release.json
+models/{model_id}/releases/index.json
+system/model-release-rollouts/{model_id}/{version}/{release_sha256}.json
 system/migrations/{migration_id}.json
 ```
 
-`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. `output_id` uses the same syntax and byte limit. View IDs and etags are server-issued opaque UUIDs. `project_sha256` is the lowercase hexadecimal SHA-256 of the canonical project bundle defined in [`model-projects-libraries.md`](model-projects-libraries.md). Project bundles, output manifests, artifacts, and release objects are immutable.
+`model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. `output_id` uses the same syntax and byte limit. View IDs and etags are server-issued opaque UUIDs. `project_sha256` is the lowercase hexadecimal SHA-256 of the canonical project bundle defined in [`model-projects-dependencies.md`](model-projects-dependencies.md). Project bundles, model-release records, output manifests, and artifacts are immutable.
 
-Each new successful revision owns `outputs.json` and one complete output directory per declared output. Every output directory contains one GLB, one preview, and seven technical PNGs. Each GLB has a 64 MiB cap. Only the primary directory contains seven canonical shaded PNGs and named-view cache entries. `projection` accepts only `isometric`, `front`, `back`, `left`, `right`, `top`, and `bottom`; arbitrary object-key input is forbidden. Recipe-versioned paths invalidate caches when visual semantics change. Named-view keys bind the project revision, primary output ID, view ID, etag, and recipe. Migration subkeys and recovery backups are defined in [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md).
+Each new successful revision owns `outputs.json` and one complete output directory per declared output. Every output directory contains one GLB, one preview, and seven technical PNGs. Each GLB has a 64 MiB cap. Only the primary directory contains seven canonical shaded PNGs and named-view cache entries. `projection` accepts only `isometric`, `front`, `back`, `left`, `right`, `top`, and `bottom`; arbitrary object-key input is forbidden. Recipe-versioned paths invalidate caches when visual semantics change. Named-view keys bind the project revision, primary output ID, view ID, etag, and recipe.
 
-Revisions without `outputs.json` retain the legacy fixed keys `model.glb`, `preview.svg`, `projections/{projection}.png`, `renders/three-v2/canonical/{projection}.png`, and `renders/three-v2/views/{view_id}/{etag}.png`. New multipart revisions never write those keys. The repository interprets them through the synthetic legacy primary output defined in [`design-bundles.md`](design-bundles.md).
+Migration `0002-model-dependency-cutover` removes all prior revisions and fixed-key artifacts. Post-cutover revisions always use the multipart layout. The repository exposes no compatibility aliases for deleted storage.
 
 Model and view creation and all immutable writes retain the object store's atomic `If-None-Match: *` request. A repeated immutable write accepts identical bytes and rejects conflicting bytes. For matched mutable `model.json` and view JSON changes and deletes, the process serializes mutations, reads the current object ETag, rejects a mismatch, and then sends an unconditional mutation. This process-local optimistic concurrency requires one server replica with a `Recreate` strategy.
 
 `model.json` is the authority for display name, desired project revision, current successful project revision, render state, safe render error, default view ID, optional current-successful output summaries, the primary facts alias, and `updated_at`. The unchanged protobuf fields retain `source_revision` in their names as a wire-compatibility label. Output summaries and facts belong to the recorded current successful revision and match its immutable manifest. Each view object contains the protobuf-equivalent camera fields and etag metadata. JSON schema details must be fixed with the storage adapter; implementations must not infer an alternative key layout.
 
-`updated_at` records the latest accepted model create, project edit, compatible-library rollout, or name edit. Render-state transitions and view mutations do not change it.
+`updated_at` records the latest accepted model create, project edit, compatible model-release rollout, or name edit. Render-state transitions and view mutations do not change it.
 
 ## Declared Bucket Ownership
 
@@ -42,13 +42,13 @@ The production stack sets `protectData=true`, which applies Pulumi protection to
 
 ## Project Contract
 
-[`model-projects-libraries.md`](model-projects-libraries.md) is authoritative for canonical files, managed `AGENTS.md`, dependencies, exact locks, and MCP file operations. Creation succeeds only when the model ID is absent; a current model conflicts. After the explicit Python entrypoint executes with the locked direct libraries available, its top-level `result` must satisfy [`design-bundles.md`](design-bundles.md). Imports and other top-level Python statements remain allowed under the trusted-source MVP assumption. CQGI parameters are excluded.
+[`model-projects-dependencies.md`](model-projects-dependencies.md) is authoritative for canonical files, managed `AGENTS.md`, model releases, exact dependency closure, and MCP file operations. Creation succeeds only when the model ID is absent; a current model conflicts. After Faktory materializes the root and exact dependency packages, it executes only the root entrypoint. Its top-level `result` must satisfy [`design-bundles.md`](design-bundles.md). Imports and other top-level Python statements remain allowed under the trusted-source MVP assumption. CQGI parameters are excluded.
 
-A name-only edit updates metadata without a project revision, render work, or render-state change. MCP project and library tools are the only source-bearing interfaces. MCP `model.list`, inspect results, protobuf responses, and browser responses remain source-free metadata or artifacts; the browser has no project route or editor.
+A name-only edit updates metadata without a project revision, render work, or render-state change. MCP project and model-release tools are the only source-bearing interfaces. MCP `model.list`, inspect results, protobuf responses, and browser responses remain source-free metadata or artifacts; the browser has no project route or editor.
 
 ## Replacement Rendering
 
-1. Validate and canonicalize the edited project, resolve dependencies only when creation or an explicit dependency edit requires it, compute `project_sha256`, and persist immutable `project.json` before marking that revision desired.
+1. Validate and canonicalize the edited v2 project, resolve direct dependencies when required, validate its exact closure, compute `project_sha256`, and persist immutable `project.json` before marking that revision desired.
 2. Set the desired revision and render state to `PENDING`, then `RENDERING` when work starts.
 3. Preserve the complete current-successful design bundle while the replacement renders.
 4. Normalize `result` and validate 1 through 64 unique outputs, their roles, declaration order, and exactly one primary selection.
@@ -60,7 +60,7 @@ A name-only edit updates metadata without a project revision, render work, or re
 10. After every immutable write succeeds, atomically advance the current successful revision and its output summaries. Replace the primary facts alias, clear the safe error, and set `READY`.
 11. On any failure, preserve the prior current successful revision and its complete bundle. Set the desired revision state to `FAILED` and record only a safe bounded error.
 
-Canonical shaded objects are never overwritten. The ordered legacy migration copies and remaps existing objects without deleting them. Existing `three-v1` objects remain legacy and unselected after `three-v2` becomes active. An existing revision needs a successful rerender before canonical v2 inspection can select its seven `three-v2` artifacts; until then, canonical shaded inspection returns not found while technical images retain current behavior. Saved-view inspection can use the legacy synthetic primary GLB and populate its fixed-key `three-v2` cache through the existing on-demand render path.
+Canonical shaded objects are never overwritten. Migration `0002-model-dependency-cutover` deletes all prior model objects before repository validation. Every post-cutover successful revision writes the current multipart and `three-v2` layouts.
 
 The one server replica uses an in-process bounded rendering queue. On restart, models left `PENDING` are queued without rewriting `model.json`; interrupted `RENDERING` models are reset to `PENDING` before being queued. Reconciliation is serialized with repository mutations. Queue limits, renderer timeout, output limits, and subprocess behavior are explicit runtime configuration.
 
@@ -94,4 +94,4 @@ Before an immutable cache write, the repository rechecks the current successful 
 
 ## Security Boundary
 
-MVP project and library source is trusted operational input but remains capable of arbitrary Python behavior. The renderer is not a hostile-code sandbox. Production source access for untrusted principals is forbidden until a separately reviewed isolation design exists.
+MVP project and dependency source is trusted operational input but remains capable of arbitrary Python behavior. The renderer is not a hostile-code sandbox. Production source access for untrusted principals is forbidden until a separately reviewed isolation design exists.

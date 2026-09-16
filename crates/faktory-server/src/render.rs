@@ -61,6 +61,21 @@ struct RenderJob {
     revision: String,
 }
 
+#[derive(serde::Serialize)]
+struct DependencyManifest<'a> {
+    format: &'static str,
+    root_model_id: &'a str,
+    nodes: Vec<DependencyNode<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct DependencyNode<'a> {
+    model_id: &'a str,
+    package: &'a str,
+    project_revision: &'a str,
+    dependencies: &'a [String],
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderQueue {
     sender: mpsc::Sender<RenderJob>,
@@ -324,7 +339,7 @@ async fn render(
     job: &RenderJob,
 ) -> Result<RenderedOutput, &'static str> {
     let directory = tempfile::tempdir().map_err(|_| "temporary storage unavailable")?;
-    let (project_root, entrypoint, library_root) =
+    let (project_root, entrypoint, dependency_root) =
         materialize_render_inputs(repository, directory.path(), job).await?;
     let output_root = directory.path().join("output");
     let mut command = tokio::process::Command::new(&config.command[0]);
@@ -332,7 +347,7 @@ async fn render(
         .args(&config.command[1..])
         .arg(&project_root)
         .arg(&entrypoint)
-        .arg(&library_root)
+        .arg(&dependency_root)
         .arg(&output_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -470,21 +485,28 @@ fn checked_bundle_total(total: u64, file_size: u64) -> Option<u64> {
         .filter(|total| *total <= MAX_BUNDLE_BYTES)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn materialize_render_inputs(
     repository: &Repository,
     staging_root: &Path,
     job: &RenderJob,
 ) -> Result<(PathBuf, String, PathBuf), &'static str> {
-    let project = repository
-        .get_project(&job.model_id, &job.revision)
+    let closure = repository
+        .resolve_project_closure(&job.model_id, &job.revision)
         .await
-        .map_err(|_| "project unavailable")?;
+        .map_err(|_| "model dependency closure unavailable")?;
+    let project = closure
+        .iter()
+        .find(|item| item.identity.model_id == job.model_id)
+        .ok_or("project unavailable")?
+        .project
+        .clone();
     let project_root = staging_root.join("project");
-    let library_root = staging_root.join("libraries");
+    let dependency_root = staging_root.join("dependencies");
     tokio::fs::create_dir(&project_root)
         .await
         .map_err(|_| "temporary storage unavailable")?;
-    tokio::fs::create_dir(&library_root)
+    tokio::fs::create_dir(&dependency_root)
         .await
         .map_err(|_| "temporary storage unavailable")?;
 
@@ -500,36 +522,75 @@ async fn materialize_render_inputs(
         .map_err(|()| "project unavailable")?;
     }
 
-    let mut library_paths = BTreeSet::new();
+    let mut dependency_paths = BTreeSet::new();
     materialize_file(
-        &library_root,
-        "faktory_shared/__init__.py",
+        &dependency_root,
+        "faktory_models/__init__.py",
         b"",
-        &mut library_paths,
+        &mut dependency_paths,
     )
     .await
     .map_err(|()| "temporary storage unavailable")?;
-    for lock in &project.locks {
-        let release = repository
-            .get_library(&lock.name, &lock.version)
-            .await
-            .map_err(|_| "locked library unavailable")?;
-        if release.digest != lock.release_sha256 {
-            return Err("locked library unavailable");
-        }
-        for file in &release.files {
+    for resolved in &closure {
+        let package = format!(
+            "faktory_models/m_{}",
+            resolved.identity.model_id.replace('-', "_")
+        );
+        let mut exported = false;
+        for file in resolved.project.files.iter().filter(|file| {
+            file.path == "faktory_model/__init__.py" || file.path.starts_with("faktory_model/")
+        }) {
+            exported = true;
+            let suffix = file
+                .path
+                .strip_prefix("faktory_model/")
+                .ok_or("model dependency closure unavailable")?;
             materialize_file(
-                &library_root,
-                &file.path,
+                &dependency_root,
+                &format!("{package}/{suffix}"),
                 file.content.as_bytes(),
-                &mut library_paths,
+                &mut dependency_paths,
             )
             .await
-            .map_err(|()| "locked library unavailable")?;
+            .map_err(|()| "model dependency closure unavailable")?;
+        }
+        if !exported && resolved.identity.model_id == job.model_id {
+            materialize_file(
+                &dependency_root,
+                &format!("{package}/__init__.py"),
+                b"",
+                &mut dependency_paths,
+            )
+            .await
+            .map_err(|()| "temporary storage unavailable")?;
         }
     }
+    let manifest = DependencyManifest {
+        format: "faktory-model-dependencies-v1",
+        root_model_id: &job.model_id,
+        nodes: closure
+            .iter()
+            .map(|item| DependencyNode {
+                model_id: &item.identity.model_id,
+                package: &item.identity.package,
+                project_revision: &item.identity.project_revision,
+                dependencies: &item.identity.dependencies,
+            })
+            .collect(),
+    };
+    let mut manifest_bytes =
+        serde_json::to_vec(&manifest).map_err(|_| "model dependency closure unavailable")?;
+    manifest_bytes.push(b'\n');
+    materialize_file(
+        &dependency_root,
+        "dependencies.json",
+        &manifest_bytes,
+        &mut dependency_paths,
+    )
+    .await
+    .map_err(|()| "temporary storage unavailable")?;
     safe_relative_path(&project.entrypoint).map_err(|()| "project unavailable")?;
-    Ok((project_root, project.entrypoint, library_root))
+    Ok((project_root, project.entrypoint, dependency_root))
 }
 
 async fn materialize_file(
@@ -941,10 +1002,7 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
-    use crate::model::{
-        library::LibraryRelease,
-        project::{DirectRequirement, ProjectFile},
-    };
+    use crate::model::project::ProjectFile;
     use crate::storage::{
         InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject,
     };
@@ -1160,27 +1218,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materializes_exact_project_and_locked_library_code_only() {
+    async fn materializes_root_project_export_and_dependency_manifest() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
-        repository
-            .publish_library(
-                LibraryRelease::new(
-                    "gears".to_owned(),
-                    semver::Version::new(1, 2, 3),
-                    vec![ProjectFile {
-                        path: "faktory_shared/gears/__init__.py".to_owned(),
-                        content: "VALUE = 123\n".to_owned(),
-                    }],
-                    "Import the locked package.".to_owned(),
-                    vec![ProjectFile {
-                        path: "docs/guide.md".to_owned(),
-                        content: "Private library documentation\n".to_owned(),
-                    }],
-                )
-                .expect("library release"),
-            )
-            .await
-            .expect("publish library");
         let model = repository
             .create_project_from_files(
                 "part",
@@ -1188,26 +1227,27 @@ mod tests {
                 vec![
                     ProjectFile {
                         path: "parts/main.py".to_owned(),
-                        content: "from faktory_shared.gears import VALUE\nresult = VALUE\n"
+                        content: "from faktory_models.m_part import VALUE\nresult = VALUE\n"
                             .to_owned(),
                     },
                     ProjectFile {
                         path: "parts/helper.py".to_owned(),
                         content: "HELPER = True\n".to_owned(),
                     },
+                    ProjectFile {
+                        path: "faktory_model/__init__.py".to_owned(),
+                        content: "VALUE = 123\n".to_owned(),
+                    },
                 ],
                 "parts/main.py".to_owned(),
-                vec![DirectRequirement {
-                    name: "gears".to_owned(),
-                    range: ">=1.0.0,<2.0.0".to_owned(),
-                }],
+                vec![],
                 "Project hints",
             )
             .await
             .expect("create project");
         let directory = tempfile::tempdir().expect("temp directory");
 
-        let (project_root, entrypoint, library_root) = materialize_render_inputs(
+        let (project_root, entrypoint, dependency_root) = materialize_render_inputs(
             &repository,
             directory.path(),
             &RenderJob {
@@ -1227,13 +1267,13 @@ mod tests {
         );
         assert!(project_root.join("AGENTS.md").is_file());
         assert_eq!(
-            tokio::fs::read_to_string(library_root.join("faktory_shared/gears/__init__.py"))
+            tokio::fs::read_to_string(dependency_root.join("faktory_models/m_part/__init__.py"))
                 .await
-                .expect("locked package"),
+                .expect("root package"),
             "VALUE = 123\n"
         );
-        assert!(library_root.join("faktory_shared/__init__.py").is_file());
-        assert!(!library_root.join("docs").exists());
+        assert!(dependency_root.join("faktory_models/__init__.py").is_file());
+        assert!(dependency_root.join("dependencies.json").is_file());
     }
 
     #[tokio::test]

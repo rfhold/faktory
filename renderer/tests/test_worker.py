@@ -60,12 +60,13 @@ class RendererTests(unittest.TestCase):
     def render_model(
         self, source: Path, glb: Path, svg: Path, facts: Path
     ) -> str | None:
-        library_root = source.parent / "libraries"
-        library_root.mkdir(exist_ok=True)
+        dependency_root = source.parent / "dependencies"
+        dependency_root.mkdir(exist_ok=True)
+        self.write_dependency_root(dependency_root)
         return render(
             source.parent,
             Path(source.name),
-            library_root,
+            dependency_root,
             self.bundle_root(source.parent),
         )
 
@@ -73,14 +74,53 @@ class RendererTests(unittest.TestCase):
         self,
         project_root: Path,
         entrypoint: str,
-        library_root: Path,
+        dependency_root: Path,
         output_root: Path,
     ) -> str | None:
+        if not any(dependency_root.iterdir()):
+            self.write_dependency_root(dependency_root)
         return render(
             project_root,
             Path(entrypoint),
-            library_root,
+            dependency_root,
             self.bundle_root(output_root),
+        )
+
+    @staticmethod
+    def write_dependency_root(
+        dependency_root: Path,
+        nodes: list[dict[str, object]] | None = None,
+        package_files: dict[str, dict[str, str]] | None = None,
+        root_model_id: str = "fixture",
+    ) -> None:
+        if nodes is None:
+            nodes = [
+                {
+                    "model_id": root_model_id,
+                    "package": f"faktory_models.m_{root_model_id.replace('-', '_')}",
+                    "project_revision": "0" * 64,
+                    "dependencies": [],
+                }
+            ]
+        namespace = dependency_root / "faktory_models"
+        namespace.mkdir(parents=True, exist_ok=True)
+        (namespace / "__init__.py").write_text("", encoding="utf-8")
+        for node in nodes:
+            model_id = str(node["model_id"])
+            package = namespace / f"m_{model_id.replace('-', '_')}"
+            package.mkdir()
+            files = (package_files or {}).get(model_id, {"__init__.py": ""})
+            for relative, content in files.items():
+                path = package / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+        manifest = {
+            "format": "faktory-model-dependencies-v1",
+            "root_model_id": root_model_id,
+            "nodes": nodes,
+        }
+        (dependency_root / "dependencies.json").write_text(
+            json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8"
         )
 
     @staticmethod
@@ -306,11 +346,12 @@ class RendererTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            libraries = root / "libraries"
+            dependencies = root / "dependencies"
             bundle = root / "bundle"
-            libraries.mkdir()
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
 
-            self.assertIsNone(render(project_root, Path("main.py"), libraries, bundle))
+            self.assertIsNone(render(project_root, Path("main.py"), dependencies, bundle))
             manifest = json.loads((bundle / "outputs.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 [
@@ -384,34 +425,45 @@ class RendererTests(unittest.TestCase):
                     )
                 )
 
-    def test_shared_library_can_import_design_api(self) -> None:
+    def test_model_package_can_import_design_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project"
-            libraries = root / "libraries"
+            dependencies = root / "dependencies"
             outputs = root / "outputs"
             project.mkdir()
-            package = libraries / "faktory_shared" / "fixture"
-            package.mkdir(parents=True)
+            dependencies.mkdir()
             outputs.mkdir()
-            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
-            (package / "__init__.py").write_text(
-                "import cadquery as cq\n"
-                "from faktory_design.v1 import Design, Output\n"
-                "def make():\n"
-                "    return Design((Output('shared-part', 'part', cq.Workplane('XY').box(1, 2, 3), primary=True),))\n",
-                encoding="utf-8",
+            (project / "faktory_model").mkdir()
+            (project / "faktory_model" / "__init__.py").write_text(
+                "from .helper import VALUE\n", encoding="utf-8"
+            )
+            (project / "faktory_model" / "helper.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+            self.write_dependency_root(
+                dependencies,
+                package_files={
+                    "fixture": {
+                        "__init__.py": (
+                            "import cadquery as cq\n"
+                            "from faktory_design.v1 import Design, Output\n"
+                            "def make():\n"
+                            "    return Design((Output('model-part', 'part', cq.Workplane('XY').box(1, 2, 3), primary=True),))\n"
+                        )
+                    }
+                },
             )
             (project / "main.py").write_text(
-                "from faktory_shared.fixture import make\nresult = make()\n",
+                "from faktory_models.m_fixture import make\nresult = make()\n",
                 encoding="utf-8",
             )
 
-            self.assertIsNone(self.render_project(project, "main.py", libraries, outputs))
+            self.assertIsNone(self.render_project(project, "main.py", dependencies, outputs))
             manifest = json.loads(
                 (self.bundle_root(outputs) / "outputs.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["outputs"][0]["output_id"], "shared-part")
+            self.assertEqual(manifest["outputs"][0]["output_id"], "model-part")
 
     def test_project_cannot_shadow_design_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -747,7 +799,9 @@ class RendererTests(unittest.TestCase):
                 "result = cq.Workplane('XY').box(1, 1, 1)\n",
                 encoding="utf-8",
             )
-            (root / "libraries").mkdir()
+            dependencies = root / "dependencies"
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
 
             completed = subprocess.run(
                 [
@@ -756,7 +810,7 @@ class RendererTests(unittest.TestCase):
                     "renderer",
                     str(root),
                     source.name,
-                    str(root / "libraries"),
+                    str(dependencies),
                     str(self.bundle_root(root)),
                 ],
                 check=False,
@@ -783,7 +837,9 @@ class RendererTests(unittest.TestCase):
                 "print('source text')\nraise RuntimeError('secret details')\n",
                 encoding="utf-8",
             )
-            (root / "libraries").mkdir()
+            dependencies = root / "dependencies"
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
 
             completed = subprocess.run(
                 [
@@ -792,7 +848,7 @@ class RendererTests(unittest.TestCase):
                     "renderer",
                     str(root),
                     source.name,
-                    str(root / "libraries"),
+                    str(dependencies),
                     str(self.bundle_root(root)),
                 ],
                 check=False,
@@ -874,120 +930,155 @@ class RendererTests(unittest.TestCase):
                 facts = json.loads(self.render_paths(outputs)[2].read_text(encoding="utf-8"))
                 self.assertEqual(facts["size_millimeters"], {"x": 2.0, "y": 3.0, "z": 4.0})
 
-    def test_exact_shared_library_import_wins_over_project_namespace_collision(self) -> None:
+    def test_dependency_root_precedes_project_namespace_collision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project"
-            libraries = root / "libraries"
+            dependencies = root / "dependencies"
             outputs = root / "outputs"
-            (project / "faktory_shared" / "gears").mkdir(parents=True)
-            (libraries / "faktory_shared" / "gears").mkdir(parents=True)
+            (project / "faktory_models" / "m_fixture").mkdir(parents=True)
+            dependencies.mkdir()
             outputs.mkdir()
-            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
-            (libraries / "faktory_shared" / "gears" / "__init__.py").write_text(
-                "import cadquery as cq\n"
-                "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n",
-                encoding="utf-8",
-            )
-            (project / "faktory_shared" / "gears" / "__init__.py").write_text(
+            (project / "faktory_models" / "m_fixture" / "__init__.py").write_text(
                 "raise RuntimeError('project collision executed')\n", encoding="utf-8"
             )
+            self.write_dependency_root(
+                dependencies,
+                package_files={
+                    "fixture": {
+                        "__init__.py": (
+                            "import cadquery as cq\n"
+                            "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n"
+                        )
+                    }
+                },
+            )
             (project / "main.py").write_text(
-                "from faktory_shared.gears import make\nresult = make()\n",
+                "from faktory_models.m_fixture import make\nresult = make()\n",
                 encoding="utf-8",
             )
 
-            self.assertIsNone(self.render_project(project, "main.py", libraries, outputs))
+            self.assertIsNone(
+                self.render_project(project, "main.py", dependencies, outputs)
+            )
             facts = json.loads(self.render_paths(outputs)[2].read_text(encoding="utf-8"))
             self.assertEqual(facts["size_millimeters"], {"x": 2.0, "y": 3.0, "z": 4.0})
 
-    def test_shared_library_rejects_multiline_and_aliased_cross_library_imports(self) -> None:
+    def test_all_project_python_files_are_parsed_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            dependencies = root / "dependencies"
+            outputs = root / "outputs"
+            project.mkdir()
+            dependencies.mkdir()
+            outputs.mkdir()
+            self.write_dependency_root(dependencies)
+            (project / "main.py").write_text("result = None\n", encoding="utf-8")
+            (project / "unused.py").write_text("PRIVATE_SOURCE = (\n", encoding="utf-8")
+
+            self.assertEqual(
+                self.render_project(project, "main.py", dependencies, outputs),
+                "invalid_project_source",
+            )
+            self.assertFalse(any(outputs.iterdir()))
+
+    def test_packages_allow_own_and_direct_dependency_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            dependencies = root / "dependencies"
+            outputs = root / "outputs"
+            project.mkdir()
+            dependencies.mkdir()
+            outputs.mkdir()
+            nodes = [
+                {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": ["gears"]},
+                {"model_id": "gears", "package": "faktory_models.m_gears", "project_revision": "1" * 64, "dependencies": []},
+            ]
+            self.write_dependency_root(
+                dependencies,
+                nodes=nodes,
+                package_files={
+                    "fixture": {
+                        "__init__.py": (
+                            "from .helper import make as relative_make\n"
+                            "from faktory_models.m_fixture.helper import make as absolute_make\n"
+                            "assert relative_make is absolute_make\n"
+                            "make = relative_make\n"
+                        ),
+                        "helper.py": "from faktory_models.m_gears import make\n",
+                        "entrypoint.py": "raise RuntimeError('must not execute')\n",
+                    },
+                    "gears": {
+                        "__init__.py": "import cadquery as cq\ndef make():\n    return cq.Workplane('XY').box(2, 3, 4)\n"
+                    },
+                },
+            )
+            (project / "main.py").write_text(
+                "from faktory_models import m_fixture\nresult = m_fixture.make()\n",
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(
+                self.render_project(project, "main.py", dependencies, outputs)
+            )
+
+    def test_project_and_packages_reject_undeclared_or_legacy_imports(self) -> None:
         cases = {
-            "from": "from faktory_shared import (\n    wheels as other,\n)\n",
-            "import": "import faktory_shared.wheels as other\n",
+            "project_transitive": ("from faktory_models.m_wheels import make\nresult = make()\n", "", "invalid_project_source"),
+            "package_transitive": ("result = None\n", "from faktory_models.m_wheels import make\n", "invalid_dependency_source"),
+            "project_source_alias": ("from faktory_model import make\nresult = make()\n", "", "invalid_project_source"),
+            "project_legacy": ("import faktory_shared.anything\nresult = None\n", "", "invalid_project_source"),
         }
-        for statement, library_source in cases.items():
-            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as directory:
+        for name, (project_source, package_source, expected) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 project = root / "project"
-                libraries = root / "libraries"
+                dependencies = root / "dependencies"
                 outputs = root / "outputs"
                 project.mkdir()
-                (libraries / "faktory_shared" / "gears").mkdir(parents=True)
+                dependencies.mkdir()
                 outputs.mkdir()
-                (libraries / "faktory_shared" / "__init__.py").write_text(
-                    "", encoding="utf-8"
+                nodes = [
+                    {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": ["gears"]},
+                    {"model_id": "gears", "package": "faktory_models.m_gears", "project_revision": "1" * 64, "dependencies": ["wheels"]},
+                    {"model_id": "wheels", "package": "faktory_models.m_wheels", "project_revision": "2" * 64, "dependencies": []},
+                ]
+                self.write_dependency_root(
+                    dependencies,
+                    nodes=nodes,
+                    package_files={
+                        "fixture": {"__init__.py": package_source},
+                        "gears": {"__init__.py": ""},
+                        "wheels": {"__init__.py": ""},
+                    },
                 )
-                (libraries / "faktory_shared" / "gears" / "__init__.py").write_text(
-                    library_source, encoding="utf-8"
-                )
-                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                (project / "main.py").write_text(project_source, encoding="utf-8")
 
                 self.assertEqual(
-                    self.render_project(project, "main.py", libraries, outputs),
-                    "invalid_library_source",
+                    self.render_project(project, "main.py", dependencies, outputs),
+                    expected,
                 )
                 self.assertFalse(any(outputs.iterdir()))
 
-    def test_shared_library_permits_same_library_relative_and_absolute_imports(self) -> None:
+    def test_invalid_dependency_syntax_has_safe_cli_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project"
-            libraries = root / "libraries"
+            dependencies = root / "dependencies"
             outputs = root / "outputs"
             project.mkdir()
-            package = libraries / "faktory_shared" / "gears"
-            package.mkdir(parents=True)
+            dependencies.mkdir()
             outputs.mkdir()
-            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
-            (package / "helper.py").write_text(
-                "import cadquery as cq\n"
-                "def make():\n    return cq.Workplane('XY').box(2, 3, 4)\n",
-                encoding="utf-8",
-            )
-            (package / "__init__.py").write_text(
-                "from .helper import (\n    make as relative_make,\n)\n"
-                "from faktory_shared.gears.helper import make as absolute_make\n"
-                "assert relative_make is absolute_make\n"
-                "make = relative_make\n",
-                encoding="utf-8",
-            )
-            (project / "main.py").write_text(
-                "from faktory_shared.gears import make\nresult = make()\n",
-                encoding="utf-8",
-            )
-
-            self.assertIsNone(self.render_project(project, "main.py", libraries, outputs))
-            facts = json.loads(self.render_paths(outputs)[2].read_text(encoding="utf-8"))
-            self.assertEqual(facts["size_millimeters"], {"x": 2.0, "y": 3.0, "z": 4.0})
-
-    def test_invalid_library_syntax_has_stable_error_without_source_leakage(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "project"
-            libraries = root / "libraries"
-            outputs = root / "outputs"
-            project.mkdir()
-            package = libraries / "faktory_shared" / "gears"
-            package.mkdir(parents=True)
-            outputs.mkdir()
-            (libraries / "faktory_shared" / "__init__.py").write_text("", encoding="utf-8")
-            (package / "__init__.py").write_text(
-                "TOP_SECRET = (\n", encoding="utf-8"
+            self.write_dependency_root(
+                dependencies,
+                package_files={"fixture": {"__init__.py": "TOP_SECRET = (\n"}},
             )
             (project / "main.py").write_text("result = None\n", encoding="utf-8")
-            glb, svg, facts = self.render_paths(outputs)
 
             completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "renderer",
-                    str(project),
-                    "main.py",
-                    str(libraries),
-                    str(self.bundle_root(outputs)),
-                ],
+                [sys.executable, "-m", "renderer", str(project), "main.py", str(dependencies), str(self.bundle_root(outputs))],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -995,29 +1086,222 @@ class RendererTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(completed.stdout, "")
-            self.assertEqual(completed.stderr, "renderer_error=invalid_library_source\n")
+            self.assertEqual(completed.stderr, "renderer_error=invalid_dependency_source\n")
             self.assertNotIn("TOP_SECRET", completed.stderr)
             self.assertFalse(any(outputs.iterdir()))
 
-    def test_missing_shared_library_has_stable_error_and_no_outputs(self) -> None:
+    def test_manifest_rejects_noncanonical_and_invalid_identity_fields(self) -> None:
+        mutations = {
+            "extra_key": lambda value: value.update({"extra": True}),
+            "bad_root": lambda value: value.update({"root_model_id": "Missing"}),
+            "bad_package": lambda value: value["nodes"][0].update({"package": "faktory_models.fixture"}),
+            "bad_revision": lambda value: value["nodes"][0].update({"project_revision": "A" * 64}),
+            "duplicate_dependency": lambda value: value["nodes"][0].update({"dependencies": ["fixture", "fixture"]}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                self.write_dependency_root(dependencies)
+                manifest_path = dependencies / "dependencies.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                mutate(manifest)
+                manifest_path.write_text(
+                    json.dumps(manifest, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                self.assertEqual(
+                    self.render_project(project, "main.py", dependencies, outputs),
+                    "invalid_dependency_manifest",
+                )
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project"
-            libraries = root / "libraries"
+            dependencies = root / "dependencies"
             outputs = root / "outputs"
             project.mkdir()
-            libraries.mkdir()
+            dependencies.mkdir()
             outputs.mkdir()
-            (project / "main.py").write_text(
-                "from faktory_shared.missing import make\nresult = make()\n",
+            self.write_dependency_root(dependencies)
+            manifest_path = dependencies / "dependencies.json"
+            manifest_path.write_text(
+                json.dumps(json.loads(manifest_path.read_text(encoding="utf-8")), indent=2) + "\n",
                 encoding="utf-8",
             )
-
+            (project / "main.py").write_text("result = None\n", encoding="utf-8")
             self.assertEqual(
-                self.render_project(project, "main.py", libraries, outputs),
-                "source_execution_failed",
+                self.render_project(project, "main.py", dependencies, outputs),
+                "invalid_dependency_manifest",
             )
-            self.assertFalse(any(outputs.iterdir()))
+
+    def test_model_id_package_normalization_handles_digits_and_keywords(self) -> None:
+        for model_id, package in (
+            ("3-way-clamp", "faktory_models.m_3_way_clamp"),
+            ("class", "faktory_models.m_class"),
+        ):
+            with self.subTest(model_id=model_id), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                nodes = [
+                    {
+                        "model_id": model_id,
+                        "package": package,
+                        "project_revision": "0" * 64,
+                        "dependencies": [],
+                    }
+                ]
+                self.write_dependency_root(
+                    dependencies, nodes=nodes, root_model_id=model_id
+                )
+                (project / "main.py").write_text(
+                    f"import {package}\nresult = None\n", encoding="utf-8"
+                )
+                self.assertEqual(
+                    self.render_project(project, "main.py", dependencies, outputs),
+                    "unsupported_result",
+                )
+
+    def test_dependency_count_exact_and_adjacent_limits(self) -> None:
+        for dependency_count, valid in ((64, True), (65, False)):
+            with self.subTest(dependency_count=dependency_count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                dependency_ids = [f"model-{index:02d}" for index in range(dependency_count)]
+                nodes = [
+                    {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": dependency_ids},
+                    *[
+                        {"model_id": model_id, "package": f"faktory_models.m_{model_id.replace('-', '_')}", "project_revision": f"{index + 1:064x}", "dependencies": []}
+                        for index, model_id in enumerate(dependency_ids)
+                    ],
+                ]
+                nodes.sort(key=lambda node: str(node["model_id"]))
+                self.write_dependency_root(dependencies, nodes=nodes)
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                error = self.render_project(project, "main.py", dependencies, outputs)
+                self.assertEqual(error, "unsupported_result" if valid else "invalid_dependency_manifest")
+
+    def test_dependency_depth_exact_and_adjacent_limits(self) -> None:
+        for depth, valid in ((8, True), (9, False)):
+            with self.subTest(depth=depth), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                model_ids = [f"model-{index:02d}" for index in range(depth + 1)]
+                nodes = [
+                    {
+                        "model_id": model_id,
+                        "package": f"faktory_models.m_{model_id.replace('-', '_')}",
+                        "project_revision": f"{index:064x}",
+                        "dependencies": [model_ids[index + 1]] if index < depth else [],
+                    }
+                    for index, model_id in enumerate(model_ids)
+                ]
+                self.write_dependency_root(
+                    dependencies, nodes=nodes, root_model_id=model_ids[0]
+                )
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                error = self.render_project(project, "main.py", dependencies, outputs)
+                self.assertEqual(error, "unsupported_result" if valid else "invalid_dependency_manifest")
+
+    def test_dependency_graph_rejects_cycles_and_disconnected_nodes(self) -> None:
+        cases = {
+            "self_dependency": [
+                {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": ["fixture"]},
+            ],
+            "cycle": [
+                {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": ["other"]},
+                {"model_id": "other", "package": "faktory_models.m_other", "project_revision": "1" * 64, "dependencies": ["fixture"]},
+            ],
+            "disconnected": [
+                {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": []},
+                {"model_id": "other", "package": "faktory_models.m_other", "project_revision": "1" * 64, "dependencies": []},
+            ],
+        }
+        for name, nodes in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                self.write_dependency_root(dependencies, nodes=nodes)
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                self.assertEqual(
+                    self.render_project(project, "main.py", dependencies, outputs),
+                    "invalid_dependency_manifest",
+                )
+
+    def test_dependency_staging_and_source_size_are_strict(self) -> None:
+        for name, stage in {
+            "unexpected_namespace_file": lambda root: (root / "faktory_models" / "extra.py").write_text("", encoding="utf-8"),
+            "unrepresented_package": lambda root: (root / "faktory_models" / "m_extra").mkdir(),
+            "unexpected_root_path": lambda root: (root / "extra").mkdir(),
+            "missing_init": lambda root: (root / "faktory_models" / "m_fixture" / "__init__.py").unlink(),
+            "symlink": lambda root: (root / "faktory_models" / "m_fixture" / "link.py").symlink_to("__init__.py"),
+        }.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                self.write_dependency_root(dependencies)
+                stage(dependencies)
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                self.assertEqual(
+                    self.render_project(project, "main.py", dependencies, outputs),
+                    "invalid_dependency_source",
+                )
+
+        for limit, expected in ((1, "unsupported_result"), (0, "invalid_dependency_source")):
+            with self.subTest(source_limit=limit), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                dependencies = root / "dependencies"
+                outputs = root / "outputs"
+                project.mkdir()
+                dependencies.mkdir()
+                outputs.mkdir()
+                nodes = [
+                    {"model_id": "fixture", "package": "faktory_models.m_fixture", "project_revision": "0" * 64, "dependencies": ["other"]},
+                    {"model_id": "other", "package": "faktory_models.m_other", "project_revision": "1" * 64, "dependencies": []},
+                ]
+                self.write_dependency_root(
+                    dependencies,
+                    nodes=nodes,
+                    package_files={"fixture": {"__init__.py": "# large root excluded\n"}, "other": {"__init__.py": "x"}},
+                )
+                (project / "main.py").write_text("result = None\n", encoding="utf-8")
+                with mock.patch("renderer.worker.MAX_PACKAGE_SOURCE_BYTES", limit):
+                    self.assertEqual(
+                        self.render_project(project, "main.py", dependencies, outputs),
+                        expected,
+                    )
 
     def test_absolute_and_traversing_entrypoints_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1070,6 +1354,65 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual(Path.cwd(), original_cwd)
                 self.assertEqual(sys.path, original_path)
         self.assertEqual(rendered[0], rendered[1])
+
+    def test_repeated_package_execution_clears_cache_and_restores_import_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            dependencies = root / "dependencies"
+            first_outputs = root / "first"
+            second_outputs = root / "second"
+            project.mkdir()
+            dependencies.mkdir()
+            first_outputs.mkdir()
+            second_outputs.mkdir()
+            self.write_dependency_root(
+                dependencies,
+                package_files={
+                    "fixture": {
+                        "__init__.py": (
+                            "import cadquery as cq\n"
+                            "def make():\n    return cq.Workplane('XY').box(1, 2, 3)\n"
+                        )
+                    }
+                },
+            )
+            (project / "main.py").write_text(
+                "from faktory_models.m_fixture import make\nresult = make()\n",
+                encoding="utf-8",
+            )
+            sentinel = mock.Mock()
+            prior = sys.modules.get("faktory_models")
+            sys.modules["faktory_models"] = sentinel
+            original_path = sys.path.copy()
+            original_importer_cache = sys.path_importer_cache.copy()
+            original_dont_write_bytecode = sys.dont_write_bytecode
+            try:
+                self.assertIsNone(
+                    self.render_project(project, "main.py", dependencies, first_outputs)
+                )
+                package = dependencies / "faktory_models" / "m_fixture" / "__init__.py"
+                package.write_text(
+                    "import cadquery as cq\n"
+                    "def make():\n    return cq.Workplane('XY').box(4, 5, 6)\n",
+                    encoding="utf-8",
+                )
+                self.assertIsNone(
+                    self.render_project(project, "main.py", dependencies, second_outputs)
+                )
+                first = json.loads(self.render_paths(first_outputs)[2].read_text(encoding="utf-8"))
+                second = json.loads(self.render_paths(second_outputs)[2].read_text(encoding="utf-8"))
+                self.assertEqual(first["size_millimeters"], {"x": 1.0, "y": 2.0, "z": 3.0})
+                self.assertEqual(second["size_millimeters"], {"x": 4.0, "y": 5.0, "z": 6.0})
+                self.assertIs(sys.modules["faktory_models"], sentinel)
+                self.assertEqual(sys.path, original_path)
+                self.assertEqual(sys.path_importer_cache, original_importer_cache)
+                self.assertEqual(sys.dont_write_bytecode, original_dont_write_bytecode)
+            finally:
+                if prior is None:
+                    sys.modules.pop("faktory_models", None)
+                else:
+                    sys.modules["faktory_models"] = prior
 
     def test_invalid_utf8_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

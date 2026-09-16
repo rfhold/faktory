@@ -2,7 +2,7 @@
 
 ## Status
 
-The server, CadQuery renderer, visual renderer, authentication modes, MCP issuer, object-store migrations, shared-library rollout recovery, and local Garage and PostgreSQL topology exist in the repository. The multipart recovery rules below define approved behavior under implementation. Preview and production stacks declare the isolated visual-renderer workload, artifact and backup buckets, database backups, and telemetry targets. No repository implementation or declaration proves that a production bucket, backup, collector, Authentik resource, route, pipeline run, preview deployment, or production deployment exists.
+The repository implements the model-dependency cutover, model-release rollout recovery, and multipart recovery rules. Preview and production stacks declare the isolated visual-renderer workload, artifact and backup buckets, database backups, and telemetry targets. Repository implementation and declarations do not prove that a production bucket, backup, collector, Authentik resource, route, pipeline run, preview deployment, or production deployment exists.
 
 ## Topology
 
@@ -14,11 +14,11 @@ Preview and release delivery build separate Linux AMD64 and ARM64 Faktory server
 
 ## Startup Reconciliation
 
-At startup, the server runs every ordered object-store migration to completion before repository validation or render reconciliation. [`object-store-migrations.md`](object-store-migrations.md) defines migration checkpoints, legacy project conversion, backups, and the forward-only rollback boundary. A migration failure keeps readiness false and queues no render work.
+At startup, the server runs every ordered object-store migration to completion before repository validation or render reconciliation. [`object-store-migrations.md`](object-store-migrations.md) defines irreversible migration `0002-model-dependency-cutover`. It deletes all current product data and preserves completion ledgers. A migration failure keeps readiness false and queues no render work.
 
-After migrations complete, the server enumerates authoritative model metadata. Every model in `PENDING` or `RENDERING` is returned to `PENDING` and queued once, including an explicit same-project rerender whose desired and current successful revisions match. A `FAILED` desired revision is not retried automatically. Operators can use render retry, or an MCP project edit can create new work. Durable compatible-library rollout records also resume idempotently and may create new desired project revisions.
+After migrations complete, the server accepts only v2 projects. It enumerates authoritative model metadata. Every model in `PENDING` or `RENDERING` returns to `PENDING` and enters the queue once. This rule includes an explicit same-project rerender whose desired and current-successful revisions match. A `FAILED` desired revision does not retry automatically. Operators can use render retry, or an MCP project edit can create new work. Durable compatible model-release rollout records also resume idempotently and can create new desired project revisions.
 
-Missing desired project bundles or exact locked releases and invalid metadata make the affected model unhealthy and must produce safe diagnostics. A multipart current revision is unhealthy if it lacks its manifest, any declared required artifact, output summaries, or matching facts. A legacy current revision remains valid without a manifest when its synthetic primary artifact set is complete. Reconciliation must not delete objects, backfill manifests, resolve dependencies, or advance the current successful revision.
+Missing desired project bundles, missing or corrupt exact releases, invalid dependency closure, and invalid metadata make the affected model unhealthy. Diagnostics remain safe. A current revision is unhealthy if it lacks its manifest, any required artifact, output summaries, or matching facts. Reconciliation must not delete objects, resolve dependencies, change locks, or advance the current-successful revision.
 
 ## Failure Handling
 
@@ -27,14 +27,12 @@ Missing desired project bundles or exact locked releases and invalid metadata ma
 - Garage unavailability prevents authoritative mutation and artifact retrieval. The server advances success only after every required artifact write.
 - Visual-renderer unavailability, timeout, crash, malformed output, or saturation fails the desired project render. Restart alone does not retry a `FAILED` revision.
 - An operator can call `model.render.retry` for a failed desired revision after worker recovery. A project edit can also create new work.
-- `model.render.retry` reuses the exact desired project and library locks. It never resolves a newly published release.
-- Compatible-library rollout resumes from its durable record after interruption. It re-evaluates concurrently edited models and never overwrites a newer desired project.
+- `model.render.retry` reuses the exact desired project and model-release lock closure. It never resolves a newly published release.
+- Compatible model-release rollout resumes from its durable record after interruption. It re-evaluates concurrently edited models and never overwrites a newer desired project.
 - A visual-renderer crash can leave only worker-local temporary data. The read-only root and memory-backed `/tmp` make that data disposable.
 - A failed primary named-view render leaves no selectable cache entry. Retry the same `view.inspect` after worker recovery.
 - A view or revision race can leave an unreachable immutable cache object. Current identity checks prevent its return; no cache cleanup operation exists.
-- A legacy current revision has one synthetic primary output and needs no manifest backfill. Its fixed keys remain selectable.
-- A legacy current revision can lack canonical shaded images. No rerender or backfill operation exists for that gap; a later project revision must succeed.
-- A saved-view inspect can render from a legacy primary GLB after worker recovery, even when canonical shaded images remain absent.
+- A release closure failure leaves the affected desired revision unavailable for execution and preserves current-successful outputs.
 - Watch disconnection is recovered by reconnecting and accepting a new authoritative snapshot.
 - View etag conflicts are user-visible concurrency conflicts, not automatic overwrite opportunities.
 
@@ -48,4 +46,4 @@ No automatic restore resource or disaster-recovery workflow is declared. Before 
 
 ## External Action Boundary
 
-Compose startup is explicitly a local operation. It initializes development-only bucket and database state but no identity or OAuth state. The committed Compose services include the visual renderer. They set `FAKTORY_DEPLOYMENT_ENVIRONMENT=local` and omit OTLP and Pyroscope endpoints, so telemetry remains stdout-only. Production bucket creation, credential creation, Authentik configuration, OAuth registration, deployment, migration, restore, model or library mutation, render execution, and live verification each require separate target-specific authorization. Repository documentation and manifests grant no authority to perform those external actions.
+Compose startup is explicitly a local operation. It initializes development-only bucket and database state but no identity or OAuth state. The committed Compose services include the visual renderer. They set `FAKTORY_DEPLOYMENT_ENVIRONMENT=local` and omit OTLP and Pyroscope endpoints, so telemetry remains stdout-only. Production bucket creation, credential creation, Authentik configuration, OAuth registration, deployment, migration, restore, model mutation, model release, render execution, and live verification each require separate target-specific authorization. Repository documentation and manifests grant no authority to perform those external actions.

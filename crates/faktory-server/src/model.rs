@@ -1,7 +1,7 @@
 //! Persisted model and named-view records.
 
-pub mod library;
 pub mod project;
+pub mod release;
 pub mod rollout;
 
 use std::{
@@ -126,19 +126,7 @@ impl ModelRecord {
 
     #[must_use]
     pub fn effective_outputs(&self) -> Vec<ModelOutputSummaryRecord> {
-        if self.current_successful_outputs.is_empty() {
-            self.current_successful_facts
-                .map_or_else(Vec::new, |facts| {
-                    vec![ModelOutputSummaryRecord {
-                        output_id: "primary".to_owned(),
-                        role: OutputRoleRecord::Assembly,
-                        primary: true,
-                        facts,
-                    }]
-                })
-        } else {
-            self.current_successful_outputs.clone()
-        }
+        self.current_successful_outputs.clone()
     }
 
     pub fn primary_output(&self) -> Result<ModelOutputSummaryRecord, RepositoryError> {
@@ -464,6 +452,7 @@ impl Repository {
         validate_model_id(model_id)?;
         let (record, storage_etag) = self.load_json::<ModelRecord>(&model_key(model_id)).await?;
         validate_model_record(&record, model_id)?;
+        validate_post_cutover_model_record(&record)?;
         Ok(LoadedModel {
             record,
             storage_etag,
@@ -595,12 +584,6 @@ impl Repository {
             Err(error) => return Err(error),
         }
         let project = project::ProjectBundle::single_source(source)?;
-        let revision = project.digest()?;
-        self.put_immutable(
-            &source_key(model_id, &revision),
-            Bytes::copy_from_slice(source),
-        )
-        .await?;
         self.create_project(model_id, name, project).await
     }
 
@@ -627,29 +610,6 @@ impl Repository {
             }],
             ..project::ProjectEdit::default()
         });
-        if let Some(edit) = &project_edit {
-            if self
-                .get_model(model_id)
-                .await?
-                .record
-                .desired_source_revision
-                != expected_revision
-            {
-                return Err(RepositoryError::Conflict);
-            }
-            let project = self.get_project(model_id, expected_revision).await?;
-            let next = project.apply(edit)?;
-            let entrypoint = next
-                .files
-                .iter()
-                .find(|file| file.path == next.entrypoint)
-                .ok_or(RepositoryError::Corrupt)?;
-            self.put_immutable(
-                &source_key(model_id, &next.digest()?),
-                Bytes::copy_from_slice(entrypoint.content.as_bytes()),
-            )
-            .await?;
-        }
         self.edit_project(model_id, expected_revision, name, project_edit.as_ref())
             .await
     }
@@ -791,12 +751,6 @@ impl Repository {
         .await
     }
 
-    pub async fn source(&self, model_id: &str, revision: &str) -> Result<Bytes, RepositoryError> {
-        validate_model_id(model_id)?;
-        validate_revision(revision)?;
-        Ok(self.store.get(&source_key(model_id, revision)).await?.bytes)
-    }
-
     pub async fn geometry(&self, model_id: &str, revision: &str) -> Result<Bytes, RepositoryError> {
         let model = self.current_model(model_id, revision).await?;
         let primary = model.primary_output()?;
@@ -812,11 +766,7 @@ impl Repository {
     ) -> Result<Bytes, RepositoryError> {
         let model = self.current_model(model_id, revision).await?;
         resolve_output(&model, output_id)?;
-        let key = if model.current_successful_outputs.is_empty() {
-            geometry_key(model_id, revision)
-        } else {
-            output_geometry_key(model_id, revision, output_id)
-        };
+        let key = output_geometry_key(model_id, revision, output_id);
         Ok(self.store.get(&key).await?.bytes)
     }
 
@@ -835,11 +785,7 @@ impl Repository {
     ) -> Result<Bytes, RepositoryError> {
         let model = self.current_model(model_id, revision).await?;
         resolve_output(&model, output_id)?;
-        let key = if model.current_successful_outputs.is_empty() {
-            preview_key(model_id, revision)
-        } else {
-            output_preview_key(model_id, revision, output_id)
-        };
+        let key = output_preview_key(model_id, revision, output_id);
         Ok(self.store.get(&key).await?.bytes)
     }
 
@@ -864,11 +810,7 @@ impl Repository {
     ) -> Result<Bytes, RepositoryError> {
         let model = self.current_model(model_id, revision).await?;
         resolve_output(&model, output_id)?;
-        let key = if model.current_successful_outputs.is_empty() {
-            projection_key(model_id, revision, projection)
-        } else {
-            output_projection_key(model_id, revision, output_id, projection)
-        };
+        let key = output_projection_key(model_id, revision, output_id, projection);
         Ok(self.store.get(&key).await?.bytes)
     }
 
@@ -880,11 +822,7 @@ impl Repository {
     ) -> Result<Bytes, RepositoryError> {
         let model = self.current_model(model_id, revision).await?;
         let primary = model.primary_output()?;
-        let key = if model.current_successful_outputs.is_empty() {
-            shaded_projection_key(model_id, revision, projection)
-        } else {
-            output_shaded_projection_key(model_id, revision, &primary.output_id, projection)
-        };
+        let key = output_shaded_projection_key(model_id, revision, &primary.output_id, projection);
         Ok(self.store.get(&key).await?.bytes)
     }
 
@@ -919,22 +857,13 @@ impl Repository {
         if primary.output_id != identity.output_id {
             return Err(RepositoryError::NotFound);
         }
-        let key = if model.current_successful_outputs.is_empty() {
-            view_render_key(
-                model_id,
-                &identity.revision,
-                &identity.view_id,
-                &identity.view_etag,
-            )
-        } else {
-            output_view_render_key(
-                model_id,
-                &identity.revision,
-                &identity.output_id,
-                &identity.view_id,
-                &identity.view_etag,
-            )
-        };
+        let key = output_view_render_key(
+            model_id,
+            &identity.revision,
+            &identity.output_id,
+            &identity.view_id,
+            &identity.view_etag,
+        );
         Ok(self.store.get(&key).await?.bytes)
     }
 
@@ -962,22 +891,13 @@ impl Repository {
         if view.etag != identity.view_etag {
             return Err(RepositoryError::Conflict);
         }
-        let key = if model.current_successful_outputs.is_empty() {
-            view_render_key(
-                model_id,
-                &identity.revision,
-                &identity.view_id,
-                &identity.view_etag,
-            )
-        } else {
-            output_view_render_key(
-                model_id,
-                &identity.revision,
-                &identity.output_id,
-                &identity.view_id,
-                &identity.view_etag,
-            )
-        };
+        let key = output_view_render_key(
+            model_id,
+            &identity.revision,
+            &identity.output_id,
+            &identity.view_id,
+            &identity.view_etag,
+        );
         self.put_immutable(&key, image).await
     }
 
@@ -1043,6 +963,7 @@ impl Repository {
             .ok_or(RepositoryError::Corrupt)?;
         let (record, storage_etag) = self.load_json::<ModelRecord>(key).await?;
         validate_model_record(&record, model_id)?;
+        validate_post_cutover_model_record(&record)?;
         Ok(LoadedModel {
             record,
             storage_etag,
@@ -1050,35 +971,14 @@ impl Repository {
     }
 
     async fn validate_graph(&self, model: &ModelRecord) -> Result<(), RepositoryError> {
-        match self
-            .get_project(&model.id, &model.desired_source_revision)
-            .await
-        {
-            Ok(_) => {}
-            Err(RepositoryError::NotFound) => {
-                self.store
-                    .get(&source_key(&model.id, &model.desired_source_revision))
-                    .await?;
-            }
-            Err(error) => return Err(error),
-        }
+        self.get_project(&model.id, &model.desired_source_revision)
+            .await?;
         if !model.current_successful_source_revision.is_empty() {
-            if model.current_successful_outputs.is_empty() {
-                self.store
-                    .get(&geometry_key(
-                        &model.id,
-                        &model.current_successful_source_revision,
-                    ))
+            if model.current_successful_source_revision != model.desired_source_revision {
+                self.get_project(&model.id, &model.current_successful_source_revision)
                     .await?;
-                self.store
-                    .get(&preview_key(
-                        &model.id,
-                        &model.current_successful_source_revision,
-                    ))
-                    .await?;
-            } else {
-                self.validate_multipart_graph(model).await?;
             }
+            self.validate_multipart_graph(model).await?;
         }
         if !model.default_view_id.is_empty() {
             self.get_view(&model.id, &model.default_view_id).await?;
@@ -1222,6 +1122,15 @@ pub(crate) fn validate_model_record(
         || (record.render_state == StoredRenderState::Failed && record.render_error.is_empty())
         || (record.render_state == StoredRenderState::Ready
             && record.current_successful_source_revision != record.desired_source_revision)
+    {
+        return Err(RepositoryError::Corrupt);
+    }
+    Ok(())
+}
+
+const fn validate_post_cutover_model_record(record: &ModelRecord) -> Result<(), RepositoryError> {
+    if !record.current_successful_source_revision.is_empty()
+        && record.current_successful_outputs.is_empty()
     {
         return Err(RepositoryError::Corrupt);
     }
@@ -1921,7 +1830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_requires_matching_orphaned_source_bytes() {
+    async fn create_ignores_legacy_orphaned_source_objects() {
         let store = Arc::new(InMemoryObjectStore::default());
         let repository = Repository::new(store.clone(), 8);
         let source = b"source";
@@ -1947,18 +1856,14 @@ mod tests {
             )
             .await
             .expect("store corrupt orphan");
-        assert_eq!(
-            repository.create_model("corrupt", "Corrupt", source).await,
-            Err(RepositoryError::Conflict)
-        );
-        assert!(matches!(
-            repository.get_model("corrupt").await,
-            Err(RepositoryError::NotFound)
-        ));
+        repository
+            .create_model("corrupt", "Corrupt", source)
+            .await
+            .expect("legacy source object is not active");
     }
 
     #[tokio::test]
-    async fn edit_requires_matching_orphaned_source_bytes() {
+    async fn edit_ignores_legacy_orphaned_source_objects() {
         for matching in [true, false] {
             let store = Arc::new(InMemoryObjectStore::default());
             let repository = Repository::new(store.clone(), 8);
@@ -1990,23 +1895,11 @@ mod tests {
                     }]),
                 )
                 .await;
-            if matching {
-                assert_eq!(
-                    result
-                        .expect("accept matching orphan")
-                        .record
-                        .desired_source_revision,
-                    revision
-                );
-            } else {
-                assert!(matches!(result, Err(RepositoryError::Conflict)));
-                let unchanged = repository.get_model(&model.id).await.expect("model").record;
-                assert_eq!(
-                    unchanged.desired_source_revision,
-                    model.desired_source_revision
-                );
-                assert_eq!(unchanged.updated_at, model.updated_at);
-            }
+            let edited = result.expect("legacy source object is not active").record;
+            assert_ne!(
+                edited.desired_source_revision,
+                model.desired_source_revision
+            );
         }
     }
 
@@ -2184,12 +2077,28 @@ mod tests {
             edited.record.current_successful_source_revision,
             created.desired_source_revision
         );
+        let project = repository
+            .get_project("part", &edited.record.desired_source_revision)
+            .await
+            .expect("edited project");
         assert_eq!(
-            repository
-                .source("part", &edited.record.desired_source_revision)
-                .await
-                .expect("edited source"),
-            Bytes::from_static(b"final")
+            project
+                .files
+                .iter()
+                .find(|file| file.path == "source.py")
+                .expect("source file")
+                .content,
+            "final"
+        );
+        assert!(
+            matches!(
+                repository
+                    .store
+                    .get(&source_key("part", &edited.record.desired_source_revision))
+                    .await,
+                Err(StorageError::NotFound)
+            ),
+            "v2 edits must not write legacy source objects"
         );
     }
 
@@ -2274,7 +2183,7 @@ mod tests {
                 .await
                 .expect("revisions")
                 .len(),
-            2
+            1
         );
     }
 
@@ -2610,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifestless_metadata_synthesizes_primary_and_reads_fixed_keys() {
+    async fn manifestless_metadata_and_fixed_artifact_keys_are_rejected() {
         let repository = repository();
         let created = repository
             .create_model("legacy", "Legacy", b"source")
@@ -2646,46 +2555,24 @@ mod tests {
             .await
             .expect("legacy metadata");
 
-        let stored = repository
-            .get_model(&created.id)
-            .await
-            .expect("legacy model")
-            .record;
-        let outputs = stored.effective_outputs();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].output_id, "primary");
-        assert_eq!(outputs[0].role, OutputRoleRecord::Assembly);
-        assert!(outputs[0].primary);
-        assert_eq!(stored.to_proto().current_successful_outputs.len(), 1);
+        assert!(matches!(
+            repository.get_model(&created.id).await,
+            Err(RepositoryError::Corrupt)
+        ));
         assert_eq!(
             repository
                 .geometry_output(&created.id, &created.desired_source_revision, "primary")
                 .await
-                .expect("legacy geometry alias"),
-            Bytes::from_static(b"legacy-glb")
+                .expect_err("legacy geometry is inactive"),
+            RepositoryError::Corrupt
         );
         assert_eq!(
             repository
                 .preview(&created.id, &created.desired_source_revision)
                 .await
-                .expect("legacy preview alias"),
-            Bytes::from_static(b"legacy-preview")
+                .expect_err("legacy preview is inactive"),
+            RepositoryError::Corrupt
         );
-        assert_eq!(
-            repository
-                .geometry_output(&created.id, &created.desired_source_revision, "other")
-                .await
-                .expect_err("legacy has only primary"),
-            RepositoryError::NotFound
-        );
-
-        let mut json = serde_json::to_value(&stored).expect("legacy JSON");
-        json.as_object_mut()
-            .expect("model object")
-            .remove("current_successful_outputs");
-        let decoded: ModelRecord = serde_json::from_value(json).expect("old model JSON");
-        assert!(decoded.current_successful_outputs.is_empty());
-        assert_eq!(decoded.effective_outputs()[0].output_id, "primary");
     }
 
     #[tokio::test]
@@ -3640,7 +3527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_rejects_a_current_revision_without_geometry() {
+    async fn readiness_rejects_a_successful_record_without_output_manifest() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 8);
         let model = repository
             .create_model("part", "Part", b"source")
@@ -3656,34 +3543,7 @@ mod tests {
             .await
             .expect("store fixture");
 
-        assert_eq!(repository.ready().await, Err(RepositoryError::NotFound));
-        repository
-            .store
-            .put(
-                &geometry_key(&model.id, &model.desired_source_revision),
-                Bytes::from_static(b"glb"),
-                PutCondition::Absent,
-            )
-            .await
-            .expect("store geometry fixture");
-        assert_eq!(repository.ready().await, Err(RepositoryError::NotFound));
-        repository
-            .store
-            .put(
-                &preview_key(&model.id, &model.desired_source_revision),
-                Bytes::from_static(b"<svg></svg>"),
-                PutCondition::Absent,
-            )
-            .await
-            .expect("store preview fixture");
-        repository.ready().await.expect("complete graph");
-        assert!(
-            repository
-                .reconcile()
-                .await
-                .expect("isolate model")
-                .is_empty()
-        );
+        assert_eq!(repository.ready().await, Err(RepositoryError::Corrupt));
     }
 
     #[tokio::test]

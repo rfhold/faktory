@@ -5,6 +5,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import struct
@@ -34,6 +35,11 @@ sys.modules.setdefault("faktory_design.v1", _design_v1)
 ERROR_PREFIX: Final = "renderer_error="
 MAX_GLB_BYTES: Final = 64 * 1024 * 1024
 MAX_BUNDLE_BYTES: Final = 192 * 1024 * 1024
+MAX_DEPENDENCY_MODELS: Final = 64
+MAX_DEPENDENCY_DEPTH: Final = 8
+MAX_PACKAGE_SOURCE_BYTES: Final = 64 * 1024 * 1024
+MODEL_ID: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+REVISION: Final = re.compile(r"^[0-9a-f]{64}$")
 PROJECTIONS: Final = (
     ("isometric", (1, -1, 1), (1, 1, 0)),
     ("front", (0, -1, 0), (1, 0, 0)),
@@ -131,18 +137,18 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 def _validate_paths(
     project_root: Path,
     entrypoint: Path,
-    library_root: Path,
+    dependency_root: Path,
     output_root: Path,
 ) -> tuple[str | None, Path | None, Path | None, Path | None, Path | None]:
     try:
         if not project_root.is_dir() or project_root.is_symlink():
             return "invalid_project_root", None, None, None, None
-        if not library_root.is_dir() or library_root.is_symlink():
-            return "invalid_library_root", None, None, None, None
+        if not dependency_root.is_dir() or dependency_root.is_symlink():
+            return "invalid_dependency_root", None, None, None, None
         if entrypoint.is_absolute() or ".." in entrypoint.parts:
             return "invalid_entrypoint", None, None, None, None
         resolved_project_root = project_root.resolve(strict=True)
-        resolved_library_root = library_root.resolve(strict=True)
+        resolved_dependency_root = dependency_root.resolve(strict=True)
         lexical_entrypoint = resolved_project_root / entrypoint
         current = resolved_project_root
         for part in entrypoint.parts:
@@ -171,7 +177,7 @@ def _validate_paths(
         resolved_paths = [
             resolved_entrypoint,
             resolved_project_root,
-            resolved_library_root,
+            resolved_dependency_root,
             resolved_output_root,
         ]
         if len(set(resolved_paths)) != len(resolved_paths):
@@ -182,7 +188,7 @@ def _validate_paths(
         None,
         resolved_project_root,
         resolved_entrypoint,
-        resolved_library_root,
+        resolved_dependency_root,
         resolved_output_root,
     )
 
@@ -209,87 +215,261 @@ def _interpreter_paths(original: list[str]) -> list[str]:
     return retained
 
 
-def _shared_target_allowed(target: str, own_namespace: str) -> bool:
-    return target == own_namespace or target.startswith(f"{own_namespace}.")
+def _package_name(model_id: str) -> str:
+    return f"faktory_models.m_{model_id.replace('-', '_')}"
 
 
-def _from_import_allowed(
-    target: str, names: list[ast.alias], own_namespace: str
+def _regular_tree_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    raise OSError("symlink")
+                mode = entry.stat(follow_symlinks=False).st_mode
+                path = Path(entry.path)
+                if stat.S_ISDIR(mode):
+                    pending.append(path)
+                elif stat.S_ISREG(mode):
+                    files.append(path)
+                else:
+                    raise OSError("non-regular file")
+    return sorted(files)
+
+
+def _model_import_target(target: str) -> str | None:
+    if target == "faktory_models":
+        return ""
+    if not target.startswith("faktory_models."):
+        return None
+    return ".".join(target.split(".")[:2])
+
+
+def _imports_allowed(
+    tree: ast.AST, module_package: str, allowed_packages: set[str]
 ) -> bool:
-    if target == "faktory_shared":
-        return all(
-            name.name != "*"
-            and _shared_target_allowed(f"{target}.{name.name}", own_namespace)
-            for name in names
-        )
-    return _shared_target_allowed(target, own_namespace)
+    def target_allowed(target: str) -> bool:
+        if target == "faktory_shared" or target.startswith("faktory_shared."):
+            return False
+        if target == "faktory_model" or target.startswith("faktory_model."):
+            return False
+        package = _model_import_target(target)
+        return package is None or package in allowed_packages
 
-
-def _library_imports_allowed(
-    tree: ast.AST, package: str, own_namespace: str
-) -> bool:
-    package_parts = package.split(".")
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            for name in node.names:
-                if name.name == "faktory_shared" or name.name.startswith(
-                    "faktory_shared."
-                ):
-                    if not _shared_target_allowed(name.name, own_namespace):
-                        return False
+            if any(not target_allowed(name.name) for name in node.names):
+                return False
         elif isinstance(node, ast.ImportFrom):
             if node.level:
-                parent_count = node.level - 1
-                if parent_count >= len(package_parts):
+                parts = module_package.split(".") if module_package else []
+                if node.level > len(parts):
                     return False
-                base = package_parts[: len(package_parts) - parent_count]
-                target = ".".join((*base, *(node.module or "").split("."))).rstrip(".")
-                if not _from_import_allowed(target, node.names, own_namespace):
+                base = parts[: len(parts) - node.level + 1]
+                target = ".".join((*base, *((node.module or "").split("."))))
+                package = _model_import_target(target)
+                if package is not None and package not in allowed_packages:
                     return False
-            elif node.module == "faktory_shared" or (
-                node.module is not None
-                and node.module.startswith("faktory_shared.")
-            ):
-                if not _from_import_allowed(node.module, node.names, own_namespace):
+                continue
+            else:
+                target = node.module or ""
+            if target == "faktory_models":
+                if any(
+                    name.name == "*"
+                    or f"faktory_models.{name.name}" not in allowed_packages
+                    for name in node.names
+                ):
                     return False
+            elif not target_allowed(target):
+                return False
     return True
 
 
-def _validate_library_sources(library_root: Path) -> str | None:
-    shared_root = library_root / "faktory_shared"
-    if not shared_root.exists():
-        return None
+def _parse_source(path: Path, package: str, allowed: set[str]) -> bool:
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    return _imports_allowed(tree, package, allowed)
+
+
+def _load_dependency_manifest(
+    dependency_root: Path,
+) -> tuple[str | None, dict[str, object] | None, dict[str, dict[str, object]] | None]:
     try:
-        for source_path in sorted(shared_root.rglob("*.py")):
-            relative = source_path.relative_to(library_root)
-            if source_path.is_symlink() or len(relative.parts) < 3:
-                if relative != Path("faktory_shared/__init__.py"):
-                    return "invalid_library_source"
-                own_namespace = "faktory_shared"
-            else:
-                own_namespace = f"faktory_shared.{relative.parts[1]}"
-            resolved_source = source_path.resolve(strict=True)
-            if not _is_relative_to(resolved_source, library_root):
-                return "invalid_library_source"
-            source = source_path.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(source_path))
-            package_parts = relative.with_suffix("").parts[:-1]
-            package = ".".join(package_parts)
-            if not _library_imports_allowed(tree, package, own_namespace):
-                return "invalid_library_source"
-    except (OSError, RuntimeError, SyntaxError, UnicodeError):
-        return "invalid_library_source"
-    return None
+        raw = (dependency_root / "dependencies.json").read_bytes()
+        manifest = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        if not isinstance(manifest, dict) or list(manifest) != [
+            "format",
+            "root_model_id",
+            "nodes",
+        ]:
+            raise ValueError
+        if manifest["format"] != "faktory-model-dependencies-v1":
+            raise ValueError
+        root_model_id = manifest["root_model_id"]
+        nodes = manifest["nodes"]
+        if (
+            not isinstance(root_model_id, str)
+            or not MODEL_ID.fullmatch(root_model_id)
+            or len(root_model_id) > 64
+            or not isinstance(nodes, list)
+            or not nodes
+            or len(nodes) > MAX_DEPENDENCY_MODELS + 1
+        ):
+            raise ValueError
+        by_id: dict[str, dict[str, object]] = {}
+        previous = ""
+        for node in nodes:
+            if not isinstance(node, dict) or list(node) != [
+                "model_id",
+                "package",
+                "project_revision",
+                "dependencies",
+            ]:
+                raise ValueError
+            model_id = node["model_id"]
+            package = node["package"]
+            revision = node["project_revision"]
+            dependencies = node["dependencies"]
+            if (
+                not isinstance(model_id, str)
+                or not MODEL_ID.fullmatch(model_id)
+                or len(model_id) > 64
+                or model_id <= previous
+                or package != _package_name(model_id)
+                or not isinstance(revision, str)
+                or not REVISION.fullmatch(revision)
+                or not isinstance(dependencies, list)
+                or any(not isinstance(item, str) for item in dependencies)
+                or dependencies != sorted(set(dependencies))
+            ):
+                raise ValueError
+            previous = model_id
+            by_id[model_id] = node
+        if root_model_id not in by_id:
+            raise ValueError
+        for model_id, node in by_id.items():
+            dependencies = node["dependencies"]
+            assert isinstance(dependencies, list)
+            if model_id in dependencies or any(item not in by_id for item in dependencies):
+                raise ValueError
+        canonical = json.dumps(
+            manifest, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        if raw != canonical:
+            raise ValueError
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        depths: dict[str, int] = {}
+
+        def longest_path(model_id: str) -> int:
+            if model_id in visiting:
+                raise ValueError
+            if model_id in depths:
+                return depths[model_id]
+            visiting.add(model_id)
+            dependencies = by_id[model_id]["dependencies"]
+            assert isinstance(dependencies, list)
+            depth = max((longest_path(item) + 1 for item in dependencies), default=0)
+            visiting.remove(model_id)
+            visited.add(model_id)
+            depths[model_id] = depth
+            return depth
+
+        if longest_path(root_model_id) > MAX_DEPENDENCY_DEPTH or len(visited) != len(by_id):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return "invalid_dependency_manifest", None, None
+    return None, manifest, by_id
+
+
+def _validate_sources(
+    project_root: Path, dependency_root: Path
+) -> tuple[str | None, set[str] | None]:
+    manifest_error, manifest, nodes = _load_dependency_manifest(dependency_root)
+    if manifest_error is not None or manifest is None or nodes is None:
+        return manifest_error, None
+    namespace_root = dependency_root / "faktory_models"
+    try:
+        dependency_files = _regular_tree_files(dependency_root)
+        namespace_init = namespace_root / "__init__.py"
+        expected_packages = {str(node["package"]).split(".")[1] for node in nodes.values()}
+        if {path.name for path in dependency_root.iterdir()} != {
+            "dependencies.json",
+            "faktory_models",
+        }:
+            raise ValueError
+        if not namespace_root.is_dir() or namespace_init not in dependency_files:
+            raise ValueError
+        if {path.name for path in namespace_root.iterdir()} != expected_packages | {
+            "__init__.py"
+        }:
+            raise ValueError
+        allowed_dependency_files = {
+            dependency_root / "dependencies.json",
+            namespace_init,
+        }
+        source_bytes = 0
+        for model_id, node in nodes.items():
+            package = str(node["package"])
+            package_root = dependency_root / Path(*package.split("."))
+            package_files = _regular_tree_files(package_root)
+            if package_root / "__init__.py" not in package_files:
+                raise ValueError
+            allowed_dependency_files.update(package_files)
+            if model_id != manifest["root_model_id"]:
+                source_bytes += sum(path.stat().st_size for path in package_files)
+            dependencies = node["dependencies"]
+            assert isinstance(dependencies, list)
+            allowed = {package, *(_package_name(item) for item in dependencies)}
+            for path in package_files:
+                if path.suffix == ".py":
+                    relative = path.relative_to(dependency_root)
+                    module_package = ".".join(relative.parts[:-1])
+                    if not _parse_source(path, module_package, allowed):
+                        return "invalid_dependency_source", None
+        if set(dependency_files) != allowed_dependency_files:
+            raise ValueError
+        if source_bytes > MAX_PACKAGE_SOURCE_BYTES:
+            raise ValueError
+        if not _parse_source(namespace_init, "faktory_models", set()):
+            return "invalid_dependency_source", None
+    except (OSError, RuntimeError, SyntaxError, UnicodeError, ValueError):
+        return "invalid_dependency_source", None
+
+    root_model_id = manifest["root_model_id"]
+    assert isinstance(root_model_id, str)
+    root = nodes[root_model_id]
+    root_dependencies = root["dependencies"]
+    assert isinstance(root_dependencies, list)
+    project_allowed = {
+        str(root["package"]),
+        *(_package_name(item) for item in root_dependencies),
+    }
+    try:
+        for path in _regular_tree_files(project_root):
+            if path.suffix != ".py":
+                continue
+            relative = path.relative_to(project_root)
+            module_package = ".".join(relative.parts[:-1])
+            if not _parse_source(path, module_package, project_allowed):
+                return "invalid_project_source", None
+    except (OSError, RuntimeError, SyntaxError, UnicodeError, ValueError):
+        return "invalid_project_source", None
+    return None, project_allowed
 
 
 @contextlib.contextmanager
 def _execution_environment(
-    project_root: Path, library_root: Path, entrypoint: Path
+    project_root: Path, dependency_root: Path, entrypoint: Path
 ) -> Iterator[dict[str, object]]:
     original_cwd = Path.cwd()
     original_path = sys.path.copy()
     original_modules = sys.modules.copy()
     original_importer_cache = sys.path_importer_cache.copy()
+    original_dont_write_bytecode = sys.dont_write_bytecode
     package_parts = entrypoint.relative_to(project_root).parent.parts
     package = ".".join(package_parts)
     namespace: dict[str, object] = {
@@ -307,14 +487,15 @@ def _execution_environment(
     }
     try:
         os.chdir(project_root)
+        sys.dont_write_bytecode = True
         sys.path[:] = [
-            str(library_root),
+            str(dependency_root),
             str(project_root),
             *_interpreter_paths(original_path),
         ]
         for name in tuple(sys.modules):
             top_level = name.partition(".")[0]
-            if top_level == "faktory_shared" or (
+            if top_level == "faktory_models" or (
                 top_level in project_names and top_level != "faktory_design"
             ):
                 del sys.modules[name]
@@ -322,6 +503,7 @@ def _execution_environment(
         yield main_module.__dict__
     finally:
         os.chdir(original_cwd)
+        sys.dont_write_bytecode = original_dont_write_bytecode
         sys.path[:] = original_path
         sys.modules.clear()
         sys.modules.update(original_modules)
@@ -587,17 +769,17 @@ def _render_output(
 def render(
     project_root: Path,
     entrypoint: Path,
-    library_root: Path,
+    dependency_root: Path,
     output_root: Path,
 ) -> str | None:
-    path_error, project_root, source_path, library_root, output_root = _validate_paths(
-        project_root, entrypoint, library_root, output_root
+    path_error, project_root, source_path, dependency_root, output_root = _validate_paths(
+        project_root, entrypoint, dependency_root, output_root
     )
     if path_error is not None:
         return path_error
     assert project_root is not None
     assert source_path is not None
-    assert library_root is not None
+    assert dependency_root is not None
     assert output_root is not None
 
     temporary_root = output_root.with_name(f".{output_root.name}.{uuid.uuid4().hex}.tmp")
@@ -605,11 +787,6 @@ def render(
         temporary_root.mkdir(mode=0o700)
     except OSError:
         return "output_create_failed"
-
-    library_error = _validate_library_sources(library_root)
-    if library_error is not None:
-        _remove_output_tree(temporary_root)
-        return library_error
 
     try:
         source = source_path.read_text(encoding="utf-8")
@@ -620,12 +797,17 @@ def render(
         _remove_output_tree(temporary_root)
         return "source_read_failed"
 
+    source_error, _ = _validate_sources(project_root, dependency_root)
+    if source_error is not None:
+        _remove_output_tree(temporary_root)
+        return source_error
+
     try:
         code = compile(source, str(source_path), "exec")
         with open(os.devnull, "w", encoding="utf-8") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                 with _execution_environment(
-                    project_root, library_root, source_path
+                    project_root, dependency_root, source_path
                 ) as namespace:
                     exec(code, namespace)
     except BaseException:

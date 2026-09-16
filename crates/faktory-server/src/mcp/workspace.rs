@@ -1,8 +1,7 @@
-//! Bounded agent-oriented project and library workspace operations.
+//! Bounded agent-oriented project workspace operations.
 
 use globset::GlobBuilder;
 use regex::Regex;
-use semver::Version;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -13,7 +12,7 @@ use crate::model::{
     },
 };
 
-use super::{LibraryReadInput, ModelGrepInput, ModelReadInput};
+use super::{ModelGrepInput, ModelReadInput};
 
 pub(super) const DEFAULT_READ_LIMIT: usize = 200;
 pub(super) const MAX_READ_LIMIT: usize = 2_000;
@@ -132,48 +131,6 @@ pub(super) async fn model_grep(
         }
     }
     Ok(json!({"revision": actual_revision, "matches": matches, "truncated": truncated}))
-}
-
-pub(super) async fn library_open(
-    repository: &Repository,
-    name: &str,
-    version: &Version,
-) -> Result<Value, RepositoryError> {
-    let release = repository.get_library(name, version).await?;
-    Ok(json!({
-        "name": release.name,
-        "version": release.version,
-        "release_sha256": release.digest,
-        "guidance": release.guidance,
-        "docs": file_index(&release.docs),
-        "files": file_index(&release.files)
-    }))
-}
-
-pub(super) async fn library_read(
-    repository: &Repository,
-    input: &LibraryReadInput,
-) -> Result<Value, RepositoryError> {
-    validate_read_bounds(input.offset, input.limit)?;
-    let release = repository.get_library(&input.name, &input.version).await?;
-    let path = normalize_user_path(&input.path)?;
-    let file = release
-        .docs
-        .iter()
-        .chain(&release.files)
-        .find(|file| file.path == path)
-        .ok_or(RepositoryError::NotFound)?;
-    let read = read_lines(&file.content, input.offset, input.limit)?;
-    Ok(json!({
-        "name": release.name,
-        "version": release.version,
-        "release_sha256": release.digest,
-        "path": path,
-        "content": read.content,
-        "start_line": input.offset,
-        "total_lines": read.total_lines,
-        "truncated": read.truncated
-    }))
 }
 
 pub(super) fn parse_patch(patch: &str) -> Result<ParsedPatch, RepositoryError> {
@@ -363,7 +320,7 @@ async fn load_project(
     }
 }
 
-fn file_index(files: &[crate::model::project::ProjectFile]) -> Vec<Value> {
+pub(super) fn file_index(files: &[crate::model::project::ProjectFile]) -> Vec<Value> {
     files
         .iter()
         .map(|file| {
@@ -436,10 +393,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{
-            library::LibraryRelease,
-            project::{ProjectEdit, ProjectFile},
-        },
+        model::project::{ProjectEdit, ProjectFile},
         storage::InMemoryObjectStore,
     };
 
@@ -764,49 +718,5 @@ mod tests {
             .err(),
             Some(RepositoryError::Invalid)
         );
-    }
-
-    #[tokio::test]
-    async fn library_workspace_indexes_and_reads_immutable_release_files() {
-        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
-        let release = LibraryRelease::new(
-            "gears".to_owned(),
-            Version::new(1, 2, 3),
-            vec![ProjectFile {
-                path: "faktory_shared/gears/__init__.py".to_owned(),
-                content: "one\ntwo\nthree".to_owned(),
-            }],
-            "Use the public API.".to_owned(),
-            vec![ProjectFile {
-                path: "docs/guide.md".to_owned(),
-                content: "Guide body".to_owned(),
-            }],
-        )
-        .expect("release");
-        let digest = release.digest.clone();
-        repository.publish_library(release).await.expect("publish");
-
-        let opened = library_open(&repository, "gears", &Version::new(1, 2, 3))
-            .await
-            .expect("open library");
-        assert_eq!(opened["release_sha256"], digest);
-        assert_eq!(opened["guidance"], "Use the public API.");
-        assert!(!opened.to_string().contains("Guide body"));
-        let read = library_read(
-            &repository,
-            &LibraryReadInput {
-                name: "gears".to_owned(),
-                version: Version::new(1, 2, 3),
-                path: "faktory_shared/gears/__init__.py".to_owned(),
-                offset: 2,
-                limit: 1,
-            },
-        )
-        .await
-        .expect("read library");
-        assert_eq!(read["release_sha256"], digest);
-        assert_eq!(read["content"], "two\n");
-        assert_eq!(read["total_lines"], 3);
-        assert_eq!(read["truncated"], true);
     }
 }

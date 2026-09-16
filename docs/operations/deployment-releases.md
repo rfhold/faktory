@@ -35,7 +35,7 @@ No pipeline has run and neither stack is deployed. These files cannot function a
 
 The deployment has one replica and strategy `Recreate`. An update stops the prior pod before the replacement becomes available, so every preview, production, or rollback deployment has expected service downtime. There is no automatic application rollback in the pipeline.
 
-Manual rollback requires target-specific production authorization and previously published, reviewed server and visual-renderer digests. Both images must remain compatible with current database, object, RPC, and recipe state. From `infra/pulumi`, an authorized operator previews the exact pair before applying it:
+Manual rollback requires target-specific production authorization and previously published, reviewed server and visual-renderer digests. Both images must remain compatible with current database, object, RPC, and recipe state. A server image that predates a completed object-store migration is not compatible; after `0002-model-dependency-cutover`, older binaries fail closed on its permanent completion ledger. From `infra/pulumi`, an authorized operator previews the exact pair before applying it:
 
 ```bash
 pulumi preview --stack prod --diff \

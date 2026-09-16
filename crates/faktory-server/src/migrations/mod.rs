@@ -1,5 +1,6 @@
 //! Ordered forward-only object-store migrations.
 
+mod model_dependency_cutover;
 mod model_project_bundles;
 
 use std::sync::Arc;
@@ -12,10 +13,16 @@ use crate::{
     storage::{ObjectStore, PutCondition, StorageError},
 };
 
-const REGISTRY: &[Migration] = &[Migration {
-    id: model_project_bundles::ID,
-    description: model_project_bundles::DESCRIPTION,
-}];
+const REGISTRY: &[Migration] = &[
+    Migration {
+        id: model_project_bundles::ID,
+        description: model_project_bundles::DESCRIPTION,
+    },
+    Migration {
+        id: model_dependency_cutover::ID,
+        description: model_dependency_cutover::DESCRIPTION,
+    },
+];
 
 struct Migration {
     id: &'static str,
@@ -49,6 +56,9 @@ pub async fn run(store: Arc<dyn ObjectStore>) -> Result<(), RepositoryError> {
             Err(StorageError::NotFound) => {
                 match migration.id {
                     model_project_bundles::ID => model_project_bundles::run(store.as_ref()).await?,
+                    model_dependency_cutover::ID => {
+                        model_dependency_cutover::run(store.as_ref()).await?;
+                    }
                     _ => return Err(RepositoryError::Corrupt),
                 }
                 put_immutable_json(
@@ -131,10 +141,185 @@ mod tests {
             TechnicalProjection, TimestampRecord, geometry_key, model_key, preview_key,
             projection_key, shaded_projection_key, source_key,
         },
-        storage::{InMemoryObjectStore, ObjectStore, PutCondition},
+        storage::{InMemoryObjectStore, ObjectStore, PutCondition, StorageError, StoredObject},
     };
+    use async_trait::async_trait;
     use bytes::Bytes;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug, Default)]
+    struct InterruptDeleteStore {
+        inner: InMemoryObjectStore,
+        interrupt_next_delete: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ObjectStore for InterruptDeleteStore {
+        async fn get(&self, key: &str) -> Result<StoredObject, StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            bytes: Bytes,
+            condition: PutCondition,
+        ) -> Result<String, StorageError> {
+            self.inner.put(key, bytes, condition).await
+        }
+
+        async fn delete(&self, key: &str, expected_etag: &str) -> Result<(), StorageError> {
+            if self.interrupt_next_delete.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Unavailable);
+            }
+            self.inner.delete(key, expected_etag).await
+        }
+
+        async fn ready(&self) -> Result<(), StorageError> {
+            self.inner.ready().await
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CutoverMatrixStore {
+        inner: InMemoryObjectStore,
+        list_calls: AtomicUsize,
+        fail_list_call: AtomicUsize,
+        fail_delete_key: Mutex<Option<String>>,
+        fail_put_key: Mutex<Option<String>>,
+        paged_prefix: Mutex<Option<String>>,
+    }
+
+    impl CutoverMatrixStore {
+        fn fail_delete_once(&self, key: &str) {
+            *self.fail_delete_key.lock().expect("delete failpoint") = Some(key.to_owned());
+        }
+
+        fn fail_put_once(&self, key: &str) {
+            *self.fail_put_key.lock().expect("put failpoint") = Some(key.to_owned());
+        }
+
+        fn fail_list_once(&self, call: usize) {
+            self.list_calls.store(0, Ordering::SeqCst);
+            self.fail_list_call.store(call, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CutoverMatrixStore {
+        async fn get(&self, key: &str) -> Result<StoredObject, StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            let call = self.list_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_list_call.load(Ordering::SeqCst) == call {
+                self.fail_list_call.store(0, Ordering::SeqCst);
+                return Err(StorageError::Unavailable);
+            }
+            let mut keys = self.inner.list(prefix).await?;
+            if self.paged_prefix.lock().expect("page failpoint").as_deref() == Some(prefix)
+                && keys.len() > 1
+            {
+                keys.truncate(1);
+            }
+            Ok(keys)
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            bytes: Bytes,
+            condition: PutCondition,
+        ) -> Result<String, StorageError> {
+            let should_fail = {
+                let mut fail = self.fail_put_key.lock().expect("put failpoint");
+                let matches = fail.as_deref() == Some(key);
+                if matches {
+                    fail.take();
+                }
+                matches
+            };
+            if should_fail {
+                return Err(StorageError::Unavailable);
+            }
+            self.inner.put(key, bytes, condition).await
+        }
+
+        async fn delete(&self, key: &str, expected_etag: &str) -> Result<(), StorageError> {
+            let should_fail = {
+                let mut fail = self.fail_delete_key.lock().expect("delete failpoint");
+                let matches = fail.as_deref() == Some(key);
+                if matches {
+                    fail.take();
+                }
+                matches
+            };
+            if should_fail {
+                return Err(StorageError::Unavailable);
+            }
+            self.inner.delete(key, expected_etag).await
+        }
+
+        async fn ready(&self) -> Result<(), StorageError> {
+            self.inner.ready().await
+        }
+    }
+
+    async fn pending_cutover_store() -> Arc<CutoverMatrixStore> {
+        let store = Arc::new(CutoverMatrixStore::default());
+        run(store.clone()).await.expect("seed migration ledgers");
+        let key = ledger_key(model_dependency_cutover::ID);
+        let ledger = store.get(&key).await.expect("cutover ledger");
+        store
+            .inner
+            .delete(&key, &ledger.etag)
+            .await
+            .expect("reset cutover ledger");
+        store.list_calls.store(0, Ordering::SeqCst);
+        store
+    }
+
+    async fn put_cutover_fixture(store: &CutoverMatrixStore, key: &str) {
+        store
+            .inner
+            .put(key, Bytes::from_static(b"fixture"), PutCondition::Absent)
+            .await
+            .expect("cutover fixture");
+    }
+
+    async fn assert_cutover_ledger_absent(store: &CutoverMatrixStore) {
+        assert_eq!(
+            store.get(&ledger_key(model_dependency_cutover::ID)).await,
+            Err(StorageError::NotFound)
+        );
+    }
+
+    async fn restart_cutover(store: Arc<CutoverMatrixStore>) {
+        run(store.clone()).await.expect("restart cutover");
+        for prefix in model_dependency_cutover::PREFIXES {
+            assert!(
+                store
+                    .list(prefix)
+                    .await
+                    .expect("verified prefix")
+                    .is_empty()
+            );
+        }
+        assert!(
+            store
+                .get(&ledger_key(model_dependency_cutover::ID))
+                .await
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -220,7 +405,9 @@ mod tests {
             )
             .await
             .expect("model");
-        run(store.clone()).await.expect("migration");
+        model_project_bundles::run(store.as_ref())
+            .await
+            .expect("migration");
         let first_keys = store.list("").await.expect("keys");
         let migrated: ModelRecord =
             serde_json::from_slice(&store.get(&model_key("part")).await.expect("model").bytes)
@@ -251,19 +438,20 @@ mod tests {
             legacy_bytes
         );
         assert!(store.get(&source_key("part", &desired)).await.is_ok());
-        for key in [
-            "system/migrations/0001-model-project-bundles.json",
-            "system/migrations/0001-model-project-bundles/items/part.json",
-        ] {
+        for key in ["system/migrations/0001-model-project-bundles/items/part.json"] {
             let object = store.get(key).await.expect("migration state");
             store
                 .delete(key, &object.etag)
                 .await
                 .expect("simulate crash boundary");
         }
-        run(store.clone()).await.expect("resume partial migration");
+        model_project_bundles::run(store.as_ref())
+            .await
+            .expect("resume partial migration");
         assert_eq!(store.list("").await.expect("keys"), first_keys);
-        run(store.clone()).await.expect("rerun");
+        model_project_bundles::run(store.as_ref())
+            .await
+            .expect("rerun");
         assert_eq!(store.list("").await.expect("keys"), first_keys);
         let rerun: ModelRecord =
             serde_json::from_slice(&store.get(&model_key("part")).await.expect("model").bytes)
@@ -326,7 +514,9 @@ mod tests {
             .await
             .expect("legacy model");
 
-        run(store.clone()).await.expect("migration");
+        model_project_bundles::run(store.as_ref())
+            .await
+            .expect("migration");
         let migrated: ModelRecord = serde_json::from_slice(
             &store
                 .get(&model_key("legacy"))
@@ -365,8 +555,151 @@ mod tests {
             Bytes::from_static(b"legacy-svg")
         );
         let first_keys = store.list("").await.expect("keys");
-        run(store.clone()).await.expect("idempotent rerun");
+        model_project_bundles::run(store.as_ref())
+            .await
+            .expect("idempotent rerun");
         assert_eq!(store.list("").await.expect("keys"), first_keys);
+    }
+
+    #[tokio::test]
+    async fn model_dependency_cutover_deletes_legacy_product_data_and_preserves_ledgers() {
+        let store = Arc::new(InMemoryObjectStore::default());
+        for key in [
+            "models/migration-fixture/model.json",
+            "libraries/migration_fixture/releases/1.0.0/release.json",
+            "system/library-rollouts/migration_fixture/1.0.0/deadbeef.json",
+            "system/migrations/0001-model-project-bundles/items/migration-fixture.json",
+            "system/migrations/0001-model-project-bundles/backup/migration-fixture/model.json",
+            "system/migrations/0001-model-project-bundles.json",
+        ] {
+            store
+                .put(key, Bytes::from_static(b"fixture"), PutCondition::Absent)
+                .await
+                .expect("fixture");
+        }
+        model_dependency_cutover::run(store.as_ref())
+            .await
+            .expect("cutover");
+        assert_eq!(
+            store.list("").await.expect("keys"),
+            vec!["system/migrations/0001-model-project-bundles.json".to_owned()]
+        );
+        model_dependency_cutover::run(store.as_ref())
+            .await
+            .expect("idempotent cutover");
+
+        let fresh = Arc::new(InMemoryObjectStore::default());
+        run(fresh.clone()).await.expect("fresh store migrations");
+        assert!(
+            fresh
+                .get("system/migrations/0001-model-project-bundles.json")
+                .await
+                .is_ok()
+        );
+        assert!(
+            fresh
+                .get("system/migrations/0002-model-dependency-cutover.json")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn model_dependency_cutover_restarts_after_interrupted_delete() {
+        let store = Arc::new(InterruptDeleteStore::default());
+        store
+            .put(
+                "libraries/migration_fixture/releases/1.0.0/release.json",
+                Bytes::from_static(b"fixture"),
+                PutCondition::Absent,
+            )
+            .await
+            .expect("fixture");
+        store.interrupt_next_delete.store(true, Ordering::SeqCst);
+
+        assert_eq!(run(store.clone()).await, Err(RepositoryError::Unavailable));
+        assert!(
+            store
+                .get("system/migrations/0001-model-project-bundles.json")
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .get("system/migrations/0002-model-dependency-cutover.json")
+                .await,
+            Err(StorageError::NotFound)
+        );
+
+        run(store.clone()).await.expect("restart migration");
+        assert!(
+            store
+                .list("libraries/")
+                .await
+                .expect("legacy keys")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get("system/migrations/0002-model-dependency-cutover.json")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn model_dependency_cutover_failure_matrix_is_restart_safe() {
+        let delete_keys = [
+            "models/part/model.json",
+            "libraries/fixture/release.json",
+            "system/library-rollouts/fixture/rollout.json",
+            "system/migrations/0001-model-project-bundles/items/part.json",
+            "system/migrations/0001-model-project-bundles/backup/part/model.json",
+        ];
+        for key in delete_keys {
+            let store = pending_cutover_store().await;
+            put_cutover_fixture(&store, key).await;
+            store.fail_delete_once(key);
+            assert_eq!(run(store.clone()).await, Err(RepositoryError::Unavailable));
+            assert_cutover_ledger_absent(&store).await;
+            restart_cutover(store).await;
+        }
+
+        for failed_list_call in [2, 3, 7] {
+            let store = pending_cutover_store().await;
+            if failed_list_call != 7 {
+                put_cutover_fixture(&store, "models/part/model.json").await;
+            }
+            store.fail_list_once(failed_list_call);
+            assert_eq!(run(store.clone()).await, Err(RepositoryError::Unavailable));
+            assert_cutover_ledger_absent(&store).await;
+            restart_cutover(store).await;
+        }
+
+        let paged = pending_cutover_store().await;
+        put_cutover_fixture(&paged, "libraries/fixture/a").await;
+        put_cutover_fixture(&paged, "libraries/fixture/b").await;
+        *paged.paged_prefix.lock().expect("page fixture") = Some("libraries/".to_owned());
+        restart_cutover(paged).await;
+
+        let ledger_failure = pending_cutover_store().await;
+        let completion_ledger_key = ledger_key(model_dependency_cutover::ID);
+        ledger_failure.fail_put_once(&completion_ledger_key);
+        assert_eq!(
+            run(ledger_failure.clone()).await,
+            Err(RepositoryError::Unavailable)
+        );
+        assert_cutover_ledger_absent(&ledger_failure).await;
+        for prefix in model_dependency_cutover::PREFIXES {
+            assert!(
+                ledger_failure
+                    .list(prefix)
+                    .await
+                    .expect("empty before completion retry")
+                    .is_empty()
+            );
+        }
+        restart_cutover(ledger_failure).await;
     }
 
     #[tokio::test]

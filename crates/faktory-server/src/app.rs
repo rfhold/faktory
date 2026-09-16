@@ -291,7 +291,17 @@ pub async fn build_runtime_with_visual_renderer(
         .map_err(startup_migration_error)?;
     let repository = Repository::new(store, config.watch_capacity);
     repository
-        .resume_incomplete_library_rollouts()
+        .reconcile_model_release_rollout_intents()
+        .await
+        .inspect_err(|error| {
+            tracing::error!(
+                repository.error.kind = error.kind(),
+                "startup model release rollout intent reconciliation failed"
+            );
+        })
+        .map_err(|_| "startup model release rollout intent reconciliation failed".to_owned())?;
+    repository
+        .resume_incomplete_model_release_rollouts()
         .await
         .map_err(startup_rollout_recovery_error)?;
     let visual = VisualCoordinator::new(visual_renderer, visual_timeout);
@@ -333,9 +343,9 @@ fn startup_reconciliation_error(error: RepositoryError) -> String {
 fn startup_rollout_recovery_error(error: RepositoryError) -> String {
     tracing::error!(
         repository.error.kind = error.kind(),
-        "startup library rollout recovery failed"
+        "startup model release rollout recovery failed"
     );
-    "startup library rollout recovery failed".to_owned()
+    "startup model release rollout recovery failed".to_owned()
 }
 
 fn startup_migration_error(error: RepositoryError) -> String {
@@ -1088,7 +1098,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             assert_eq!(
                 startup_rollout_recovery_error(RepositoryError::Corrupt),
-                "startup library rollout recovery failed"
+                "startup model release rollout recovery failed"
             );
         });
 
@@ -1097,7 +1107,10 @@ mod tests {
         assert_no_private_sentinels("stdout", &stdout);
         let event = serde_json::from_str::<serde_json::Value>(stdout.trim()).expect("JSON event");
         assert_eq!(event["level"], "ERROR");
-        assert_eq!(event["message"], "startup library rollout recovery failed");
+        assert_eq!(
+            event["message"],
+            "startup model release rollout recovery failed"
+        );
         assert_eq!(event["repository.error.kind"], "corrupt");
         assert_eq!(
             event
@@ -1416,126 +1429,6 @@ mod tests {
             visual: VisualRendererConfig::Disabled,
             watch_capacity: 4,
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn startup_resumes_library_rollouts_before_single_render_reconciliation() {
-        use crate::model::{
-            StoredRenderState,
-            library::LibraryRelease,
-            project::{DirectRequirement, ProjectFile},
-        };
-
-        fn file(path: &str, content: &str) -> ProjectFile {
-            ProjectFile {
-                path: path.to_owned(),
-                content: content.to_owned(),
-            }
-        }
-
-        fn release(version: semver::Version) -> LibraryRelease {
-            LibraryRelease::new(
-                "gears".to_owned(),
-                version,
-                vec![file("faktory_shared/gears/__init__.py", "VALUE = 1\n")],
-                "Import the package.".to_owned(),
-                vec![file("docs/guide.md", "API\n")],
-            )
-            .expect("library release")
-        }
-
-        let store = Arc::new(InMemoryObjectStore::default());
-        crate::migrations::run(store.clone())
-            .await
-            .expect("initial migrations");
-        let repository = Repository::new(store.clone(), 4);
-        repository
-            .publish_library(release(semver::Version::new(1, 0, 0)))
-            .await
-            .expect("old release");
-        let model = repository
-            .create_project_from_files(
-                "consumer",
-                "Consumer",
-                vec![file("main.py", "result = None\n")],
-                "main.py".to_owned(),
-                vec![DirectRequirement {
-                    name: "gears".to_owned(),
-                    range: ">=1.0.0,<2.0.0".to_owned(),
-                }],
-                "",
-            )
-            .await
-            .expect("consumer project");
-        repository
-            .complete_render(
-                &model.id,
-                &model.desired_source_revision,
-                rendered(b"last-good"),
-            )
-            .await
-            .expect("complete original render");
-        let next = repository
-            .publish_library(release(semver::Version::new(1, 1, 0)))
-            .await
-            .expect("new release");
-        assert!(
-            !repository
-                .get_rollout("gears", &next.version, &next.digest)
-                .await
-                .expect("incomplete rollout")
-                .complete
-        );
-
-        let mut config = disabled_config();
-        config.render.command = vec!["/usr/bin/false".to_owned()];
-        let runtime = build_runtime(store, config)
-            .await
-            .expect("recovered runtime");
-        let resumed = runtime
-            .repository()
-            .get_model("consumer")
-            .await
-            .expect("resumed consumer")
-            .record;
-        assert_ne!(
-            resumed.desired_source_revision,
-            model.desired_source_revision
-        );
-        assert_eq!(
-            resumed.current_successful_source_revision,
-            model.desired_source_revision
-        );
-        assert_eq!(
-            runtime
-                .repository()
-                .get_project("consumer", &resumed.desired_source_revision)
-                .await
-                .expect("updated project")
-                .locks[0]
-                .version,
-            next.version
-        );
-
-        for _ in 0..100 {
-            let current = runtime
-                .repository()
-                .get_model("consumer")
-                .await
-                .expect("consumer after reconciliation")
-                .record;
-            if current.render_state == StoredRenderState::Failed {
-                assert_eq!(
-                    current.current_successful_source_revision,
-                    model.desired_source_revision
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("resumed pending revision was not reconciled");
     }
 
     #[test]

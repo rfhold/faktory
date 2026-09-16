@@ -1,4 +1,4 @@
-//! Durable idempotent shared-library consumer rollouts.
+//! Durable idempotent same-major model-release consumer rollouts.
 
 use std::collections::BTreeMap;
 
@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Repository, RepositoryError,
-    library::LibraryRelease,
-    project::{LibraryLock, ProjectEdit, validate_library_name},
+    project::{ModelLock, ProjectEdit},
+    release::ModelRelease,
+    validate_model_id,
 };
 use crate::storage::{PutCondition, StorageError};
 
@@ -22,8 +23,8 @@ pub enum RolloutModelState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LibraryRolloutRecord {
-    pub library_name: String,
+pub struct ModelReleaseRolloutRecord {
+    pub model_id: String,
     pub version: Version,
     pub release_sha256: String,
     pub complete: bool,
@@ -31,23 +32,55 @@ pub struct LibraryRolloutRecord {
 }
 
 #[must_use]
-pub fn rollout_key(name: &str, version: &Version, release_sha256: &str) -> String {
-    format!("system/library-rollouts/{name}/{version}/{release_sha256}.json")
+pub fn rollout_key(model_id: &str, version: &Version, release_sha256: &str) -> String {
+    format!("system/model-release-rollouts/{model_id}/{version}/{release_sha256}.json")
 }
 
 impl Repository {
+    pub async fn reconcile_model_release_rollout_intents(
+        &self,
+    ) -> Result<Vec<ModelReleaseRolloutRecord>, RepositoryError> {
+        let mut model_ids = self
+            .store
+            .list("models/")
+            .await?
+            .into_iter()
+            .filter_map(|key| {
+                let remainder = key.strip_prefix("models/")?;
+                let (model_id, suffix) = remainder.split_once('/')?;
+                suffix.starts_with("releases/").then(|| model_id.to_owned())
+            })
+            .collect::<Vec<_>>();
+        model_ids.sort();
+        model_ids.dedup();
+        let mut intents = Vec::new();
+        for model_id in model_ids {
+            let releases = self.list_model_releases(&model_id).await?;
+            for release in &releases {
+                if releases.iter().any(|candidate| {
+                    candidate.version < release.version
+                        && candidate.version.major == release.version.major
+                }) {
+                    intents.push(self.create_rollout_intent(release).await?);
+                }
+            }
+        }
+        Ok(intents)
+    }
+
+    #[allow(clippy::suspicious_operation_groupings)]
     pub(super) async fn create_rollout_intent(
         &self,
-        release: &LibraryRelease,
-    ) -> Result<LibraryRolloutRecord, RepositoryError> {
-        let record = LibraryRolloutRecord {
-            library_name: release.name.clone(),
+        release: &ModelRelease,
+    ) -> Result<ModelReleaseRolloutRecord, RepositoryError> {
+        let record = ModelReleaseRolloutRecord {
+            model_id: release.model_id.clone(),
             version: release.version.clone(),
             release_sha256: release.digest.clone(),
             complete: false,
             models: BTreeMap::new(),
         };
-        let key = rollout_key(&release.name, &release.version, &release.digest);
+        let key = rollout_key(&release.model_id, &release.version, &release.digest);
         let bytes = serde_json::to_vec(&record).map_err(|_| RepositoryError::Corrupt)?;
         match self
             .store
@@ -56,88 +89,52 @@ impl Repository {
         {
             Ok(_) => Ok(record),
             Err(StorageError::Conflict) => {
-                let existing = self.store.get(&key).await?;
-                if existing.bytes == bytes {
-                    Ok(record)
-                } else {
+                let existing = self.load_json::<ModelReleaseRolloutRecord>(&key).await?.0;
+                if existing.model_id != release.model_id
+                    || existing.version != release.version
+                    || existing.release_sha256 != release.digest
+                {
                     Err(RepositoryError::Conflict)
+                } else {
+                    Ok(existing)
                 }
             }
             Err(error) => Err(error.into()),
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub async fn rollout_library_release(
+    #[allow(clippy::suspicious_operation_groupings, clippy::too_many_lines)]
+    pub async fn rollout_model_release(
         &self,
-        release: &LibraryRelease,
-    ) -> Result<LibraryRolloutRecord, RepositoryError> {
-        let stored = self.get_library(&release.name, &release.version).await?;
+        release: &ModelRelease,
+    ) -> Result<ModelReleaseRolloutRecord, RepositoryError> {
+        let stored = self
+            .get_model_release(&release.model_id, &release.version)
+            .await?;
         if stored.digest != release.digest {
             return Err(RepositoryError::Conflict);
         }
-        let key = rollout_key(&release.name, &release.version, &release.digest);
-        let mut record = match self.load_json::<LibraryRolloutRecord>(&key).await {
+        let key = rollout_key(&release.model_id, &release.version, &release.digest);
+        let mut record = match self.load_json::<ModelReleaseRolloutRecord>(&key).await {
             Ok((record, _)) => record,
             Err(RepositoryError::NotFound) => self.create_rollout_intent(release).await?,
             Err(error) => return Err(error),
         };
-        let identity_matches = record.library_name.eq(&release.name)
-            && record.version.eq(&release.version)
-            && record.release_sha256.eq(&release.digest);
-        if !identity_matches {
+        if (record.model_id != release.model_id)
+            || (record.version != release.version)
+            || (record.release_sha256 != release.digest)
+        {
             return Err(RepositoryError::Corrupt);
         }
         record.complete = false;
         self.persist_rollout(&key, &record).await?;
-
         for listed in self.list_models().await? {
-            let mut attempts = 0;
-            let outcome = loop {
-                attempts += 1;
-                let model = self.get_model(&listed.id).await?.record;
-                let project = self
-                    .get_project(&model.id, &model.desired_source_revision)
-                    .await?;
-                let Some(requirement) = project
-                    .requirements
-                    .iter()
-                    .find(|requirement| requirement.name == release.name)
-                else {
-                    break RolloutModelState::NotEligible;
-                };
-                if !requirement.matches(&release.version) {
-                    break RolloutModelState::NotEligible;
-                }
-                let current = project
-                    .locks
-                    .iter()
-                    .find(|lock| lock.name == release.name)
-                    .ok_or(RepositoryError::Corrupt)?;
-                if current.version >= release.version {
-                    break RolloutModelState::AlreadyCurrent;
-                }
-                let mut locks = project.locks.clone();
-                *locks
-                    .iter_mut()
-                    .find(|lock| lock.name == release.name)
-                    .ok_or(RepositoryError::Corrupt)? = LibraryLock {
-                    name: release.name.clone(),
-                    version: release.version.clone(),
-                    release_sha256: release.digest.clone(),
-                };
-                let guidance = self.dependency_guidance(&locks).await?;
-                let edit = ProjectEdit::lock_update(locks, guidance);
-                match self
-                    .edit_project(&model.id, &model.desired_source_revision, None, Some(&edit))
-                    .await
-                {
-                    Ok(_) => break RolloutModelState::Updated,
-                    Err(RepositoryError::Conflict) if attempts < 4 => {}
-                    Err(RepositoryError::Conflict) => return Err(RepositoryError::Conflict),
-                    Err(error) => return Err(error),
-                }
-            };
+            if record.models.contains_key(&listed.id) {
+                continue;
+            }
+            let outcome = self
+                .apply_model_release_to_consumer(&listed.id, release)
+                .await?;
             record.models.insert(listed.id, outcome);
             self.persist_rollout(&key, &record).await?;
         }
@@ -146,53 +143,98 @@ impl Repository {
         Ok(record)
     }
 
-    pub async fn resume_incomplete_library_rollouts(
+    pub(super) async fn apply_model_release_to_consumer(
         &self,
-    ) -> Result<Vec<LibraryRolloutRecord>, RepositoryError> {
-        let mut keys = self.store.list("system/library-rollouts/").await?;
+        consumer_id: &str,
+        release: &ModelRelease,
+    ) -> Result<RolloutModelState, RepositoryError> {
+        let _guard = self.mutations.lock().await;
+        if consumer_id == release.model_id {
+            return Ok(RolloutModelState::NotEligible);
+        }
+        let model = self.get_model(consumer_id).await?.record;
+        let project = self
+            .get_project(consumer_id, &model.desired_source_revision)
+            .await?;
+        let Some(requirement) = project
+            .requirements
+            .iter()
+            .find(|item| item.model_id == release.model_id)
+        else {
+            return Ok(RolloutModelState::NotEligible);
+        };
+        if !requirement.matches(&release.version) {
+            return Ok(RolloutModelState::NotEligible);
+        }
+        let current = project
+            .locks
+            .iter()
+            .find(|item| item.model_id == release.model_id)
+            .ok_or(RepositoryError::Corrupt)?;
+        if current.version >= release.version {
+            return Ok(RolloutModelState::AlreadyCurrent);
+        }
+        let mut locks = project.locks.clone();
+        *locks
+            .iter_mut()
+            .find(|item| item.model_id == release.model_id)
+            .ok_or(RepositoryError::Corrupt)? = ModelLock {
+            model_id: release.model_id.clone(),
+            version: release.version.clone(),
+            project_revision: release.project_revision.clone(),
+            release_sha256: release.digest.clone(),
+        };
+        let guidance = self.dependency_guidance(&locks).await?;
+        self.edit_project_locked(
+            consumer_id,
+            &model.desired_source_revision,
+            None,
+            Some(&ProjectEdit::lock_update(locks, guidance)),
+        )
+        .await?;
+        Ok(RolloutModelState::Updated)
+    }
+
+    pub async fn resume_incomplete_model_release_rollouts(
+        &self,
+    ) -> Result<Vec<ModelReleaseRolloutRecord>, RepositoryError> {
+        let mut keys = self.store.list("system/model-release-rollouts/").await?;
         keys.sort();
         let mut resumed = Vec::new();
         for key in keys {
-            let (name, version, release_sha256) = parse_rollout_key(&key)?;
-            let (record, _) = self.load_json::<LibraryRolloutRecord>(&key).await?;
-            if record.library_name != name
+            let (model_id, version, digest) = parse_rollout_key(&key)?;
+            let record = self.load_json::<ModelReleaseRolloutRecord>(&key).await?.0;
+            if record.model_id != model_id
                 || record.version != version
-                || record.release_sha256 != release_sha256
+                || record.release_sha256 != digest
             {
                 return Err(RepositoryError::Corrupt);
             }
             if record.complete {
                 continue;
             }
-            let release = self.get_library(&name, &version).await?;
-            if release.digest != release_sha256 {
+            let release = self.get_model_release(&model_id, &version).await?;
+            if release.digest != digest {
                 return Err(RepositoryError::Corrupt);
             }
-            resumed.push(self.rollout_library_release(&release).await?);
+            resumed.push(self.rollout_model_release(&release).await?);
         }
         Ok(resumed)
-    }
-
-    pub async fn get_rollout(
-        &self,
-        name: &str,
-        version: &Version,
-        release_sha256: &str,
-    ) -> Result<LibraryRolloutRecord, RepositoryError> {
-        Ok(self
-            .load_json::<LibraryRolloutRecord>(&rollout_key(name, version, release_sha256))
-            .await?
-            .0)
     }
 
     async fn persist_rollout(
         &self,
         key: &str,
-        record: &LibraryRolloutRecord,
+        record: &ModelReleaseRolloutRecord,
     ) -> Result<(), RepositoryError> {
-        let bytes = serde_json::to_vec(record).map_err(|_| RepositoryError::Corrupt)?;
         self.store
-            .put(key, bytes.into(), PutCondition::Any)
+            .put(
+                key,
+                serde_json::to_vec(record)
+                    .map_err(|_| RepositoryError::Corrupt)?
+                    .into(),
+                PutCondition::Any,
+            )
             .await
             .map(|_| ())
             .map_err(Into::into)
@@ -201,239 +243,28 @@ impl Repository {
 
 fn parse_rollout_key(key: &str) -> Result<(String, Version, String), RepositoryError> {
     let mut parts = key
-        .strip_prefix("system/library-rollouts/")
+        .strip_prefix("system/model-release-rollouts/")
         .ok_or(RepositoryError::Corrupt)?
         .split('/');
-    let name = parts.next().ok_or(RepositoryError::Corrupt)?;
+    let model_id = parts.next().ok_or(RepositoryError::Corrupt)?;
     let version = parts
         .next()
         .and_then(|value| Version::parse(value).ok())
         .ok_or(RepositoryError::Corrupt)?;
-    let release_sha256 = parts
+    let digest = parts
         .next()
         .and_then(|value| value.strip_suffix(".json"))
         .ok_or(RepositoryError::Corrupt)?;
     if parts.next().is_some()
-        || validate_library_name(name).is_err()
+        || validate_model_id(model_id).is_err()
         || !version.pre.is_empty()
         || !version.build.is_empty()
-        || release_sha256.len() != 64
-        || !release_sha256
+        || digest.len() != 64
+        || !digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(RepositoryError::Corrupt);
     }
-    Ok((name.to_owned(), version, release_sha256.to_owned()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        model::{
-            GeometryFactsRecord, GeometrySizeRecord, ModelOutputSummaryRecord, OutputManifest,
-            OutputRoleRecord, RenderedModelOutput, RenderedOutput, TechnicalProjectionImages,
-            library::LibraryRelease,
-            project::{
-                DependencyGuidance, DirectRequirement, LibraryLock, ProjectBundle, ProjectFile,
-            },
-        },
-        storage::InMemoryObjectStore,
-    };
-    use std::sync::Arc;
-
-    fn file(path: &str, content: &str) -> ProjectFile {
-        ProjectFile {
-            path: path.to_owned(),
-            content: content.to_owned(),
-        }
-    }
-    fn release(version: Version) -> LibraryRelease {
-        LibraryRelease::new(
-            "gears".to_owned(),
-            version,
-            vec![file("faktory_shared/gears/__init__.py", "")],
-            "Use it".to_owned(),
-            vec![file("docs/guide.md", "API")],
-        )
-        .expect("release")
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn rollout_updates_desired_lock_and_preserves_last_good() {
-        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 4);
-        assert_eq!(
-            rollout_key("gears", &Version::new(1, 1, 0), "abc"),
-            "system/library-rollouts/gears/1.1.0/abc.json"
-        );
-        let old = repository
-            .publish_library(release(Version::new(1, 0, 0)))
-            .await
-            .expect("old");
-        let requirement = DirectRequirement {
-            name: "gears".to_owned(),
-            range: ">=1.0.0,<2.0.0".to_owned(),
-        };
-        let guidance = vec![DependencyGuidance {
-            name: "gears".to_owned(),
-            version: old.version.clone(),
-            release_sha256: old.digest.clone(),
-            guidance: old.guidance.clone(),
-            documentation: old.docs.iter().map(|doc| doc.path.clone()).collect(),
-        }];
-        let project = ProjectBundle::new(
-            vec![file("main.py", "part = 1")],
-            "main.py".to_owned(),
-            vec![requirement],
-            vec![LibraryLock {
-                name: "gears".to_owned(),
-                version: old.version.clone(),
-                release_sha256: old.digest.clone(),
-            }],
-            &guidance,
-            "",
-        )
-        .expect("project");
-        let model = repository
-            .create_project("consumer", "Consumer", project)
-            .await
-            .expect("model");
-        repository
-            .complete_render(&model.id, &model.desired_source_revision, {
-                let summary = ModelOutputSummaryRecord {
-                    output_id: "primary".to_owned(),
-                    role: OutputRoleRecord::Assembly,
-                    primary: true,
-                    facts: GeometryFactsRecord {
-                        volume_cubic_millimeters: 1.0,
-                        size_millimeters: GeometrySizeRecord {
-                            x: 1.0,
-                            y: 1.0,
-                            z: 1.0,
-                        },
-                    },
-                };
-                RenderedOutput {
-                    manifest: OutputManifest {
-                        format: OutputManifest::FORMAT.to_owned(),
-                        outputs: vec![summary.clone()],
-                    }
-                    .canonical_bytes()
-                    .expect("manifest"),
-                    outputs: vec![RenderedModelOutput {
-                        summary,
-                        glb: bytes::Bytes::from_static(b"glb"),
-                        preview: bytes::Bytes::from_static(b"svg"),
-                        projections: TechnicalProjectionImages::all(bytes::Bytes::from_static(
-                            b"png",
-                        )),
-                        shaded: Some(TechnicalProjectionImages::all(bytes::Bytes::from_static(
-                            b"png",
-                        ))),
-                    }],
-                }
-            })
-            .await
-            .expect("render");
-        let next = repository
-            .publish_library(release(Version::new(1, 1, 0)))
-            .await
-            .expect("next");
-        assert!(
-            !repository
-                .get_rollout("gears", &next.version, &next.digest)
-                .await
-                .expect("intent")
-                .complete
-        );
-        let first = repository
-            .rollout_library_release(&next)
-            .await
-            .expect("rollout");
-        assert_eq!(first.models["consumer"], RolloutModelState::Updated);
-        let changed = repository
-            .get_model("consumer")
-            .await
-            .expect("consumer")
-            .record;
-        assert_ne!(
-            changed.desired_source_revision,
-            model.desired_source_revision
-        );
-        assert_eq!(
-            changed.current_successful_source_revision,
-            model.desired_source_revision
-        );
-        let rerun = repository
-            .rollout_library_release(&next)
-            .await
-            .expect("rerun");
-        assert_eq!(rerun.models["consumer"], RolloutModelState::AlreadyCurrent);
-        assert_eq!(
-            repository
-                .get_model("consumer")
-                .await
-                .expect("consumer")
-                .record
-                .desired_source_revision,
-            changed.desired_source_revision
-        );
-
-        let one_two = repository
-            .publish_library(release(Version::new(1, 2, 0)))
-            .await
-            .expect("1.2");
-        let one_three = repository
-            .publish_library(release(Version::new(1, 3, 0)))
-            .await
-            .expect("1.3");
-        let resumed = repository
-            .resume_incomplete_library_rollouts()
-            .await
-            .expect("resume");
-        assert_eq!(
-            resumed
-                .iter()
-                .map(|record| record.version.clone())
-                .collect::<Vec<_>>(),
-            vec![one_two.version, one_three.version.clone()]
-        );
-        assert!(resumed.iter().all(|record| record.complete));
-        let latest = repository
-            .get_model("consumer")
-            .await
-            .expect("consumer")
-            .record;
-        assert_eq!(
-            repository
-                .get_project("consumer", &latest.desired_source_revision)
-                .await
-                .expect("project")
-                .locks[0]
-                .version,
-            one_three.version
-        );
-        assert_eq!(
-            latest.current_successful_source_revision,
-            model.desired_source_revision
-        );
-        assert!(
-            repository
-                .resume_incomplete_library_rollouts()
-                .await
-                .expect("idempotent resume")
-                .is_empty()
-        );
-        assert_eq!(
-            repository
-                .get_model("consumer")
-                .await
-                .expect("consumer")
-                .record
-                .desired_source_revision,
-            latest.desired_source_revision
-        );
-    }
+    Ok((model_id.to_owned(), version, digest.to_owned()))
 }

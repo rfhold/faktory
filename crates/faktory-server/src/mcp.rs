@@ -20,9 +20,11 @@ use serde_json::{Value, json};
 use crate::{
     model::{
         ModelRecord, Repository, RepositoryError, TechnicalProjection, ViewRenderIdentity,
-        library::LibraryRelease,
-        project::{DirectRequirement, ProjectEdit, ProjectFile, ProjectOperation},
-        rollout::{LibraryRolloutRecord, RolloutModelState},
+        project::{
+            DirectRequirement, ProjectEdit, ProjectFile, ProjectOperation, package_namespace,
+        },
+        release::ModelRelease,
+        rollout::{ModelReleaseRolloutRecord, RolloutModelState},
     },
     render::{
         PROJECTION_HEIGHT, PROJECTION_WIDTH, RenderQueue, validate_projection_png,
@@ -223,71 +225,41 @@ impl FaktoryMcp {
         }
     }
 
-    #[tool(name = "library.list", definition = library_list_definition())]
-    async fn library_list(
+    #[tool(name = "model.release.list", definition = model_release_list_definition())]
+    async fn model_release_list(
         &self,
         call: McpToolCall,
         _: ServerContext,
     ) -> ServerResult<McpToolResult> {
-        let _: EmptyInput = parse(call)?;
-        match self.repository.list_libraries().await {
-            Ok(libraries) => Ok(result(json!({ "libraries": libraries }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "library.get", definition = library_get_definition())]
-    async fn library_get(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: LibraryGetInput = parse(call)?;
-        match self
-            .repository
-            .get_library(&input.name, &input.version)
-            .await
-        {
-            Ok(release) => Ok(result(
-                json!({ "release": library_release_value(&release) }),
+        let input: ModelIdInput = parse(call)?;
+        match self.repository.list_model_releases(&input.model_id).await {
+            Ok(releases) => Ok(result(
+                json!({ "model_id": input.model_id, "package": package_namespace(&input.model_id), "releases": releases.iter().map(model_release_value).collect::<Vec<_>>() }),
             )),
             Err(error) => Ok(tool_error(error)),
         }
     }
 
-    #[tool(name = "library.open", definition = library_open_definition())]
-    async fn library_open(
+    #[tool(name = "model.release.get", definition = model_release_get_definition())]
+    async fn model_release_get(
         &self,
         call: McpToolCall,
         _: ServerContext,
     ) -> ServerResult<McpToolResult> {
-        let input: LibraryGetInput = parse(call)?;
-        match workspace::library_open(&self.repository, &input.name, &input.version).await {
-            Ok(output) => Ok(result(output)),
+        let input: ModelReleaseGetInput = parse(call)?;
+        match model_release_get_value(&self.repository, &input).await {
+            Ok(value) => Ok(result(value)),
             Err(error) => Ok(tool_error(error)),
         }
     }
 
-    #[tool(name = "library.read", definition = library_read_definition())]
-    async fn library_read(
+    #[tool(name = "model.release.publish", definition = model_release_publish_definition())]
+    async fn model_release_publish(
         &self,
         call: McpToolCall,
         _: ServerContext,
     ) -> ServerResult<McpToolResult> {
-        let input: LibraryReadInput = parse(call)?;
-        match workspace::library_read(&self.repository, &input).await {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "library.publish", definition = library_publish_definition())]
-    async fn library_publish(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: LibraryPublishInput = parse(call)?;
+        let input: ModelReleasePublishInput = parse(call)?;
         match publish_and_rollout(self.repository.clone(), self.renders.clone(), input).await {
             Ok(output) => Ok(result(output)),
             Err(error) => Ok(tool_error(error)),
@@ -666,21 +638,15 @@ async fn apply_patch_and_schedule(
 async fn publish_and_rollout(
     repository: Repository,
     renders: RenderQueue,
-    input: LibraryPublishInput,
+    input: ModelReleasePublishInput,
 ) -> Result<Value, RepositoryError> {
     let task_repository = repository.clone();
     let task = tokio::spawn(async move {
         let release = task_repository
-            .publish_library(LibraryRelease::new(
-                input.name,
-                input.version,
-                input.files,
-                input.guidance,
-                input.docs,
-            )?)
+            .publish_model_release(&input.model_id, input.version, &input.expected_revision)
             .await?;
         let compatible = task_repository
-            .list_library_releases(&release.name)
+            .list_model_releases(&release.model_id)
             .await?
             .iter()
             .any(|candidate| {
@@ -688,7 +654,7 @@ async fn publish_and_rollout(
                     && candidate.version.major == release.version.major
             });
         let (rollout, scheduled) = if compatible {
-            let rollout = task_repository.rollout_library_release(&release).await?;
+            let rollout = task_repository.rollout_model_release(&release).await?;
             let scheduled = renders.reconcile(&task_repository).await?;
             (rollout_value(&rollout), scheduled)
         } else {
@@ -703,8 +669,9 @@ async fn publish_and_rollout(
         };
         Ok(json!({
             "release": {
-                "name": release.name,
+                "model_id": release.model_id,
                 "version": release.version,
+                "project_revision": release.project_revision,
                 "release_sha256": release.digest
             },
             "rollout": rollout,
@@ -714,18 +681,41 @@ async fn publish_and_rollout(
     join_scheduled(&repository, task).await
 }
 
-fn library_release_value(release: &LibraryRelease) -> Value {
+fn model_release_value(release: &ModelRelease) -> Value {
     json!({
-        "name": release.name,
+        "model_id": release.model_id,
+        "package": package_namespace(&release.model_id),
         "version": release.version,
+        "project_revision": release.project_revision,
         "release_sha256": release.digest,
-        "guidance": release.guidance,
-        "docs": release.docs,
-        "files": release.files
     })
 }
 
-fn rollout_value(rollout: &LibraryRolloutRecord) -> Value {
+async fn model_release_get_value(
+    repository: &Repository,
+    input: &ModelReleaseGetInput,
+) -> Result<Value, RepositoryError> {
+    let release = repository
+        .get_model_release(&input.model_id, &input.version)
+        .await?;
+    let mut closure = repository
+        .resolve_project_closure(&release.model_id, &release.project_revision)
+        .await?;
+    let root = closure
+        .iter_mut()
+        .find(|item| item.identity.model_id == release.model_id)
+        .ok_or(RepositoryError::Corrupt)?;
+    root.identity.version = Some(release.version.clone());
+    root.identity.release_sha256 = Some(release.digest.clone());
+    let project = repository
+        .get_project(&release.model_id, &release.project_revision)
+        .await?;
+    Ok(
+        json!({"release": model_release_value(&release), "closure": closure.iter().map(|item| &item.identity).collect::<Vec<_>>(), "files": workspace::file_index(&project.files)}),
+    )
+}
+
+fn rollout_value(rollout: &ModelReleaseRolloutRecord) -> Value {
     let mut updated = 0;
     let mut already_current = 0;
     let mut not_eligible = 0;
@@ -820,10 +810,6 @@ struct ApplyPatchInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmptyInput {}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct InspectInput {
     model_id: String,
     output_id: Option<String>,
@@ -864,21 +850,9 @@ struct EditInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LibraryGetInput {
-    name: String,
+struct ModelReleaseGetInput {
+    model_id: String,
     version: Version,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LibraryReadInput {
-    name: String,
-    version: Version,
-    path: String,
-    #[serde(default = "default_line_offset")]
-    offset: usize,
-    #[serde(default = "default_read_limit")]
-    limit: usize,
 }
 
 const fn default_line_offset() -> usize {
@@ -895,12 +869,10 @@ const fn default_grep_limit() -> usize {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LibraryPublishInput {
-    name: String,
+struct ModelReleasePublishInput {
+    model_id: String,
     version: Version,
-    files: Vec<ProjectFile>,
-    guidance: String,
-    docs: Vec<ProjectFile>,
+    expected_revision: String,
 }
 
 #[derive(Deserialize)]
@@ -1202,7 +1174,7 @@ fn model_create_definition() -> McpToolDefinition {
                     "type": "array",
                     "maxItems": 64,
                     "default": [],
-                    "description": "Optional direct-only shared-library requirements. Each stable range must be exactly >=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0; Faktory resolves and stores exact locks.",
+                    "description": "Optional direct-only model requirements. Each stable range must be exactly >=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0; Faktory resolves and stores exact locks.",
                     "items": dependency_schema()
                 },
                 "hints": {
@@ -1275,93 +1247,45 @@ fn model_apply_patch_definition() -> McpToolDefinition {
     )
 }
 
-fn library_list_definition() -> McpToolDefinition {
+fn model_release_list_definition() -> McpToolDefinition {
     definition(
-        "library.list",
-        "List shared-library catalog metadata only: names, import packages, and stable versions. Package code, guidance, and documentation remain available only through authenticated MCP library.get.",
+        "model.release.list",
+        "List immutable releases for one model.",
         true,
-        json!({"type": "object", "additionalProperties": false}),
+        json!({"type":"object","properties":{"model_id":model_id_property()},"required":["model_id"],"additionalProperties":false}),
     )
 }
 
-fn library_get_definition() -> McpToolDefinition {
+fn model_release_get_definition() -> McpToolDefinition {
     definition(
-        "library.get",
-        "Get one immutable shared-library release, including its exact identity, Python package files, nonempty guidance, and documentation. Versions are exact stable MAJOR.MINOR.PATCH values; library content is MCP-only.",
+        "model.release.get",
+        "Get immutable model-release metadata, namespace, closure identities, and file hashes without source bodies.",
         true,
         json!({
             "type": "object",
             "properties": {
-                "name": library_name_schema(),
+                "model_id": model_id_property(),
                 "version": stable_version_schema()
             },
-            "required": ["name", "version"],
+            "required": ["model_id", "version"],
             "additionalProperties": false
         }),
     )
 }
 
-fn library_open_definition() -> McpToolDefinition {
+fn model_release_publish_definition() -> McpToolDefinition {
     definition(
-        "library.open",
-        "Open one immutable shared-library release with exact identity, guidance, and content-hash indexes for package and documentation files, without file bodies.",
-        true,
-        library_identity_schema(),
-    )
-}
-
-fn library_read_definition() -> McpToolDefinition {
-    definition(
-        "library.read",
-        "Read a bounded line range from one package or documentation file in an exact immutable shared-library release.",
-        true,
-        json!({
-            "type": "object",
-            "properties": {
-                "name": library_name_schema(),
-                "version": stable_version_schema(),
-                "path": project_read_path_schema(),
-                "offset": line_offset_schema(),
-                "limit": read_limit_schema()
-            },
-            "required": ["name", "version", "path"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn library_publish_definition() -> McpToolDefinition {
-    definition(
-        "library.publish",
-        "Permanently publish one immutable MCP-only shared-library release. The version must be stable MAJOR.MINOR.PATCH and increase monotonically; package Python files must stay under faktory_shared/<name>/ and declare no shared-library dependencies. Minor and patch releases promise same-major compatibility and automatically roll compatible consumers to exact locks and rerender them; first and new-major releases do not alter consumers.",
+        "model.release.publish",
+        "Permanently publish one immutable model release from an exact READY project revision; same-major releases roll compatible consumers.",
         false,
         json!({
             "type": "object",
             "properties": {
-                "name": library_name_schema(),
+                "model_id": model_id_property(),
                 "version": stable_version_schema(),
-                "files": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 256,
-                    "description": "Python package files under faktory_shared/<name>/; __init__.py is required.",
-                    "items": project_file_schema()
-                },
-                "guidance": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 16384,
-                    "description": "Nonempty agent guidance; level-one and level-two headings are forbidden."
-                },
-                "docs": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 64,
-                    "description": "Documentation files under docs/.",
-                    "items": project_file_schema()
-                }
+                "expected_revision": revision_schema("Exact READY desired and current-successful project revision.")
             },
-            "required": ["name", "version", "files", "guidance", "docs"],
+            "required": ["model_id", "version", "expected_revision"],
             "additionalProperties": false
         }),
     )
@@ -1518,25 +1442,15 @@ fn dependency_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "name": library_name_schema(),
+            "model_id": model_id_property(),
             "range": {
                 "type": "string",
                 "pattern": "^>=[0-9]+\\.[0-9]+\\.[0-9]+,<[0-9]+\\.0\\.0$",
                 "description": "Exact stable same-major range >=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0."
             }
         },
-        "required": ["name", "range"],
+        "required": ["model_id", "range"],
         "additionalProperties": false
-    })
-}
-
-fn library_name_schema() -> Value {
-    json!({
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64,
-        "pattern": "^[a-z][a-z0-9_]{0,63}$",
-        "description": "Direct shared-library name imported as faktory_shared.<name>."
     })
 }
 
@@ -1545,17 +1459,6 @@ fn stable_version_schema() -> Value {
         "type": "string",
         "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
         "description": "Exact stable SemVer MAJOR.MINOR.PATCH with no prerelease, build suffix, or leading zero."
-    })
-}
-fn library_identity_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "name": library_name_schema(),
-            "version": stable_version_schema()
-        },
-        "required": ["name", "version"],
-        "additionalProperties": false
     })
 }
 fn view_put_definition() -> McpToolDefinition {
@@ -1806,23 +1709,6 @@ mod tests {
             orthographic_scale: 7.0,
             etag: String::new(),
         }
-    }
-
-    fn library_release(name: &str, version: &str, body: &str) -> LibraryRelease {
-        LibraryRelease::new(
-            name.to_owned(),
-            Version::parse(version).expect("version"),
-            vec![ProjectFile {
-                path: format!("faktory_shared/{name}/__init__.py"),
-                content: body.to_owned(),
-            }],
-            "Use this library through its documented public API.".to_owned(),
-            vec![ProjectFile {
-                path: "docs/guide.md".to_owned(),
-                content: "# API guide".to_owned(),
-            }],
-        )
-        .expect("library release")
     }
 
     #[derive(Debug)]
@@ -3029,8 +2915,8 @@ mod tests {
             model_read_definition(),
             model_glob_definition(),
             model_grep_definition(),
-            library_open_definition(),
-            library_read_definition(),
+            model_release_list_definition(),
+            model_release_get_definition(),
         ] {
             assert_eq!(definition.input_schema["additionalProperties"], false);
             assert_eq!(
@@ -3070,29 +2956,26 @@ mod tests {
         );
 
         for definition in [
-            library_list_definition(),
-            library_get_definition(),
-            library_open_definition(),
-            library_read_definition(),
-            library_publish_definition(),
+            model_release_list_definition(),
+            model_release_get_definition(),
+            model_release_publish_definition(),
         ] {
             assert_eq!(definition.input_schema["additionalProperties"], false);
         }
-        let publish = library_publish_definition();
+        let publish = model_release_publish_definition();
         assert_eq!(
             publish.input_schema["properties"]["version"]["pattern"],
             "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
         );
         assert_eq!(
-            publish.input_schema["properties"]["docs"]["items"]["additionalProperties"],
-            false
+            publish.input_schema["properties"]["expected_revision"]["pattern"],
+            "^[0-9a-f]{64}$"
         );
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn project_and_library_inputs_reject_unknown_nested_fields() {
-        assert!(serde_json::from_value::<EmptyInput>(json!({"source": "secret"})).is_err());
+    fn project_and_release_inputs_reject_unknown_nested_fields() {
         assert!(
             serde_json::from_value::<ModelReadInput>(json!({
                 "model_id": "part", "path": "main.py", "extra": true
@@ -3134,7 +3017,7 @@ mod tests {
                 "name": "Part",
                 "files": [{"path": "main.py", "content": "part = 1"}],
                 "entrypoint": "main.py",
-                "requirements": [{"name": "gears", "range": ">=1.0.0,<2.0.0"}]
+                "requirements": [{"model_id": "gears", "range": ">=1.0.0,<2.0.0"}]
             }))
             .is_ok()
         );
@@ -3189,12 +3072,11 @@ mod tests {
             .is_err()
         );
         assert!(
-            serde_json::from_value::<LibraryPublishInput>(json!({
-                "name": "gears",
+            serde_json::from_value::<ModelReleasePublishInput>(json!({
+                "model_id": "gears",
                 "version": "1.0.0",
-                "files": [{"path": "faktory_shared/gears/__init__.py", "content": ""}],
-                "guidance": "Use gears.",
-                "docs": [{"path": "docs/guide.md", "content": "Guide", "extra": 1}]
+                "expected_revision": "0".repeat(64),
+                "extra": 1
             }))
             .is_err()
         );
@@ -3204,10 +3086,6 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn project_edit_is_transactional_and_protects_generated_agents_sections() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
-        repository
-            .publish_library(library_release("gears", "1.0.0", "VALUE = 1"))
-            .await
-            .expect("publish dependency");
         let created = repository
             .create_project_from_files(
                 "part",
@@ -3223,10 +3101,7 @@ mod tests {
                     },
                 ],
                 "main.py".to_owned(),
-                vec![DirectRequirement {
-                    name: "gears".to_owned(),
-                    range: ">=1.0.0,<2.0.0".to_owned(),
-                }],
+                vec![],
                 "Original hint",
             )
             .await
@@ -3310,7 +3185,7 @@ mod tests {
                 .expect("AGENTS")
                 .starts_with("# Index\n")
         );
-        assert_eq!(project.locks[0].version, Version::new(1, 0, 0));
+        assert!(project.locks.is_empty());
 
         let protected = ProjectEdit::new(vec![ProjectOperation::FilePatch {
             path: "AGENTS.md".to_owned(),
@@ -3490,131 +3365,6 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(tokio::fs::read(marker).await.unwrap(), b"x");
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn library_tools_keep_list_metadata_only_and_roll_out_same_major_only() {
-        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
-        let first = repository
-            .publish_library(library_release("gears", "1.0.0", "PRIVATE_VALUE = 1"))
-            .await
-            .expect("publish first release");
-        let consumer = repository
-            .create_project_from_files(
-                "consumer",
-                "Consumer",
-                vec![ProjectFile {
-                    path: "main.py".to_owned(),
-                    content: "from faktory_shared.gears import PRIVATE_VALUE".to_owned(),
-                }],
-                "main.py".to_owned(),
-                vec![DirectRequirement {
-                    name: "gears".to_owned(),
-                    range: ">=1.0.0,<2.0.0".to_owned(),
-                }],
-                "",
-            )
-            .await
-            .expect("create consumer");
-        repository
-            .complete_render(
-                "consumer",
-                &consumer.desired_source_revision,
-                rendered_output(valid_projection_png()),
-            )
-            .await
-            .expect("complete initial render");
-        let queue = RenderQueue::start(
-            repository.clone(),
-            RenderConfig {
-                command: vec!["/bin/false".to_owned()],
-                queue_capacity: 1,
-                concurrency: 1,
-                timeout: Duration::from_secs(1),
-                max_output_bytes: 12,
-            },
-        )
-        .expect("render queue");
-        let compatible = publish_and_rollout(
-            repository.clone(),
-            queue.clone(),
-            LibraryPublishInput {
-                name: "gears".to_owned(),
-                version: Version::new(1, 1, 0),
-                files: library_release("gears", "1.1.0", "PRIVATE_VALUE = 2").files,
-                guidance: "Use this compatible release.".to_owned(),
-                docs: vec![ProjectFile {
-                    path: "docs/guide.md".to_owned(),
-                    content: "Compatible API".to_owned(),
-                }],
-            },
-        )
-        .await
-        .expect("publish compatible release");
-        assert_eq!(compatible["rollout"]["status"], "complete");
-        assert_eq!(compatible["rollout"]["counts"]["updated"], 1);
-        assert_eq!(compatible["renders_scheduled"], 1);
-        let changed = repository
-            .get_model("consumer")
-            .await
-            .expect("consumer")
-            .record;
-        let project = repository
-            .get_project("consumer", &changed.desired_source_revision)
-            .await
-            .expect("rolled out project");
-        assert_eq!(project.locks[0].version, Version::new(1, 1, 0));
-        assert_eq!(
-            project.locks[0].release_sha256,
-            compatible["release"]["release_sha256"]
-        );
-        assert_eq!(
-            changed.current_successful_source_revision,
-            consumer.desired_source_revision
-        );
-
-        let major = publish_and_rollout(
-            repository.clone(),
-            queue,
-            LibraryPublishInput {
-                name: "gears".to_owned(),
-                version: Version::new(2, 0, 0),
-                files: library_release("gears", "2.0.0", "PRIVATE_VALUE = 3").files,
-                guidance: "Use this breaking release explicitly.".to_owned(),
-                docs: vec![ProjectFile {
-                    path: "docs/guide.md".to_owned(),
-                    content: "Breaking API".to_owned(),
-                }],
-            },
-        )
-        .await
-        .expect("publish major release");
-        assert_eq!(major["rollout"]["status"], "not_applicable");
-        let unchanged = repository
-            .get_model("consumer")
-            .await
-            .expect("consumer")
-            .record;
-        assert_eq!(
-            unchanged.desired_source_revision,
-            changed.desired_source_revision
-        );
-
-        let listed = json!({"libraries": repository.list_libraries().await.expect("list")});
-        assert!(!listed.to_string().contains("PRIVATE_VALUE"));
-        assert!(!listed.to_string().contains("compatible release"));
-        let fetched = repository
-            .get_library("gears", &Version::new(1, 0, 0))
-            .await
-            .expect("get release");
-        let fetched = library_release_value(&fetched);
-        assert!(fetched.to_string().contains("PRIVATE_VALUE"));
-        assert_eq!(fetched["release_sha256"], first.digest);
-
-        let safe = tool_error(RepositoryError::Conflict).raw.to_string();
-        assert!(!safe.contains("PRIVATE_VALUE"));
-        assert!(!safe.contains("Compatible API"));
     }
 
     #[tokio::test]

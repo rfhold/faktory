@@ -21,7 +21,7 @@ pub const MAX_PROJECT_PATH_BYTES: usize = 1_024;
 pub const MAX_PROJECT_COMPONENT_BYTES: usize = 255;
 pub const MAX_PROJECT_REQUIREMENTS: usize = 64;
 pub const AGENTS_PATH: &str = "AGENTS.md";
-const FORMAT: &str = "faktory-project-v1";
+const FORMAT: &str = "faktory-project-v2";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +33,7 @@ pub struct ProjectFile {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectRequirement {
-    pub name: String,
+    pub model_id: String,
     pub range: String,
 }
 
@@ -50,19 +50,19 @@ impl DirectRequirement {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LibraryLock {
-    pub name: String,
+pub struct ModelLock {
+    pub model_id: String,
     pub version: Version,
+    pub project_revision: String,
     pub release_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyGuidance {
-    pub name: String,
+    pub model_id: String,
     pub version: Version,
+    pub project_revision: String,
     pub release_sha256: String,
-    pub guidance: String,
-    pub documentation: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,7 +71,7 @@ pub struct ProjectBundle {
     pub format: String,
     pub entrypoint: String,
     pub requirements: Vec<DirectRequirement>,
-    pub locks: Vec<LibraryLock>,
+    pub locks: Vec<ModelLock>,
     pub files: Vec<ProjectFile>,
 }
 
@@ -90,7 +90,7 @@ pub struct ProjectEdit {
     pub(crate) entrypoint: Option<String>,
     #[doc(hidden)]
     pub(crate) requirements: Option<Vec<DirectRequirement>>,
-    pub(crate) locks: Option<Vec<LibraryLock>>,
+    pub(crate) locks: Option<Vec<ModelLock>>,
     pub(crate) dependency_guidance: Vec<DependencyGuidance>,
     #[doc(hidden)]
     pub(crate) hint_patches: Vec<ExactPatch>,
@@ -145,7 +145,7 @@ impl ProjectBundle {
         files: Vec<ProjectFile>,
         entrypoint: String,
         requirements: Vec<DirectRequirement>,
-        locks: Vec<LibraryLock>,
+        locks: Vec<ModelLock>,
         dependency_guidance: &[DependencyGuidance],
         hints: &str,
     ) -> Result<Self, RepositoryError> {
@@ -305,7 +305,7 @@ impl ProjectEdit {
     }
 
     pub(crate) fn lock_update(
-        locks: Vec<LibraryLock>,
+        locks: Vec<ModelLock>,
         dependency_guidance: Vec<DependencyGuidance>,
     ) -> Self {
         Self {
@@ -402,7 +402,7 @@ fn normalize_dependencies(
     caller_files: &mut Vec<ProjectFile>,
     entrypoint: &str,
     mut requirements: Vec<DirectRequirement>,
-    mut locks: Vec<LibraryLock>,
+    mut locks: Vec<ModelLock>,
     dependency_guidance: &[DependencyGuidance],
     hints: &str,
 ) -> Result<ProjectBundle, RepositoryError> {
@@ -418,8 +418,8 @@ fn normalize_dependencies(
     {
         return Err(RepositoryError::Invalid);
     }
-    requirements.sort_by(|left, right| left.name.cmp(&right.name));
-    locks.sort_by(|left, right| left.name.cmp(&right.name));
+    requirements.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    locks.sort_by(|left, right| left.model_id.cmp(&right.model_id));
     validate_dependencies(&requirements, &locks)?;
     let hints = normalize_hints(hints)?;
     let agents = render_agents(
@@ -472,17 +472,17 @@ fn normalize_caller_files(files: Vec<ProjectFile>) -> Result<Vec<ProjectFile>, R
 
 fn validate_dependencies(
     requirements: &[DirectRequirement],
-    locks: &[LibraryLock],
+    locks: &[ModelLock],
 ) -> Result<(), RepositoryError> {
     if requirements.len() > MAX_PROJECT_REQUIREMENTS || requirements.len() != locks.len() {
         return Err(RepositoryError::Invalid);
     }
-    let mut names = BTreeSet::new();
+    let mut model_ids = BTreeSet::new();
     for (requirement, lock) in requirements.iter().zip(locks) {
-        validate_library_name(&requirement.name)?;
+        validate_model_id(&requirement.model_id)?;
         let (major, parsed) = parse_requirement(&requirement.range)?;
-        if !names.insert(requirement.name.as_str())
-            || lock.name != requirement.name
+        if !model_ids.insert(requirement.model_id.as_str())
+            || lock.model_id != requirement.model_id
             || lock.version.major != major
             || !lock.version.pre.is_empty()
             || !lock.version.build.is_empty()
@@ -490,6 +490,7 @@ fn validate_dependencies(
         {
             return Err(RepositoryError::Invalid);
         }
+        validate_revision(&lock.project_revision)?;
         validate_revision(&lock.release_sha256)?;
     }
     Ok(())
@@ -523,19 +524,6 @@ pub fn parse_requirement(value: &str) -> Result<(u64, VersionReq), RepositoryErr
         return Err(RepositoryError::Invalid);
     }
     Ok((lower.major, requirement))
-}
-
-pub fn validate_library_name(name: &str) -> Result<(), RepositoryError> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name.as_bytes()[0].is_ascii_lowercase()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(RepositoryError::Invalid);
-    }
-    Ok(())
 }
 
 pub(crate) fn normalize_user_path(path: &str) -> Result<String, RepositoryError> {
@@ -583,7 +571,7 @@ fn normalize_hints(value: &str) -> Result<String, RepositoryError> {
 fn render_agents(
     files: &[ProjectFile],
     entrypoint: &str,
-    locks: &[LibraryLock],
+    locks: &[ModelLock],
     guidance: &[DependencyGuidance],
     hints: &str,
 ) -> Result<String, RepositoryError> {
@@ -603,35 +591,19 @@ fn render_agents(
     }
     output.push_str("\n# Dependency Guidance\n\n");
     if locks.is_empty() {
-        output.push_str("No shared libraries are locked.\n");
+        output.push_str("No model dependencies are locked.\n");
     } else {
         for lock in locks {
-            let item = guidance
+            guidance
                 .iter()
                 .find(|item| {
-                    item.name == lock.name
+                    item.model_id == lock.model_id
                         && item.version == lock.version
+                        && item.project_revision == lock.project_revision
                         && item.release_sha256 == lock.release_sha256
                 })
                 .ok_or(RepositoryError::Invalid)?;
-            let guidance_text = normalize_text(&item.guidance)
-                .trim_end_matches('\n')
-                .to_owned();
-            if guidance_text.is_empty()
-                || guidance_text
-                    .lines()
-                    .any(|line| markdown_heading_level(line).is_some_and(|level| level <= 2))
-            {
-                return Err(RepositoryError::Invalid);
-            }
-            writeln!(output, "## faktory_shared.{} {}\n\nRelease: {}\n\n{}\n\nDocumentation through MCP library.get:\n", lock.name, lock.version, lock.release_sha256, guidance_text).map_err(|_| RepositoryError::Corrupt)?;
-            let mut docs = item.documentation.clone();
-            docs.sort();
-            for doc in docs {
-                writeln!(output, "- {}", json_quote(&doc)?)
-                    .map_err(|_| RepositoryError::Corrupt)?;
-            }
-            output.push('\n');
+            writeln!(output, "## {} {}\n\nModel: {}\nProject revision: {}\nRelease: {}\n\nInspect exact files with MCP model.release.get(model_id={}, version={}).\nRead one exact file with MCP model.read(model_id={}, revision={}, path=<path>).\n", package_namespace(&lock.model_id), lock.version, json_quote(&lock.model_id)?, lock.project_revision, lock.release_sha256, json_quote(&lock.model_id)?, json_quote(&lock.version.to_string())?, json_quote(&lock.model_id)?, json_quote(&lock.project_revision)?).map_err(|_| RepositoryError::Corrupt)?;
         }
         output.pop();
     }
@@ -644,6 +616,11 @@ fn render_agents(
         return Err(RepositoryError::Invalid);
     }
     Ok(output)
+}
+
+#[must_use]
+pub fn package_namespace(model_id: &str) -> String {
+    format!("faktory_models.m_{}", model_id.replace('-', "_"))
 }
 
 fn json_quote(value: &str) -> Result<String, RepositoryError> {
@@ -705,24 +682,27 @@ impl Repository {
     pub async fn resolve_project_requirements(
         &self,
         requirements: &[DirectRequirement],
-    ) -> Result<(Vec<LibraryLock>, Vec<DependencyGuidance>), RepositoryError> {
+    ) -> Result<(Vec<ModelLock>, Vec<DependencyGuidance>), RepositoryError> {
         let mut ordered = requirements.to_vec();
-        ordered.sort_by(|left, right| left.name.cmp(&right.name));
+        ordered.sort_by(|left, right| left.model_id.cmp(&right.model_id));
         if ordered.len() > MAX_PROJECT_REQUIREMENTS
-            || ordered.windows(2).any(|pair| pair[0].name == pair[1].name)
+            || ordered
+                .windows(2)
+                .any(|pair| pair[0].model_id == pair[1].model_id)
         {
             return Err(RepositoryError::Invalid);
         }
         let mut locks = Vec::with_capacity(ordered.len());
         for requirement in ordered {
-            validate_library_name(&requirement.name)?;
+            validate_model_id(&requirement.model_id)?;
             parse_requirement(&requirement.range)?;
             let release = self
-                .resolve_library(&requirement.name, &requirement.range)
+                .resolve_model_release(&requirement.model_id, &requirement.range)
                 .await?;
-            locks.push(LibraryLock {
-                name: release.name,
+            locks.push(ModelLock {
+                model_id: release.model_id,
                 version: release.version,
+                project_revision: release.project_revision,
                 release_sha256: release.digest,
             });
         }
@@ -760,6 +740,8 @@ impl Repository {
         if project.locks != resolved {
             return Err(RepositoryError::Invalid);
         }
+        self.validate_project_closure(model_id, project.clone())
+            .await?;
         let _guard = self.mutations.lock().await;
         match self.get_model(model_id).await {
             Ok(_) => return Err(RepositoryError::Conflict),
@@ -770,16 +752,6 @@ impl Repository {
         self.put_immutable(
             &project_key(model_id, &revision),
             Bytes::from(project.canonical_bytes()?),
-        )
-        .await?;
-        let entrypoint = project
-            .files
-            .iter()
-            .find(|file| file.path == project.entrypoint)
-            .ok_or(RepositoryError::Corrupt)?;
-        self.put_immutable(
-            &super::source_key(model_id, &revision),
-            Bytes::copy_from_slice(entrypoint.content.as_bytes()),
         )
         .await?;
         let record = ModelRecord {
@@ -845,22 +817,26 @@ impl Repository {
         Ok(())
     }
 
+    #[allow(clippy::suspicious_operation_groupings)]
     pub(super) async fn dependency_guidance(
         &self,
-        locks: &[LibraryLock],
+        locks: &[ModelLock],
     ) -> Result<Vec<DependencyGuidance>, RepositoryError> {
         let mut guidance = Vec::with_capacity(locks.len());
         for lock in locks {
-            let release = self.get_library(&lock.name, &lock.version).await?;
-            if release.digest != lock.release_sha256 {
+            let release = self
+                .get_model_release(&lock.model_id, &lock.version)
+                .await?;
+            if release.digest != lock.release_sha256
+                || release.project_revision != lock.project_revision
+            {
                 return Err(RepositoryError::Corrupt);
             }
             guidance.push(DependencyGuidance {
-                name: lock.name.clone(),
+                model_id: lock.model_id.clone(),
                 version: lock.version.clone(),
+                project_revision: lock.project_revision.clone(),
                 release_sha256: lock.release_sha256.clone(),
-                guidance: release.guidance.clone(),
-                documentation: release.docs.iter().map(|doc| doc.path.clone()).collect(),
             });
         }
         Ok(guidance)
@@ -882,6 +858,17 @@ impl Repository {
             validate_name(name)?;
         }
         let _guard = self.mutations.lock().await;
+        self.edit_project_locked(model_id, expected_revision, name, edit)
+            .await
+    }
+
+    pub(super) async fn edit_project_locked(
+        &self,
+        model_id: &str,
+        expected_revision: &str,
+        name: Option<&str>,
+        edit: Option<&ProjectEdit>,
+    ) -> Result<EditedModel, RepositoryError> {
         let loaded = self.get_model(model_id).await?;
         if loaded.record.desired_source_revision != expected_revision {
             return Err(RepositoryError::Conflict);
@@ -901,20 +888,12 @@ impl Repository {
                 resolved_edit.dependency_guidance = self.dependency_guidance(locks).await?;
             }
             let next = project.apply(&resolved_edit)?;
+            self.validate_project_closure(model_id, next.clone())
+                .await?;
             let revision = next.digest()?;
             self.put_immutable(
                 &project_key(model_id, &revision),
                 Bytes::from(next.canonical_bytes()?),
-            )
-            .await?;
-            let entrypoint = next
-                .files
-                .iter()
-                .find(|file| file.path == next.entrypoint)
-                .ok_or(RepositoryError::Corrupt)?;
-            self.put_immutable(
-                &super::source_key(model_id, &revision),
-                Bytes::copy_from_slice(entrypoint.content.as_bytes()),
             )
             .await?;
             record.desired_source_revision = revision;
@@ -973,7 +952,7 @@ mod tests {
             hex_digest(Sha256::digest(b"a\n"))
         );
         let bytes = left.canonical_bytes().expect("canonical");
-        assert!(bytes.starts_with(b"{\"format\":\"faktory-project-v1\",\"entrypoint\":"));
+        assert!(bytes.starts_with(b"{\"format\":\"faktory-project-v2\",\"entrypoint\":"));
         assert!(bytes.ends_with(b"\n"));
     }
 
@@ -990,7 +969,7 @@ mod tests {
         .expect("project");
         assert_eq!(
             project.agents_md().expect("agents"),
-            "# Index\n\nEntrypoint: \"main.py\"\n\n- \"AGENTS.md\"\n- \"main.py\"\n\n# Dependency Guidance\n\nNo shared libraries are locked.\n\n# Hints\n\n"
+            "# Index\n\nEntrypoint: \"main.py\"\n\n- \"AGENTS.md\"\n- \"main.py\"\n\n# Dependency Guidance\n\nNo model dependencies are locked.\n\n# Hints\n\n"
         );
     }
 

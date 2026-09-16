@@ -2,9 +2,9 @@
 
 Read [the documentation index](docs/README.md) and the nearest contract before changing behavior. Keep source and generated protocol bindings in the same change.
 
-The implemented model-project hard cutover is defined by [Model Projects and Shared Libraries](docs/architecture/model-projects-libraries.md) and [Object-Store Migrations](docs/operations/object-store-migrations.md). Preserve its bulk MCP contracts, agent-oriented virtual workspace, canonical bundle, shared-library rollout, and legacy migration together. Do not reintroduce a singular-source schema. Workspace tools must remain views and transactions over canonical objects, not OS filesystem or arbitrary object-store access. This behavior adds no protobuf fields, HTTP source route, or browser source interface.
+The implemented hard cutover is defined by [Model Projects and Dependencies](docs/architecture/model-projects-dependencies.md) and [Object-Store Migrations](docs/operations/object-store-migrations.md). Preserve v2 bundles, model releases, exact transitive closure, compatible rollout, and destructive migration `0002` together. Do not reintroduce singular-source schemas or compatibility for deleted product data. Workspace tools remain transactions over canonical objects, not OS filesystem or arbitrary object-store access. The contract adds no protobuf dependency fields, HTTP source route, or browser source interface.
 
-The approved multipart result contract is defined by [Multipart Design Bundles](docs/architecture/design-bundles.md), with storage and protocol details in the linked architecture documents. It is under implementation on this branch. Preserve project revision identity, exact locks, source confidentiality, current-only artifact gates, retained-last-good behavior, and all-output atomicity. Keep legacy result types and revisions as one synthetic primary output without destructive migration.
+The implemented multipart result contract is defined by [Multipart Design Bundles](docs/architecture/design-bundles.md), with storage and protocol details in the linked architecture documents. Preserve project revision identity, exact locks, source confidentiality, current-only artifact gates, retained-last-good behavior, and all-output atomicity. Direct CadQuery result types remain valid. Migration `0002` deletes all pre-cutover revisions instead of preserving storage compatibility.
 
 ## Toolchains
 
@@ -94,11 +94,11 @@ docker run --rm --entrypoint /bin/sh faktory-renderer-verify:local -c '
 set -eu
 output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
 trap '\''rm -rf "$output_dir"'\'' EXIT
-mkdir "$output_dir/libraries"
+mkdir "$output_dir/models"
 /opt/faktory/env/bin/python -m renderer \
   /opt/faktory/renderer/examples/constraint_bench \
   main.py \
-  "$output_dir/libraries" \
+  "$output_dir/models" \
   "$output_dir/bundle"
 /opt/faktory/env/bin/python -c '\''
 import json
