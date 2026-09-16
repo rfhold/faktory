@@ -1,5 +1,7 @@
 //! MCP tools over the same repository and render queue.
 
+mod workspace;
+
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -102,6 +104,49 @@ impl FaktoryMcp {
         }
     }
 
+    #[tool(name = "model.open", definition = model_open_definition())]
+    async fn model_open(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
+        let input: ModelIdInput = parse(call)?;
+        match workspace::model_open(&self.repository, &input.model_id).await {
+            Ok(output) => Ok(result(output)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "model.read", definition = model_read_definition())]
+    async fn model_read(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
+        let input: ModelReadInput = parse(call)?;
+        match workspace::model_read(&self.repository, &input).await {
+            Ok(output) => Ok(result(output)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "model.glob", definition = model_glob_definition())]
+    async fn model_glob(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
+        let input: ModelGlobInput = parse(call)?;
+        match workspace::model_glob(
+            &self.repository,
+            &input.model_id,
+            &input.pattern,
+            input.revision.as_deref(),
+        )
+        .await
+        {
+            Ok(output) => Ok(result(output)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "model.grep", definition = model_grep_definition())]
+    async fn model_grep(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
+        let input: ModelGrepInput = parse(call)?;
+        match workspace::model_grep(&self.repository, &input).await {
+            Ok(output) => Ok(result(output)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
     #[tool(name = "model.inspect", definition = model_inspect_definition())]
     async fn model_inspect(
         &self,
@@ -164,6 +209,19 @@ impl FaktoryMcp {
         }
     }
 
+    #[tool(name = "model.apply_patch", definition = model_apply_patch_definition())]
+    async fn model_apply_patch(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: ApplyPatchInput = parse(call)?;
+        match apply_patch_and_schedule(self.repository.clone(), self.renders.clone(), input).await {
+            Ok(output) => Ok(result(output)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
     #[tool(name = "library.list", definition = library_list_definition())]
     async fn library_list(
         &self,
@@ -192,6 +250,32 @@ impl FaktoryMcp {
             Ok(release) => Ok(result(
                 json!({ "release": library_release_value(&release) }),
             )),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "library.open", definition = library_open_definition())]
+    async fn library_open(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: LibraryGetInput = parse(call)?;
+        match workspace::library_open(&self.repository, &input.name, &input.version).await {
+            Ok(output) => Ok(result(output)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    #[tool(name = "library.read", definition = library_read_definition())]
+    async fn library_read(
+        &self,
+        call: McpToolCall,
+        _: ServerContext,
+    ) -> ServerResult<McpToolResult> {
+        let input: LibraryReadInput = parse(call)?;
+        match workspace::library_read(&self.repository, &input).await {
+            Ok(output) => Ok(result(output)),
             Err(error) => Ok(tool_error(error)),
         }
     }
@@ -517,6 +601,41 @@ async fn edit_and_schedule(
     join_scheduled(&repository, task).await
 }
 
+async fn apply_patch_and_schedule(
+    repository: Repository,
+    renders: RenderQueue,
+    input: ApplyPatchInput,
+) -> Result<Value, RepositoryError> {
+    let parsed = workspace::parse_patch(&input.patch)?;
+    let project = ProjectEdit::new(parsed.operations)?;
+    let previous_revision = input.expected_revision.clone();
+    let reservation = renders.reserve().await?;
+    let task_repository = repository.clone();
+    let task = tokio::spawn(async move {
+        let edited = task_repository
+            .edit_project(
+                &input.model_id,
+                &input.expected_revision,
+                None,
+                Some(&project),
+            )
+            .await?;
+        debug_assert!(edited.source_changed);
+        reservation.submit(
+            edited.record.id.clone(),
+            edited.record.desired_source_revision.clone(),
+        );
+        Ok(json!({
+            "model": edited.record,
+            "previous_revision": previous_revision,
+            "new_revision": edited.record.desired_source_revision,
+            "changed_paths": parsed.changed_paths,
+            "renders_scheduled": 1
+        }))
+    });
+    join_scheduled(&repository, task).await
+}
+
 async fn publish_and_rollout(
     repository: Repository,
     renders: RenderQueue,
@@ -635,6 +754,45 @@ struct ModelIdInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ModelReadInput {
+    model_id: String,
+    path: String,
+    revision: Option<String>,
+    #[serde(default = "default_line_offset")]
+    offset: usize,
+    #[serde(default = "default_read_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelGlobInput {
+    model_id: String,
+    pattern: String,
+    revision: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelGrepInput {
+    model_id: String,
+    pattern: String,
+    include: Option<String>,
+    revision: Option<String>,
+    #[serde(default = "default_grep_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyPatchInput {
+    model_id: String,
+    expected_revision: String,
+    patch: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmptyInput {}
 
 #[derive(Deserialize)]
@@ -681,6 +839,30 @@ struct EditInput {
 struct LibraryGetInput {
     name: String,
     version: Version,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryReadInput {
+    name: String,
+    version: Version,
+    path: String,
+    #[serde(default = "default_line_offset")]
+    offset: usize,
+    #[serde(default = "default_read_limit")]
+    limit: usize,
+}
+
+const fn default_line_offset() -> usize {
+    1
+}
+
+const fn default_read_limit() -> usize {
+    workspace::DEFAULT_READ_LIMIT
+}
+
+const fn default_grep_limit() -> usize {
+    workspace::DEFAULT_GREP_LIMIT
 }
 
 #[derive(Deserialize)]
@@ -818,6 +1000,82 @@ fn model_get_definition() -> McpToolDefinition {
         "Get model metadata and the complete canonical desired-revision project, including every file (including generated AGENTS.md), the entrypoint, direct dependency requirements, and exact server-controlled locks. This is the hard-cutover multi-file contract; no legacy source field is returned.",
         true,
         model_id_schema(),
+    )
+}
+fn model_open_definition() -> McpToolDefinition {
+    definition(
+        "model.open",
+        "Open the desired model project with model metadata, revision identity, entrypoint, requirements, locks, a content-hash file index, and the full generated AGENTS.md. Other file bodies are omitted.",
+        true,
+        model_id_schema(),
+    )
+}
+fn model_read_definition() -> McpToolDefinition {
+    definition(
+        "model.read",
+        "Read a bounded line range from one file in the desired or an exact immutable model revision. The response identifies the actual revision used.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "model_id": model_id_property(),
+                "path": project_read_path_schema(),
+                "revision": revision_schema("Optional exact immutable revision; defaults to the current desired revision."),
+                "offset": line_offset_schema(),
+                "limit": read_limit_schema()
+            },
+            "required": ["model_id", "path"],
+            "additionalProperties": false
+        }),
+    )
+}
+fn model_glob_definition() -> McpToolDefinition {
+    definition(
+        "model.glob",
+        "Discover at most 1000 matching paths in the desired or an exact immutable model revision using an ASCII glob.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "model_id": model_id_property(),
+                "pattern": {
+                    "type": "string", "minLength": 1, "maxLength": workspace::MAX_PATTERN_BYTES,
+                    "description": "ASCII glob matched against complete relative POSIX project paths. '*', '?', and character classes do not cross '/'; valid '**' forms recursively match path components."
+                },
+                "revision": revision_schema("Optional exact immutable revision; defaults to the current desired revision.")
+            },
+            "required": ["model_id", "pattern"],
+            "additionalProperties": false
+        }),
+    )
+}
+fn model_grep_definition() -> McpToolDefinition {
+    definition(
+        "model.grep",
+        "Search UTF-8 project lines with a bounded linear-time Rust regular expression in the desired or an exact immutable revision.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "model_id": model_id_property(),
+                "pattern": {
+                    "type": "string", "minLength": 1,
+                    "description": "Rust regex pattern, limited to 1024 UTF-8 bytes."
+                },
+                "include": {
+                    "type": "string", "minLength": 1, "maxLength": workspace::MAX_PATTERN_BYTES,
+                    "description": "Optional ASCII glob restricting searched project paths. '*', '?', and character classes do not cross '/'; valid '**' forms recursively match path components."
+                },
+                "revision": revision_schema("Optional exact immutable revision; defaults to the current desired revision."),
+                "limit": {
+                    "type": "integer", "minimum": 1, "maximum": workspace::MAX_GREP_LIMIT,
+                    "default": workspace::DEFAULT_GREP_LIMIT,
+                    "description": "Maximum matches returned; each matching line is limited to 2000 UTF-8 bytes."
+                }
+            },
+            "required": ["model_id", "pattern"],
+            "additionalProperties": false
+        }),
     )
 }
 fn model_inspect_definition() -> McpToolDefinition {
@@ -960,6 +1218,28 @@ fn model_edit_definition() -> McpToolDefinition {
     )
 }
 
+fn model_apply_patch_definition() -> McpToolDefinition {
+    definition(
+        "model.apply_patch",
+        "Conditionally and atomically apply one stripped file patch envelope to caller-owned project files. The complete envelope is parsed first; every hunk must match exactly once in one project transaction, and exactly one render is scheduled on success.",
+        false,
+        json!({
+            "type": "object",
+            "properties": {
+                "model_id": model_id_property(),
+                "expected_revision": revision_schema("Exact desired project revision guarding the whole transaction."),
+                "patch": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "UTF-8 stripped patch envelope, limited to 1,048,576 bytes, with Begin/End Patch and ordered Add, Update, optional Move, and Delete sections. AGENTS.md is protected."
+                }
+            },
+            "required": ["model_id", "expected_revision", "patch"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn library_list_definition() -> McpToolDefinition {
     definition(
         "library.list",
@@ -981,6 +1261,35 @@ fn library_get_definition() -> McpToolDefinition {
                 "version": stable_version_schema()
             },
             "required": ["name", "version"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn library_open_definition() -> McpToolDefinition {
+    definition(
+        "library.open",
+        "Open one immutable shared-library release with exact identity, guidance, and content-hash indexes for package and documentation files, without file bodies.",
+        true,
+        library_identity_schema(),
+    )
+}
+
+fn library_read_definition() -> McpToolDefinition {
+    definition(
+        "library.read",
+        "Read a bounded line range from one package or documentation file in an exact immutable shared-library release.",
+        true,
+        json!({
+            "type": "object",
+            "properties": {
+                "name": library_name_schema(),
+                "version": stable_version_schema(),
+                "path": project_read_path_schema(),
+                "offset": line_offset_schema(),
+                "limit": read_limit_schema()
+            },
+            "required": ["name", "version", "path"],
             "additionalProperties": false
         }),
     )
@@ -1105,6 +1414,42 @@ fn project_path_schema() -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": 1024})
 }
 
+fn project_read_path_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024,
+        "description": "Strict relative ASCII POSIX file path."
+    })
+}
+
+fn revision_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$",
+        "description": description
+    })
+}
+
+fn line_offset_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "default": 1,
+        "description": "One-based starting line."
+    })
+}
+
+fn read_limit_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": workspace::MAX_READ_LIMIT,
+        "default": workspace::DEFAULT_READ_LIMIT,
+        "description": "Maximum lines returned."
+    })
+}
+
 fn exact_patches_schema() -> Value {
     json!({
         "type": "array",
@@ -1165,6 +1510,17 @@ fn stable_version_schema() -> Value {
         "type": "string",
         "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
         "description": "Exact stable SemVer MAJOR.MINOR.PATCH with no prerelease, build suffix, or leading zero."
+    })
+}
+fn library_identity_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": library_name_schema(),
+            "version": stable_version_schema()
+        },
+        "required": ["name", "version"],
+        "additionalProperties": false
     })
 }
 fn view_put_definition() -> McpToolDefinition {
@@ -2536,8 +2892,55 @@ mod tests {
         assert_eq!(inspect.input_schema["additionalProperties"], false);
 
         for definition in [
+            model_open_definition(),
+            model_read_definition(),
+            model_glob_definition(),
+            model_grep_definition(),
+            library_open_definition(),
+            library_read_definition(),
+        ] {
+            assert_eq!(definition.input_schema["additionalProperties"], false);
+            assert_eq!(
+                definition.annotations.as_ref().unwrap()["readOnlyHint"],
+                true
+            );
+        }
+        let read = model_read_definition();
+        assert_eq!(read.input_schema["properties"]["offset"]["default"], 1);
+        assert_eq!(
+            read.input_schema["properties"]["limit"]["maximum"],
+            workspace::MAX_READ_LIMIT
+        );
+        let grep = model_grep_definition();
+        assert_eq!(
+            grep.input_schema["properties"]["limit"]["maximum"],
+            workspace::MAX_GREP_LIMIT
+        );
+        assert_eq!(grep.input_schema["properties"]["pattern"]["minLength"], 1);
+        assert!(
+            grep.input_schema["properties"]["pattern"]
+                .get("maxLength")
+                .is_none()
+        );
+        assert_eq!(
+            model_glob_definition().input_schema["properties"]["pattern"]["maxLength"],
+            workspace::MAX_PATTERN_BYTES
+        );
+        let patch = model_apply_patch_definition();
+        assert_eq!(patch.input_schema["additionalProperties"], false);
+        assert_eq!(patch.annotations.as_ref().unwrap()["readOnlyHint"], false);
+        assert_eq!(patch.input_schema["properties"]["patch"]["minLength"], 1);
+        assert!(
+            patch.input_schema["properties"]["patch"]
+                .get("maxLength")
+                .is_none()
+        );
+
+        for definition in [
             library_list_definition(),
             library_get_definition(),
+            library_open_definition(),
+            library_read_definition(),
             library_publish_definition(),
         ] {
             assert_eq!(definition.input_schema["additionalProperties"], false);
@@ -2554,8 +2957,35 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn project_and_library_inputs_reject_unknown_nested_fields() {
         assert!(serde_json::from_value::<EmptyInput>(json!({"source": "secret"})).is_err());
+        assert!(
+            serde_json::from_value::<ModelReadInput>(json!({
+                "model_id": "part", "path": "main.py", "extra": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ApplyPatchInput>(json!({
+                "model_id": "part", "expected_revision": "0".repeat(64),
+                "patch": "*** Begin Patch\n*** End Patch", "extra": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ModelGrepInput>(json!({
+                "model_id": "part", "pattern": "é".repeat(513)
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<ApplyPatchInput>(json!({
+                "model_id": "part", "expected_revision": "0".repeat(64),
+                "patch": "é".repeat((workspace::MAX_PATCH_BYTES / 2) + 1)
+            }))
+            .is_ok()
+        );
         let minimal = serde_json::from_value::<CreateInput>(json!({
             "model_id": "part",
             "name": "Part",
@@ -2768,6 +3198,165 @@ mod tests {
                 .await,
             Err(RepositoryError::Invalid)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn model_apply_patch_is_atomic_ordered_and_schedules_one_render() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let marker = directory.path().join("renders");
+        let script = format!("printf x >> '{}'; exit 1", marker.display());
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let created = repository
+            .create_project_from_files(
+                "part",
+                "Part",
+                vec![
+                    ProjectFile {
+                        path: "main.py".to_owned(),
+                        content: "from old import value\nprint(value)".to_owned(),
+                    },
+                    ProjectFile {
+                        path: "old.py".to_owned(),
+                        content: "value = 1".to_owned(),
+                    },
+                    ProjectFile {
+                        path: "trash.txt".to_owned(),
+                        content: "remove me".to_owned(),
+                    },
+                ],
+                "main.py".to_owned(),
+                Vec::new(),
+                "",
+            )
+            .await
+            .expect("create project");
+        let queue = RenderQueue::start(
+            repository.clone(),
+            RenderConfig {
+                command: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 12,
+            },
+        )
+        .expect("render queue");
+        let output = apply_patch_and_schedule(
+            repository.clone(),
+            queue.clone(),
+            ApplyPatchInput {
+                model_id: "part".to_owned(),
+                expected_revision: created.desired_source_revision.clone(),
+                patch: "*** Begin Patch\n*** Add File: empty.txt\n*** Update File: old.py\n@@ value\n-value = 1\n+value = 2\n*** Move to: lib/value.py\n*** Update File: main.py\n@@ import\n-from old import value\n+from lib.value import value\n*** Delete File: trash.txt\n*** End Patch"
+                    .to_owned(),
+            },
+        )
+        .await
+        .expect("apply patch");
+        assert_eq!(output["previous_revision"], created.desired_source_revision);
+        assert_eq!(output["renders_scheduled"], 1);
+        assert_eq!(
+            output["changed_paths"],
+            json!([
+                "empty.txt",
+                "old.py",
+                "lib/value.py",
+                "main.py",
+                "trash.txt"
+            ])
+        );
+        let revision = output["new_revision"].as_str().unwrap();
+        let project = repository
+            .get_project("part", revision)
+            .await
+            .expect("patched project");
+        let file = |path: &str| {
+            project
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.content.as_str())
+        };
+        assert_eq!(file("empty.txt"), Some(""));
+        assert_eq!(file("lib/value.py"), Some("value = 2"));
+        assert_eq!(
+            file("main.py"),
+            Some("from lib.value import value\nprint(value)")
+        );
+        assert_eq!(file("old.py"), None);
+        assert_eq!(file("trash.txt"), None);
+
+        for _ in 0..100 {
+            if tokio::fs::read(&marker)
+                .await
+                .is_ok_and(|bytes| bytes == b"x")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"x");
+
+        let held_reservation = queue.reserve().await.expect("hold queue capacity");
+        let malformed = tokio::time::timeout(
+            Duration::from_millis(100),
+            apply_patch_and_schedule(
+                repository.clone(),
+                queue.clone(),
+                ApplyPatchInput {
+                    model_id: "part".to_owned(),
+                    expected_revision: revision.to_owned(),
+                    patch: "*** Begin Patch\n*** Update File: main.py\n@@ \t\n-old\n+new\n*** End Patch"
+                        .to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("malformed hunk rejected before queue reservation");
+        assert_eq!(malformed.err(), Some(RepositoryError::Invalid));
+        drop(held_reservation);
+
+        for (expected_revision, patch) in [
+            (
+                revision.to_owned(),
+                "*** Begin Patch\n*** Add File: staged.txt\n+staged\n*** Update File: main.py\n@@ bad\n-missing\n+replacement\n*** End Patch",
+            ),
+            (
+                created.desired_source_revision,
+                "*** Begin Patch\n*** Add File: stale.txt\n+stale\n*** End Patch",
+            ),
+            (
+                revision.to_owned(),
+                "*** Begin Patch\n*** Add File: transient.txt\n+value\n*** Delete File: transient.txt\n*** End Patch",
+            ),
+        ] {
+            assert!(
+                apply_patch_and_schedule(
+                    repository.clone(),
+                    queue.clone(),
+                    ApplyPatchInput {
+                        model_id: "part".to_owned(),
+                        expected_revision,
+                        patch: patch.to_owned(),
+                    },
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                repository
+                    .get_model("part")
+                    .await
+                    .expect("model")
+                    .record
+                    .desired_source_revision,
+                revision
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(tokio::fs::read(marker).await.unwrap(), b"x");
     }
 
     #[tokio::test]

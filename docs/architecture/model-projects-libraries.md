@@ -64,9 +64,9 @@ Documentation through MCP library.get:
 <normalized user hints>
 ```
 
-## MCP Model Cutover
+## MCP Project Tools
 
-The hard cutover retains the `model.create`, `model.get`, and `model.edit` names but removes every singular `source` and source-patch schema:
+The hard cutover retains the bulk `model.create`, `model.get`, and `model.edit` contracts. It removes every singular `source` and source-patch schema:
 
 - `model.create` requires `model_id`, `name`, `files`, and `entrypoint`. Each file has `path` and `content`. Optional `requirements` and `hints` default to an empty array and empty string. Faktory resolves each supplied requirement and writes exact locks before calculating the revision.
 - `model.get` accepts only `model_id`. It returns complete model metadata and the complete canonical desired-revision project: every file with its content, the generated `AGENTS.md`, entrypoint, requirements, and exact locks.
@@ -74,7 +74,50 @@ The hard cutover retains the `model.create`, `model.get`, and `model.edit` names
 
 Operations apply sequentially to the desired project. An exact patch has non-empty `old` text that must match exactly once at its step; patches within an operation also apply sequentially. Add rejects an existing path, delete rejects a missing path or the active entrypoint, and rename rejects a missing source or existing destination. The complete result must pass path, entrypoint, dependency, AGENTS, and size validation and must differ from the prior project. `expected_revision` guards the whole edit. A name-only edit retains its existing metadata-only behavior.
 
-Creation, retrieval, editing, library operations, and source-bearing errors remain confidential to authorized MCP callers. Model list and inspect tools, browser gRPC-web, watches, protobuf records, logs, telemetry, and HTTP artifacts never contain project files, AGENTS content, requirements guidance, or library source.
+The agent-oriented tools add bounded filesystem ergonomics over the same immutable project revisions:
+
+- `model.open(model_id)` opens the current desired revision. It returns model metadata, revision, entrypoint, requirements, exact locks, full generated `AGENTS.md`, and a file index. Each index entry contains the path, UTF-8 byte size, and lowercase SHA-256. Other file bodies are absent.
+- `model.read(model_id, path, revision?, offset?, limit?)` reads one file from an exact revision. Omitted `revision` selects the desired revision. `offset` is a one-based line number and defaults to 1. `limit` defaults to 200 and permits 1 through 2,000 lines. The response contains the actual revision, path, content, start line, total line count, and truncation flag. A start at one line past the end returns empty content; a later start is invalid.
+- `model.glob(model_id, pattern, revision?)` matches complete relative POSIX paths in canonical order. The glob must contain 1 through 1,024 ASCII bytes. `*`, `?`, and character classes do not cross `/`; valid `**` forms recursively match path components. The response returns at most 1,000 paths and reports truncation.
+- `model.grep(model_id, pattern, include?, revision?, limit?)` uses the linear-time Rust regex syntax over UTF-8 logical lines. The regex must contain 1 through 1,024 UTF-8 bytes. Runtime validation enforces this byte limit. The JSON Schema omits `maxLength` because that keyword measures characters. The optional `include` uses the same ASCII path glob contract, including recursive `**` forms. The result limit defaults to 100 and permits 1 through 1,000 matches. Results follow canonical file and line order. Each result contains a path, one-based line, line text without its LF, and a text-truncation flag. Line text stops at a UTF-8 boundary within 2,000 bytes. The response also reports result-set truncation.
+
+Agents use `model.open` first. Its revision guards later reads and mutations, while its `AGENTS.md` supplies project and dependency guidance. Agents use `model.read`, `model.glob`, and `model.grep` for bounded discovery. They use `model.apply_patch` for atomic source-tree changes. They use `model.edit` for names, entrypoints, dependency replacement, Hints, or structured file operations. They use `model.get` only when they need the complete project body.
+
+### Stripped Patch Transaction
+
+`model.apply_patch` requires exactly `model_id`, `expected_revision`, and `patch`. `expected_revision` must equal the current desired revision. A stale value returns a retry-enabled conflict and leaves the model unchanged. The UTF-8 patch must contain 1 through 1,048,576 bytes and must not contain CR or NUL. Runtime validation enforces this byte limit. The JSON Schema omits `maxLength` because that keyword measures characters.
+
+The patch uses this stripped envelope:
+
+```text
+*** Begin Patch
+*** Add File: notes.txt
++first line
++
+*** Update File: main.py
+@@ optional label
+ unchanged context
+-old text
++new text
+*** Move to: src/main.py
+*** Delete File: obsolete.txt
+*** End Patch
+```
+
+The first and last markers are exact. One optional final LF terminates the envelope but does not alter file content. Each section executes in envelope order:
+
+- `*** Add File: <path>` creates a missing file. Every content line must start with `+`; Faktory removes that prefix and joins lines with LF. No content lines create an empty file. A final empty `+` line preserves a file-final LF.
+- `*** Update File: <path>` requires one or more `@@` hunks, a `*** Move to: <path>`, or both. A hunk header is `@@` or `@@ <label>`; the label has no matching effect. Context, removal, and addition lines start with space, `-`, and `+`. Each hunk must change text and must contain non-empty old text.
+- `*** Move to: <path>` follows its update section. It renames the post-hunk file and can serve as a rename-only update.
+- `*** Delete File: <path>` deletes an existing non-entrypoint file and has no body.
+
+Each hunk's complete old text must match exactly once at that step. Faktory applies hunks and sections in order, so later matches see earlier changes. The syntax adds no implicit file-final newline. Add sections represent one with a final empty `+` line; update hunks include it in their exact text.
+
+Every path uses the canonical project path rules, and no section can target `AGENTS.md`. Faktory parses the complete envelope before mutation. It then applies all operations to one project transaction and validates the final canonical bundle. Any malformed section, missing or ambiguous hunk, path conflict, stale revision, invalid final project, or project-level no-op leaves the model unchanged. Invalid and no-op patches return `invalid_argument`; stale revisions return `conflict`.
+
+A success regenerates managed `AGENTS.md`, creates one immutable project revision, advances the desired revision, and schedules exactly one render. The output contains the updated model, previous and new revisions, ordered changed paths, and `renders_scheduled: 1`.
+
+All tool input objects reject unknown fields, including nested project operations and exact patches. Creation, discovery, retrieval, editing, and source-bearing errors remain confidential to authorized MCP callers. Model list and inspect tools, browser gRPC-web, watches, protobuf records, logs, telemetry, and HTTP artifacts never contain project files, AGENTS content, requirements guidance, or library source.
 
 ## Shared Library Releases
 
@@ -92,7 +135,15 @@ Faktory provides no external dependency declaration, installation, or resolution
 
 The only accepted model requirement syntax is `>=MAJOR.MINOR.PATCH,<NEXT_MAJOR.0.0`, with no whitespace, where `NEXT_MAJOR` is `MAJOR + 1`. The lower bound records the oldest compatible API the model accepts. Each lock records the selected exact version and release SHA-256. Initial resolution and explicit dependency edits select the highest published compatible version, then store it in the bundle. Rendering imports only those locked releases and never consults the mutable release catalog.
 
-MCP-only `library.list`, `library.get`, and `library.publish` tools expose release metadata and authorized source, guidance, and docs. Publication validates package namespace, canonical bytes, stable SemVer, version uniqueness, direct-only imports, and compatibility policy. There is no browser, protobuf, HTTP artifact, deletion, or yank API for libraries.
+MCP-only library tools preserve the bulk catalog, retrieval, and publication contracts:
+
+- `library.list()` returns catalog metadata only: names, import packages, and stable versions.
+- `library.get(name, version)` returns one complete immutable release with identity, guidance, docs, and package file bodies.
+- `library.publish(...)` validates package namespace, canonical bytes, stable SemVer, version uniqueness, direct-only imports, and compatibility policy.
+- `library.open(name, version)` returns the exact identity and guidance plus content-hash indexes for docs and package files. Each index entry contains path, UTF-8 byte size, and lowercase SHA-256. It omits all doc and package bodies.
+- `library.read(name, version, path, offset?, limit?)` reads one doc or package file from that exact immutable release. Line slicing and output fields match `model.read`; the response also contains name, version, and release SHA-256. No mutable-library default exists.
+
+Agents use `library.open` before selective `library.read` calls. They use `library.get` only when they need the complete release body. All library inputs reject unknown fields. There is no browser, protobuf, HTTP artifact, mutation, deletion, or yank API for published releases.
 
 ## Compatible Rollout
 
@@ -104,4 +155,4 @@ The rollout records a per-model terminal outcome and can resume after restart wi
 
 ## Exclusions
 
-This contract adds no browser source UI, protobuf fields, library yanking or deletion, prerelease versions, external dependency management, hostile-code sandbox, or multi-replica coordination. The trusted-source and source-confidentiality boundaries remain in force.
+These MCP tools are views and transactions over canonical project and release objects. They do not add a second storage model, OS filesystem access, or arbitrary object-key access. They add no HTTP, protobuf, or browser source exposure. They add no library mutation, yanking, deletion, prerelease versions, external dependency management, hostile-code sandbox, or multi-replica coordination. The trusted-source and source-confidentiality boundaries remain in force.

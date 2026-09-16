@@ -2,7 +2,7 @@
 
 Read [the documentation index](docs/README.md) and the nearest contract before changing behavior. Keep source and generated protocol bindings in the same change.
 
-The implemented model-project hard cutover is defined by [Model Projects and Shared Libraries](docs/architecture/model-projects-libraries.md) and [Object-Store Migrations](docs/operations/object-store-migrations.md). Preserve its MCP schema replacement, canonical bundle, shared-library rollout, and legacy migration together; do not reintroduce a singular-source schema. This behavior adds no protobuf fields or browser source interface.
+The implemented model-project hard cutover is defined by [Model Projects and Shared Libraries](docs/architecture/model-projects-libraries.md) and [Object-Store Migrations](docs/operations/object-store-migrations.md). Preserve its bulk MCP contracts, agent-oriented virtual workspace, canonical bundle, shared-library rollout, and legacy migration together. Do not reintroduce a singular-source schema. Workspace tools must remain views and transactions over canonical objects, not OS filesystem or arbitrary object-store access. This behavior adds no protobuf fields, HTTP source route, or browser source interface.
 
 ## Toolchains
 
