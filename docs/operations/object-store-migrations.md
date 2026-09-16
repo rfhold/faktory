@@ -4,6 +4,8 @@
 
 Object-store migrations convert durable repository formats before normal runtime code reads them. They do not authorize a live migration. The first migration converts legacy one-file model revisions into the canonical project bundles defined by [`../architecture/model-projects-libraries.md`](../architecture/model-projects-libraries.md).
 
+The multipart output contract does not add a destructive migration. [`../architecture/design-bundles.md`](../architecture/design-bundles.md) and the compatibility rules below define how the repository interprets revisions without an output manifest.
+
 ## Framework and Ordering
 
 Each migration is one source module with one permanent identifier matching `^[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*$` and one description. The legacy conversion is `0001-model-project-bundles`. A single compile-time registry lists modules in ascending numeric-prefix order. Identifiers are never reused, reordered, or removed. The one server process is the sole migration owner. At startup it reads the durable migration ledger, rejects an unknown completed identifier or a binary older than the ledger, and runs every missing migration in order.
@@ -25,6 +27,12 @@ The legacy migration performs these steps for each model in deterministic model-
 7. After every model checkpoint is complete and verified, mark the migration complete. Normal repository validation and render reconciliation may then start.
 
 Orphaned immutable legacy objects are inventoried but do not become selectable. Existing legacy objects, backups, and source files are never deleted. Copy collisions accept byte-identical objects and fail closed on different bytes. On restart, the migration recognizes both legacy and already-migrated model metadata and verifies the durable backup and revision mapping before continuing. A failed model leaves either its original metadata or its fully written migrated metadata authoritative; no partial metadata object is accepted. No migration queues a render merely to convert storage.
+
+## Multipart Manifest Compatibility
+
+A project revision that lacks `outputs.json` is a valid legacy artifact revision when its required fixed-key serving set passes current validation. The repository exposes that set as one synthetic primary output with ID `primary`, role `assembly`, and the recorded legacy facts. Primary HTTP aliases, output-aware routes for `primary`, technical inspection, canonical shaded inspection when present, and named-view renders all select those fixed keys.
+
+The repository returns not found for every other output ID on that revision. Startup does not create `outputs.json`, copy fixed keys into `outputs/primary/`, alter metadata, enqueue a render, or delete an object. A later successful project revision writes only the multipart layout. Current-successful advancement then switches the complete selectable set atomically.
 
 ## Last-Good and Retry Behavior
 

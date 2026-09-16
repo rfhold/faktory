@@ -14,7 +14,8 @@ use std::{
 
 use bytes::Bytes;
 use faktory_proto::v1::{
-    Model, ModelGeometryFacts, NamedView, Projection, Quaternion, RenderState, Vector3,
+    Model, ModelGeometryFacts, ModelOutputSummary, NamedView, OutputRole, Projection, Quaternion,
+    RenderState, Vector3,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
@@ -89,6 +90,8 @@ pub struct ModelRecord {
     pub render_error: String,
     pub default_view_id: String,
     pub current_successful_facts: Option<GeometryFactsRecord>,
+    #[serde(default)]
+    pub current_successful_outputs: Vec<ModelOutputSummaryRecord>,
     pub updated_at: TimestampRecord,
 }
 
@@ -113,17 +116,107 @@ impl ModelRecord {
                 .current_successful_facts
                 .map(GeometryFactsRecord::to_proto),
             updated_at: Some(self.updated_at.to_proto()),
+            current_successful_outputs: self
+                .effective_outputs()
+                .iter()
+                .map(ModelOutputSummaryRecord::to_proto)
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn effective_outputs(&self) -> Vec<ModelOutputSummaryRecord> {
+        if self.current_successful_outputs.is_empty() {
+            self.current_successful_facts
+                .map_or_else(Vec::new, |facts| {
+                    vec![ModelOutputSummaryRecord {
+                        output_id: "primary".to_owned(),
+                        role: OutputRoleRecord::Assembly,
+                        primary: true,
+                        facts,
+                    }]
+                })
+        } else {
+            self.current_successful_outputs.clone()
+        }
+    }
+
+    pub fn primary_output(&self) -> Result<ModelOutputSummaryRecord, RepositoryError> {
+        self.effective_outputs()
+            .into_iter()
+            .find(|output| output.primary)
+            .ok_or(RepositoryError::NotFound)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputRoleRecord {
+    Assembly,
+    Part,
+    Tool,
+}
+
+impl OutputRoleRecord {
+    const fn to_proto(self) -> OutputRole {
+        match self {
+            Self::Assembly => OutputRole::Assembly,
+            Self::Part => OutputRole::Part,
+            Self::Tool => OutputRole::Tool,
         }
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOutputSummaryRecord {
+    pub output_id: String,
+    pub role: OutputRoleRecord,
+    pub primary: bool,
+    pub facts: GeometryFactsRecord,
+}
+
+impl ModelOutputSummaryRecord {
+    fn to_proto(&self) -> ModelOutputSummary {
+        ModelOutputSummary {
+            output_id: self.output_id.clone(),
+            role: self.role.to_proto().into(),
+            primary: self.primary,
+            facts: Some(self.facts.to_proto()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputManifest {
+    pub format: String,
+    pub outputs: Vec<ModelOutputSummaryRecord>,
+}
+
+impl OutputManifest {
+    pub const FORMAT: &'static str = "faktory-outputs-v1";
+
+    pub fn canonical_bytes(&self) -> Result<Bytes, RepositoryError> {
+        let mut bytes = serde_json::to_vec(self).map_err(|_| RepositoryError::Corrupt)?;
+        bytes.push(b'\n');
+        Ok(Bytes::from(bytes))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub struct RenderedOutput {
+pub struct RenderedModelOutput {
+    pub summary: ModelOutputSummaryRecord,
     pub glb: Bytes,
     pub preview: Bytes,
-    pub facts: GeometryFactsRecord,
     pub projections: TechnicalProjectionImages,
-    pub shaded: ShadedProjectionImages,
+    pub shaded: Option<ShadedProjectionImages>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderedOutput {
+    pub manifest: Bytes,
+    pub outputs: Vec<RenderedModelOutput>,
 }
 
 pub type ShadedProjectionImages = TechnicalProjectionImages;
@@ -131,6 +224,7 @@ pub type ShadedProjectionImages = TechnicalProjectionImages;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ViewRenderIdentity {
     pub revision: String,
+    pub output_id: String,
     pub view_id: String,
     pub view_etag: String,
 }
@@ -599,33 +693,53 @@ impl Repository {
         revision: &str,
         output: RenderedOutput,
     ) -> Result<(), RepositoryError> {
-        validate_geometry_facts(output.facts)?;
+        let summaries = validate_rendered_output(&output)?;
+        let primary = summaries
+            .iter()
+            .find(|summary| summary.primary)
+            .ok_or(RepositoryError::Corrupt)?;
         let _guard = self.mutations.lock().await;
         validate_revision(revision)?;
         let preflight = self.get_model(model_id).await?;
-        if !can_complete_render(&preflight.record, revision, output.facts) {
+        if !can_complete_render(&preflight.record, revision, &summaries) {
             return Ok(());
         }
-        self.put_immutable(&geometry_key(model_id, revision), output.glb.clone())
-            .await?;
-        self.put_immutable(&preview_key(model_id, revision), output.preview.clone())
-            .await?;
-        for projection in TechnicalProjection::ALL {
+        self.put_immutable(
+            &outputs_manifest_key(model_id, revision),
+            output.manifest.clone(),
+        )
+        .await?;
+        for rendered in &output.outputs {
+            let output_id = &rendered.summary.output_id;
             self.put_immutable(
-                &projection_key(model_id, revision, projection),
-                output.projections.get(projection).clone(),
+                &output_geometry_key(model_id, revision, output_id),
+                rendered.glb.clone(),
             )
             .await?;
-        }
-        for projection in TechnicalProjection::ALL {
             self.put_immutable(
-                &shaded_projection_key(model_id, revision, projection),
-                output.shaded.get(projection).clone(),
+                &output_preview_key(model_id, revision, output_id),
+                rendered.preview.clone(),
             )
             .await?;
+            for projection in TechnicalProjection::ALL {
+                self.put_immutable(
+                    &output_projection_key(model_id, revision, output_id, projection),
+                    rendered.projections.get(projection).clone(),
+                )
+                .await?;
+            }
+            if let Some(shaded) = &rendered.shaded {
+                for projection in TechnicalProjection::ALL {
+                    self.put_immutable(
+                        &output_shaded_projection_key(model_id, revision, output_id, projection),
+                        shaded.get(projection).clone(),
+                    )
+                    .await?;
+                }
+            }
         }
         let loaded = self.get_model(model_id).await?;
-        if !can_complete_render(&loaded.record, revision, output.facts) {
+        if !can_complete_render(&loaded.record, revision, &summaries) {
             return Ok(());
         }
         if loaded.record.render_state == StoredRenderState::Ready {
@@ -634,7 +748,8 @@ impl Repository {
         let mut record = loaded.record;
         record.render_state = StoredRenderState::Ready;
         record.current_successful_source_revision = revision.to_owned();
-        record.current_successful_facts = Some(output.facts);
+        record.current_successful_facts = Some(primary.facts);
+        record.current_successful_outputs = summaries;
         record.render_error.clear();
         self.save_model(&record, PutCondition::Matches(loaded.storage_etag))
             .await
@@ -683,29 +798,49 @@ impl Repository {
     }
 
     pub async fn geometry(&self, model_id: &str, revision: &str) -> Result<Bytes, RepositoryError> {
-        validate_revision(revision)?;
-        let model = self.get_model(model_id).await?.record;
-        if model.current_successful_source_revision != revision {
-            return Err(RepositoryError::NotFound);
-        }
-        Ok(self
-            .store
-            .get(&geometry_key(model_id, revision))
-            .await?
-            .bytes)
+        let model = self.current_model(model_id, revision).await?;
+        let primary = model.primary_output()?;
+        self.geometry_output(model_id, revision, &primary.output_id)
+            .await
+    }
+
+    pub async fn geometry_output(
+        &self,
+        model_id: &str,
+        revision: &str,
+        output_id: &str,
+    ) -> Result<Bytes, RepositoryError> {
+        let model = self.current_model(model_id, revision).await?;
+        resolve_output(&model, output_id)?;
+        let key = if model.current_successful_outputs.is_empty() {
+            geometry_key(model_id, revision)
+        } else {
+            output_geometry_key(model_id, revision, output_id)
+        };
+        Ok(self.store.get(&key).await?.bytes)
     }
 
     pub async fn preview(&self, model_id: &str, revision: &str) -> Result<Bytes, RepositoryError> {
-        validate_revision(revision)?;
-        let model = self.get_model(model_id).await?.record;
-        if model.current_successful_source_revision != revision {
-            return Err(RepositoryError::NotFound);
-        }
-        Ok(self
-            .store
-            .get(&preview_key(model_id, revision))
-            .await?
-            .bytes)
+        let model = self.current_model(model_id, revision).await?;
+        let primary = model.primary_output()?;
+        self.preview_output(model_id, revision, &primary.output_id)
+            .await
+    }
+
+    pub async fn preview_output(
+        &self,
+        model_id: &str,
+        revision: &str,
+        output_id: &str,
+    ) -> Result<Bytes, RepositoryError> {
+        let model = self.current_model(model_id, revision).await?;
+        resolve_output(&model, output_id)?;
+        let key = if model.current_successful_outputs.is_empty() {
+            preview_key(model_id, revision)
+        } else {
+            output_preview_key(model_id, revision, output_id)
+        };
+        Ok(self.store.get(&key).await?.bytes)
     }
 
     pub async fn projection_image(
@@ -714,16 +849,27 @@ impl Repository {
         revision: &str,
         projection: TechnicalProjection,
     ) -> Result<Bytes, RepositoryError> {
-        validate_revision(revision)?;
-        let model = self.get_model(model_id).await?.record;
-        if model.current_successful_source_revision != revision {
-            return Err(RepositoryError::NotFound);
-        }
-        Ok(self
-            .store
-            .get(&projection_key(model_id, revision, projection))
-            .await?
-            .bytes)
+        let model = self.current_model(model_id, revision).await?;
+        let primary = model.primary_output()?;
+        self.output_projection_image(model_id, revision, &primary.output_id, projection)
+            .await
+    }
+
+    pub async fn output_projection_image(
+        &self,
+        model_id: &str,
+        revision: &str,
+        output_id: &str,
+        projection: TechnicalProjection,
+    ) -> Result<Bytes, RepositoryError> {
+        let model = self.current_model(model_id, revision).await?;
+        resolve_output(&model, output_id)?;
+        let key = if model.current_successful_outputs.is_empty() {
+            projection_key(model_id, revision, projection)
+        } else {
+            output_projection_key(model_id, revision, output_id, projection)
+        };
+        Ok(self.store.get(&key).await?.bytes)
     }
 
     pub async fn shaded_projection_image(
@@ -732,16 +878,27 @@ impl Repository {
         revision: &str,
         projection: TechnicalProjection,
     ) -> Result<Bytes, RepositoryError> {
+        let model = self.current_model(model_id, revision).await?;
+        let primary = model.primary_output()?;
+        let key = if model.current_successful_outputs.is_empty() {
+            shaded_projection_key(model_id, revision, projection)
+        } else {
+            output_shaded_projection_key(model_id, revision, &primary.output_id, projection)
+        };
+        Ok(self.store.get(&key).await?.bytes)
+    }
+
+    async fn current_model(
+        &self,
+        model_id: &str,
+        revision: &str,
+    ) -> Result<ModelRecord, RepositoryError> {
         validate_revision(revision)?;
         let model = self.get_model(model_id).await?.record;
         if model.current_successful_source_revision != revision {
             return Err(RepositoryError::NotFound);
         }
-        Ok(self
-            .store
-            .get(&shaded_projection_key(model_id, revision, projection))
-            .await?
-            .bytes)
+        Ok(model)
     }
 
     pub async fn cached_view_image(
@@ -751,22 +908,34 @@ impl Repository {
     ) -> Result<Bytes, RepositoryError> {
         validate_revision(&identity.revision)?;
         validate_model_id(model_id)?;
+        validate_model_id(&identity.output_id)?;
         validate_id(&identity.view_id)?;
         validate_id(&identity.view_etag)?;
         let model = self.get_model(model_id).await?.record;
         if model.current_successful_source_revision != identity.revision {
             return Err(RepositoryError::NotFound);
         }
-        Ok(self
-            .store
-            .get(&view_render_key(
+        let primary = model.primary_output()?;
+        if primary.output_id != identity.output_id {
+            return Err(RepositoryError::NotFound);
+        }
+        let key = if model.current_successful_outputs.is_empty() {
+            view_render_key(
                 model_id,
                 &identity.revision,
                 &identity.view_id,
                 &identity.view_etag,
-            ))
-            .await?
-            .bytes)
+            )
+        } else {
+            output_view_render_key(
+                model_id,
+                &identity.revision,
+                &identity.output_id,
+                &identity.view_id,
+                &identity.view_etag,
+            )
+        };
+        Ok(self.store.get(&key).await?.bytes)
     }
 
     pub async fn complete_view_render(
@@ -777,6 +946,7 @@ impl Repository {
     ) -> Result<(), RepositoryError> {
         validate_revision(&identity.revision)?;
         validate_model_id(model_id)?;
+        validate_model_id(&identity.output_id)?;
         validate_id(&identity.view_id)?;
         validate_id(&identity.view_etag)?;
         let _guard = self.mutations.lock().await;
@@ -784,20 +954,31 @@ impl Repository {
         if model.current_successful_source_revision != identity.revision {
             return Err(RepositoryError::Conflict);
         }
+        let primary = model.primary_output()?;
+        if primary.output_id != identity.output_id {
+            return Err(RepositoryError::Conflict);
+        }
         let view = self.get_view(model_id, &identity.view_id).await?.record;
         if view.etag != identity.view_etag {
             return Err(RepositoryError::Conflict);
         }
-        self.put_immutable(
-            &view_render_key(
+        let key = if model.current_successful_outputs.is_empty() {
+            view_render_key(
                 model_id,
                 &identity.revision,
                 &identity.view_id,
                 &identity.view_etag,
-            ),
-            image,
-        )
-        .await
+            )
+        } else {
+            output_view_render_key(
+                model_id,
+                &identity.revision,
+                &identity.output_id,
+                &identity.view_id,
+                &identity.view_etag,
+            )
+        };
+        self.put_immutable(&key, image).await
     }
 
     pub async fn reconcile(&self) -> Result<Vec<(String, String)>, RepositoryError> {
@@ -882,21 +1063,66 @@ impl Repository {
             Err(error) => return Err(error),
         }
         if !model.current_successful_source_revision.is_empty() {
-            self.store
-                .get(&geometry_key(
-                    &model.id,
-                    &model.current_successful_source_revision,
-                ))
-                .await?;
-            self.store
-                .get(&preview_key(
-                    &model.id,
-                    &model.current_successful_source_revision,
-                ))
-                .await?;
+            if model.current_successful_outputs.is_empty() {
+                self.store
+                    .get(&geometry_key(
+                        &model.id,
+                        &model.current_successful_source_revision,
+                    ))
+                    .await?;
+                self.store
+                    .get(&preview_key(
+                        &model.id,
+                        &model.current_successful_source_revision,
+                    ))
+                    .await?;
+            } else {
+                self.validate_multipart_graph(model).await?;
+            }
         }
         if !model.default_view_id.is_empty() {
             self.get_view(&model.id, &model.default_view_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_multipart_graph(&self, model: &ModelRecord) -> Result<(), RepositoryError> {
+        let revision = &model.current_successful_source_revision;
+        let stored = self
+            .store
+            .get(&outputs_manifest_key(&model.id, revision))
+            .await?;
+        let manifest: OutputManifest =
+            serde_json::from_slice(&stored.bytes).map_err(|_| RepositoryError::Corrupt)?;
+        if manifest.format != OutputManifest::FORMAT
+            || manifest.outputs != model.current_successful_outputs
+            || manifest.canonical_bytes()? != stored.bytes
+        {
+            return Err(RepositoryError::Corrupt);
+        }
+        validate_output_summaries(&manifest.outputs)?;
+        for output in &manifest.outputs {
+            let output_id = &output.output_id;
+            self.store
+                .get(&output_geometry_key(&model.id, revision, output_id))
+                .await?;
+            self.store
+                .get(&output_preview_key(&model.id, revision, output_id))
+                .await?;
+            for projection in TechnicalProjection::ALL {
+                self.store
+                    .get(&output_projection_key(
+                        &model.id, revision, output_id, projection,
+                    ))
+                    .await?;
+                if output.primary {
+                    self.store
+                        .get(&output_shaded_projection_key(
+                            &model.id, revision, output_id, projection,
+                        ))
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -980,10 +1206,18 @@ pub(crate) fn validate_model_record(
         || record
             .current_successful_facts
             .is_some_and(|facts| validate_geometry_facts(facts).is_err())
+        || validate_output_summaries(&record.current_successful_outputs).is_err()
         || (record.current_successful_source_revision.is_empty()
             && record.current_successful_facts.is_some())
         || (!record.current_successful_source_revision.is_empty()
             && record.current_successful_facts.is_none())
+        || (!record.current_successful_outputs.is_empty()
+            && record.current_successful_facts
+                != record
+                    .current_successful_outputs
+                    .iter()
+                    .find(|output| output.primary)
+                    .map(|output| output.facts))
         || (record.render_state != StoredRenderState::Failed && !record.render_error.is_empty())
         || (record.render_state == StoredRenderState::Failed && record.render_error.is_empty())
         || (record.render_state == StoredRenderState::Ready
@@ -1011,7 +1245,11 @@ pub(crate) fn validate_geometry_facts(facts: GeometryFactsRecord) -> Result<(), 
     }
 }
 
-fn can_complete_render(record: &ModelRecord, revision: &str, facts: GeometryFactsRecord) -> bool {
+fn can_complete_render(
+    record: &ModelRecord,
+    revision: &str,
+    outputs: &[ModelOutputSummaryRecord],
+) -> bool {
     if record.desired_source_revision != revision {
         return false;
     }
@@ -1019,10 +1257,69 @@ fn can_complete_render(record: &ModelRecord, revision: &str, facts: GeometryFact
         StoredRenderState::Pending | StoredRenderState::Rendering => true,
         StoredRenderState::Ready => {
             record.current_successful_source_revision == revision
-                && record.current_successful_facts == Some(facts)
+                && record.current_successful_outputs == outputs
         }
         StoredRenderState::Failed => false,
     }
+}
+
+pub(crate) fn validate_output_summaries(
+    outputs: &[ModelOutputSummaryRecord],
+) -> Result<(), RepositoryError> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    if outputs.len() > 64 || outputs.iter().filter(|output| output.primary).count() != 1 {
+        return Err(RepositoryError::Corrupt);
+    }
+    let mut ids = std::collections::HashSet::with_capacity(outputs.len());
+    for output in outputs {
+        validate_model_id(&output.output_id).map_err(|_| RepositoryError::Corrupt)?;
+        validate_geometry_facts(output.facts)?;
+        if !ids.insert(&output.output_id) {
+            return Err(RepositoryError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn validate_rendered_output(
+    output: &RenderedOutput,
+) -> Result<Vec<ModelOutputSummaryRecord>, RepositoryError> {
+    if output.outputs.is_empty() || output.outputs.len() > 64 {
+        return Err(RepositoryError::Corrupt);
+    }
+    let summaries = output
+        .outputs
+        .iter()
+        .map(|output| output.summary.clone())
+        .collect::<Vec<_>>();
+    validate_output_summaries(&summaries)?;
+    for output in &output.outputs {
+        if output.summary.primary != output.shaded.is_some() {
+            return Err(RepositoryError::Corrupt);
+        }
+    }
+    let manifest = OutputManifest {
+        format: OutputManifest::FORMAT.to_owned(),
+        outputs: summaries.clone(),
+    };
+    if manifest.canonical_bytes()? != output.manifest {
+        return Err(RepositoryError::Corrupt);
+    }
+    Ok(summaries)
+}
+
+fn resolve_output(
+    model: &ModelRecord,
+    output_id: &str,
+) -> Result<ModelOutputSummaryRecord, RepositoryError> {
+    validate_model_id(output_id)?;
+    model
+        .effective_outputs()
+        .into_iter()
+        .find(|output| output.output_id == output_id)
+        .ok_or(RepositoryError::NotFound)
 }
 
 const MIN_PROTO_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
@@ -1262,6 +1559,54 @@ pub fn preview_key(model_id: &str, revision: &str) -> String {
     format!("models/{model_id}/revisions/{revision}/preview.svg")
 }
 #[must_use]
+pub fn outputs_manifest_key(model_id: &str, revision: &str) -> String {
+    format!("models/{model_id}/revisions/{revision}/outputs.json")
+}
+#[must_use]
+pub fn output_geometry_key(model_id: &str, revision: &str, output_id: &str) -> String {
+    format!("models/{model_id}/revisions/{revision}/outputs/{output_id}/model.glb")
+}
+#[must_use]
+pub fn output_preview_key(model_id: &str, revision: &str, output_id: &str) -> String {
+    format!("models/{model_id}/revisions/{revision}/outputs/{output_id}/preview.svg")
+}
+#[must_use]
+pub fn output_projection_key(
+    model_id: &str,
+    revision: &str,
+    output_id: &str,
+    projection: TechnicalProjection,
+) -> String {
+    format!(
+        "models/{model_id}/revisions/{revision}/outputs/{output_id}/projections/{}.png",
+        projection.as_str()
+    )
+}
+#[must_use]
+pub fn output_shaded_projection_key(
+    model_id: &str,
+    revision: &str,
+    output_id: &str,
+    projection: TechnicalProjection,
+) -> String {
+    format!(
+        "models/{model_id}/revisions/{revision}/outputs/{output_id}/renders/three-v2/canonical/{}.png",
+        projection.as_str()
+    )
+}
+#[must_use]
+pub fn output_view_render_key(
+    model_id: &str,
+    revision: &str,
+    output_id: &str,
+    view_id: &str,
+    etag: &str,
+) -> String {
+    format!(
+        "models/{model_id}/revisions/{revision}/outputs/{output_id}/renders/three-v2/views/{view_id}/{etag}.png"
+    )
+}
+#[must_use]
 pub fn projection_key(model_id: &str, revision: &str, projection: TechnicalProjection) -> String {
     format!(
         "models/{model_id}/revisions/{revision}/projections/{}.png",
@@ -1293,7 +1638,10 @@ const DEFAULT_RENDER_TIMEOUT: Duration = Duration::from_mins(2);
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_trait::async_trait;
 
@@ -1307,6 +1655,21 @@ mod tests {
         fail_projection_put: AtomicBool,
         fail_shaded_put: AtomicBool,
         fail_delete: AtomicBool,
+        fail_exact_put: Mutex<Option<String>>,
+        exact_put_failures: Mutex<Vec<String>>,
+    }
+
+    impl FailingStore {
+        fn fail_next_put_for(&self, key: String) {
+            *self.fail_exact_put.lock().expect("exact failure lock") = Some(key);
+        }
+
+        fn exact_put_failures(&self) -> Vec<String> {
+            self.exact_put_failures
+                .lock()
+                .expect("failure record lock")
+                .clone()
+        }
     }
 
     #[async_trait]
@@ -1325,6 +1688,22 @@ mod tests {
             bytes: Bytes,
             condition: PutCondition,
         ) -> Result<String, StorageError> {
+            let fail_exact = {
+                let mut target = self.fail_exact_put.lock().expect("exact failure lock");
+                if target.as_deref() == Some(key) {
+                    target.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if fail_exact {
+                self.exact_put_failures
+                    .lock()
+                    .expect("failure record lock")
+                    .push(key.to_owned());
+                return Err(StorageError::Unavailable);
+            }
             if key.ends_with("/model.json") && self.fail_model_put.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Unavailable);
             }
@@ -1358,9 +1737,10 @@ mod tests {
     }
 
     fn rendered(glb: &'static [u8]) -> RenderedOutput {
-        RenderedOutput {
-            glb: Bytes::from_static(glb),
-            preview: Bytes::from_static(b"<svg></svg>"),
+        let summary = ModelOutputSummaryRecord {
+            output_id: "primary".to_owned(),
+            role: OutputRoleRecord::Assembly,
+            primary: true,
             facts: GeometryFactsRecord {
                 volume_cubic_millimeters: 24.0,
                 size_millimeters: GeometrySizeRecord {
@@ -1369,9 +1749,97 @@ mod tests {
                     z: 4.0,
                 },
             },
-            projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
-            shaded: ShadedProjectionImages::all(Bytes::from_static(b"shaded-png")),
+        };
+        let manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: vec![summary.clone()],
         }
+        .canonical_bytes()
+        .expect("manifest");
+        RenderedOutput {
+            manifest,
+            outputs: vec![RenderedModelOutput {
+                summary,
+                glb: Bytes::from_static(glb),
+                preview: Bytes::from_static(b"<svg></svg>"),
+                projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+                shaded: Some(ShadedProjectionImages::all(Bytes::from_static(
+                    b"shaded-png",
+                ))),
+            }],
+        }
+    }
+
+    fn multipart_rendered() -> RenderedOutput {
+        let mut primary = rendered(b"assembly").outputs.remove(0);
+        primary.summary.output_id = "assembly".to_owned();
+        let secondary = RenderedModelOutput {
+            summary: ModelOutputSummaryRecord {
+                output_id: "fastener".to_owned(),
+                role: OutputRoleRecord::Part,
+                primary: false,
+                facts: GeometryFactsRecord {
+                    volume_cubic_millimeters: 1.0,
+                    size_millimeters: GeometrySizeRecord {
+                        x: 1.0,
+                        y: 1.0,
+                        z: 1.0,
+                    },
+                },
+            },
+            glb: Bytes::from_static(b"fastener"),
+            preview: Bytes::from_static(b"<svg id=\"fastener\"></svg>"),
+            projections: TechnicalProjectionImages::all(Bytes::from_static(b"fastener-png")),
+            shaded: None,
+        };
+        let outputs = vec![secondary, primary];
+        let manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect(),
+        }
+        .canonical_bytes()
+        .expect("manifest");
+        RenderedOutput { manifest, outputs }
+    }
+
+    fn replacement_multipart_rendered() -> RenderedOutput {
+        let mut rendered = multipart_rendered();
+        for (index, output) in rendered.outputs.iter_mut().enumerate() {
+            output.summary.facts.volume_cubic_millimeters += 100.0;
+            output.glb = Bytes::from(format!("replacement-glb-{index}"));
+            output.preview = Bytes::from(format!("<svg id=\"replacement-{index}\"></svg>"));
+            output.projections = TechnicalProjectionImages::all(Bytes::from(format!(
+                "replacement-technical-{index}"
+            )));
+            if output.summary.primary {
+                output.shaded = Some(ShadedProjectionImages::all(Bytes::from(format!(
+                    "replacement-shaded-{index}"
+                ))));
+            }
+        }
+        rendered.manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: rendered
+                .outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect(),
+        }
+        .canonical_bytes()
+        .expect("replacement manifest");
+        rendered
+    }
+
+    #[test]
+    fn output_manifest_rejects_unknown_members() {
+        let top_level = br#"{"format":"faktory-outputs-v1","outputs":[],"extra":true}"#;
+        assert!(serde_json::from_slice::<OutputManifest>(top_level).is_err());
+
+        let summary = br#"{"format":"faktory-outputs-v1","outputs":[{"output_id":"primary","role":"assembly","primary":true,"facts":{"volume_cubic_millimeters":1.0,"size_millimeters":{"x":1.0,"y":1.0,"z":1.0}},"extra":true}]}"#;
+        assert!(serde_json::from_slice::<OutputManifest>(summary).is_err());
     }
 
     fn view(id: String) -> NamedView {
@@ -1681,11 +2149,11 @@ mod tests {
             .record;
         assert_eq!(
             successful.current_successful_facts,
-            Some(rendered(b"").facts)
+            Some(rendered(b"").outputs[0].summary.facts)
         );
         assert_eq!(
             successful.to_proto().current_successful_facts,
-            Some(rendered(b"").facts.to_proto())
+            Some(rendered(b"").outputs[0].summary.facts.to_proto())
         );
 
         let edited = repository
@@ -1907,7 +2375,10 @@ mod tests {
             .record;
         assert_eq!(model.render_state, StoredRenderState::Failed);
         assert_eq!(model.render_error, "safe failure");
-        assert_eq!(model.current_successful_facts, Some(rendered(b"").facts));
+        assert_eq!(
+            model.current_successful_facts,
+            Some(rendered(b"").outputs[0].summary.facts)
+        );
         assert_eq!(
             repository
                 .preview(&first.id, &first.desired_source_revision)
@@ -1942,9 +2413,23 @@ mod tests {
             .expect("edit")
             .record;
         let mut replacement = rendered(b"new");
-        replacement.preview = Bytes::from_static(b"<svg><path/></svg>");
-        replacement.projections = TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
-        replacement.facts.volume_cubic_millimeters = 48.0;
+        replacement.outputs[0].preview = Bytes::from_static(b"<svg><path/></svg>");
+        replacement.outputs[0].projections =
+            TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
+        replacement.outputs[0]
+            .summary
+            .facts
+            .volume_cubic_millimeters = 48.0;
+        replacement.manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: replacement
+                .outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect(),
+        }
+        .canonical_bytes()
+        .expect("manifest");
         repository
             .complete_render(
                 &second.id,
@@ -1963,14 +2448,244 @@ mod tests {
             stored.current_successful_source_revision,
             second.desired_source_revision
         );
-        assert_eq!(stored.current_successful_facts, Some(replacement.facts));
+        assert_eq!(
+            stored.current_successful_facts,
+            Some(replacement.outputs[0].summary.facts)
+        );
         assert_eq!(
             repository
                 .preview(&second.id, &second.desired_source_revision)
                 .await
                 .expect("preview"),
-            replacement.preview
+            replacement.outputs[0].preview
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn multipart_completion_preserves_order_and_serves_each_output() {
+        let repository = repository();
+        let model = repository
+            .create_model("multipart", "Multipart", b"source")
+            .await
+            .expect("create");
+        let rendered = multipart_rendered();
+        let expected_manifest = rendered.manifest.clone();
+        repository
+            .complete_render(&model.id, &model.desired_source_revision, rendered)
+            .await
+            .expect("complete multipart render");
+
+        let stored = repository
+            .get_model(&model.id)
+            .await
+            .expect("stored model")
+            .record;
+        assert_eq!(
+            stored
+                .current_successful_outputs
+                .iter()
+                .map(|output| output.output_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fastener", "assembly"]
+        );
+        assert_eq!(
+            stored.current_successful_facts,
+            Some(stored.current_successful_outputs[1].facts)
+        );
+        assert_eq!(
+            repository
+                .geometry_output(&model.id, &model.desired_source_revision, "fastener")
+                .await
+                .expect("secondary geometry"),
+            Bytes::from_static(b"fastener")
+        );
+        assert_eq!(
+            repository
+                .preview_output(&model.id, &model.desired_source_revision, "assembly")
+                .await
+                .expect("primary preview"),
+            Bytes::from_static(b"<svg></svg>")
+        );
+        assert_eq!(
+            repository
+                .output_projection_image(
+                    &model.id,
+                    &model.desired_source_revision,
+                    "fastener",
+                    TechnicalProjection::Top,
+                )
+                .await
+                .expect("secondary projection"),
+            Bytes::from_static(b"fastener-png")
+        );
+        assert_eq!(
+            repository
+                .geometry(&model.id, &model.desired_source_revision)
+                .await
+                .expect("primary alias"),
+            Bytes::from_static(b"assembly")
+        );
+        assert_eq!(
+            repository
+                .store
+                .get(&outputs_manifest_key(
+                    &model.id,
+                    &model.desired_source_revision,
+                ))
+                .await
+                .expect("stored manifest")
+                .bytes,
+            expected_manifest
+        );
+        assert_eq!(
+            repository
+                .store
+                .get(&geometry_key(&model.id, &model.desired_source_revision))
+                .await
+                .expect_err("new revision has no legacy geometry"),
+            StorageError::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_sixty_four_outputs() {
+        let repository = repository();
+        let model = repository
+            .create_model("maximum-bundle", "Maximum bundle", b"source")
+            .await
+            .expect("create");
+        let outputs = (0..64)
+            .map(|index| {
+                let primary = index == 63;
+                RenderedModelOutput {
+                    summary: ModelOutputSummaryRecord {
+                        output_id: format!("output-{index}"),
+                        role: match index % 3 {
+                            0 => OutputRoleRecord::Assembly,
+                            1 => OutputRoleRecord::Part,
+                            _ => OutputRoleRecord::Tool,
+                        },
+                        primary,
+                        facts: rendered(b"unused").outputs[0].summary.facts,
+                    },
+                    glb: Bytes::from_static(b"glb"),
+                    preview: Bytes::from_static(b"<svg></svg>"),
+                    projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+                    shaded: primary
+                        .then(|| ShadedProjectionImages::all(Bytes::from_static(b"shaded"))),
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect(),
+        }
+        .canonical_bytes()
+        .expect("manifest");
+
+        repository
+            .complete_render(
+                &model.id,
+                &model.desired_source_revision,
+                RenderedOutput { manifest, outputs },
+            )
+            .await
+            .expect("complete maximum bundle");
+
+        let stored = repository
+            .get_model(&model.id)
+            .await
+            .expect("stored model")
+            .record;
+        assert_eq!(stored.current_successful_outputs.len(), 64);
+        assert_eq!(
+            stored.primary_output().expect("primary").output_id,
+            "output-63"
+        );
+        repository.ready().await.expect("complete maximum graph");
+    }
+
+    #[tokio::test]
+    async fn manifestless_metadata_synthesizes_primary_and_reads_fixed_keys() {
+        let repository = repository();
+        let created = repository
+            .create_model("legacy", "Legacy", b"source")
+            .await
+            .expect("create");
+        let loaded = repository.get_model(&created.id).await.expect("model");
+        let facts = rendered(b"unused").outputs[0].summary.facts;
+        let mut legacy = loaded.record;
+        legacy.render_state = StoredRenderState::Ready;
+        legacy.current_successful_source_revision = created.desired_source_revision.clone();
+        legacy.current_successful_facts = Some(facts);
+        legacy.current_successful_outputs.clear();
+        repository
+            .store
+            .put(
+                &geometry_key(&created.id, &created.desired_source_revision),
+                Bytes::from_static(b"legacy-glb"),
+                PutCondition::Absent,
+            )
+            .await
+            .expect("legacy geometry");
+        repository
+            .store
+            .put(
+                &preview_key(&created.id, &created.desired_source_revision),
+                Bytes::from_static(b"legacy-preview"),
+                PutCondition::Absent,
+            )
+            .await
+            .expect("legacy preview");
+        repository
+            .save_model(&legacy, PutCondition::Matches(loaded.storage_etag))
+            .await
+            .expect("legacy metadata");
+
+        let stored = repository
+            .get_model(&created.id)
+            .await
+            .expect("legacy model")
+            .record;
+        let outputs = stored.effective_outputs();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].output_id, "primary");
+        assert_eq!(outputs[0].role, OutputRoleRecord::Assembly);
+        assert!(outputs[0].primary);
+        assert_eq!(stored.to_proto().current_successful_outputs.len(), 1);
+        assert_eq!(
+            repository
+                .geometry_output(&created.id, &created.desired_source_revision, "primary")
+                .await
+                .expect("legacy geometry alias"),
+            Bytes::from_static(b"legacy-glb")
+        );
+        assert_eq!(
+            repository
+                .preview(&created.id, &created.desired_source_revision)
+                .await
+                .expect("legacy preview alias"),
+            Bytes::from_static(b"legacy-preview")
+        );
+        assert_eq!(
+            repository
+                .geometry_output(&created.id, &created.desired_source_revision, "other")
+                .await
+                .expect_err("legacy has only primary"),
+            RepositoryError::NotFound
+        );
+
+        let mut json = serde_json::to_value(&stored).expect("legacy JSON");
+        json.as_object_mut()
+            .expect("model object")
+            .remove("current_successful_outputs");
+        let decoded: ModelRecord = serde_json::from_value(json).expect("old model JSON");
+        assert!(decoded.current_successful_outputs.is_empty());
+        assert_eq!(decoded.effective_outputs()[0].output_id, "primary");
     }
 
     #[tokio::test]
@@ -1999,8 +2714,11 @@ mod tests {
             .expect("edit")
             .record;
         let mut replacement = rendered(b"new");
-        replacement.projections = TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
-        replacement.shaded = ShadedProjectionImages::all(Bytes::from_static(b"new-shaded"));
+        replacement.outputs[0].projections =
+            TechnicalProjectionImages::all(Bytes::from_static(b"new-png"));
+        replacement.outputs[0].shaded = Some(ShadedProjectionImages::all(Bytes::from_static(
+            b"new-shaded",
+        )));
         repository
             .complete_render(&second.id, &second.desired_source_revision, replacement)
             .await
@@ -2017,9 +2735,10 @@ mod tests {
             assert_eq!(
                 repository
                     .store
-                    .get(&projection_key(
+                    .get(&output_projection_key(
                         &first.id,
                         &first.desired_source_revision,
+                        "primary",
                         projection,
                     ))
                     .await
@@ -2041,9 +2760,10 @@ mod tests {
             assert_eq!(
                 repository
                     .store
-                    .get(&shaded_projection_key(
+                    .get(&output_shaded_projection_key(
                         &first.id,
                         &first.desired_source_revision,
+                        "primary",
                         projection,
                     ))
                     .await
@@ -2085,16 +2805,16 @@ mod tests {
         let output = rendered(b"glb");
         store
             .put(
-                &geometry_key(&model.id, &model.desired_source_revision),
-                output.glb.clone(),
+                &output_geometry_key(&model.id, &model.desired_source_revision, "primary"),
+                output.outputs[0].glb.clone(),
                 PutCondition::Absent,
             )
             .await
             .expect("store matching GLB");
         store
             .put(
-                &preview_key(&model.id, &model.desired_source_revision),
-                output.preview.clone(),
+                &output_preview_key(&model.id, &model.desired_source_revision, "primary"),
+                output.outputs[0].preview.clone(),
                 PutCondition::Absent,
             )
             .await
@@ -2106,7 +2826,280 @@ mod tests {
             .expect("complete matching retry");
         let completed = repository.get_model(&model.id).await.expect("model").record;
         assert_eq!(completed.render_state, StoredRenderState::Ready);
-        assert_eq!(completed.current_successful_facts, Some(output.facts));
+        assert_eq!(
+            completed.current_successful_facts,
+            Some(output.outputs[0].summary.facts)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn every_multipart_write_failure_preserves_the_previous_bundle() {
+        const BOUNDARY_COUNT: usize = 27;
+
+        for boundary_index in 0..BOUNDARY_COUNT {
+            let store = Arc::new(FailingStore::default());
+            let repository = Repository::new(store.clone(), 8);
+            let initial = repository
+                .create_model("part", "Part", b"first")
+                .await
+                .expect("create model");
+            let previous = multipart_rendered();
+            repository
+                .complete_render(
+                    &initial.id,
+                    &initial.desired_source_revision,
+                    previous.clone(),
+                )
+                .await
+                .expect("complete previous bundle");
+            let replacement_model = repository
+                .edit_model(
+                    &initial.id,
+                    &initial.desired_source_revision,
+                    None,
+                    Some(&[SourcePatch {
+                        old: "first".to_owned(),
+                        new: "second".to_owned(),
+                    }]),
+                )
+                .await
+                .expect("create replacement revision")
+                .record;
+            let replacement = replacement_multipart_rendered();
+            let mut boundaries = vec![outputs_manifest_key(
+                &initial.id,
+                &replacement_model.desired_source_revision,
+            )];
+            for output in &replacement.outputs {
+                let output_id = &output.summary.output_id;
+                boundaries.push(output_geometry_key(
+                    &initial.id,
+                    &replacement_model.desired_source_revision,
+                    output_id,
+                ));
+                boundaries.push(output_preview_key(
+                    &initial.id,
+                    &replacement_model.desired_source_revision,
+                    output_id,
+                ));
+                for projection in TechnicalProjection::ALL {
+                    boundaries.push(output_projection_key(
+                        &initial.id,
+                        &replacement_model.desired_source_revision,
+                        output_id,
+                        projection,
+                    ));
+                }
+                if output.summary.primary {
+                    for projection in TechnicalProjection::ALL {
+                        boundaries.push(output_shaded_projection_key(
+                            &initial.id,
+                            &replacement_model.desired_source_revision,
+                            output_id,
+                            projection,
+                        ));
+                    }
+                }
+            }
+            boundaries.push(model_key(&initial.id));
+            assert_eq!(boundaries.len(), BOUNDARY_COUNT);
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                BOUNDARY_COUNT
+            );
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .filter(|key| key.ends_with("/outputs.json"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .filter(|key| key.ends_with("/model.glb"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .filter(|key| key.ends_with("/preview.svg"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .filter(|key| key.contains("/projections/"))
+                    .count(),
+                14
+            );
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .filter(|key| key.contains("/renders/three-v2/canonical/"))
+                    .count(),
+                7
+            );
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .filter(|key| key.ends_with("/model.json"))
+                    .count(),
+                1
+            );
+
+            let target = boundaries[boundary_index].clone();
+            store.fail_next_put_for(target.clone());
+            assert_eq!(
+                repository
+                    .complete_render(
+                        &initial.id,
+                        &replacement_model.desired_source_revision,
+                        replacement,
+                    )
+                    .await,
+                Err(RepositoryError::Unavailable),
+                "boundary {target}"
+            );
+            assert_eq!(store.exact_put_failures(), vec![target.clone()]);
+
+            let current = repository
+                .get_model(&initial.id)
+                .await
+                .expect("current model")
+                .record;
+            let previous_summaries = previous
+                .outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                current.current_successful_source_revision, initial.desired_source_revision,
+                "boundary {target}"
+            );
+            assert_eq!(current.current_successful_outputs, previous_summaries);
+            assert_eq!(
+                current.current_successful_facts,
+                Some(previous.outputs[1].summary.facts)
+            );
+            assert_eq!(
+                store
+                    .get(&outputs_manifest_key(
+                        &initial.id,
+                        &initial.desired_source_revision,
+                    ))
+                    .await
+                    .expect("previous manifest")
+                    .bytes,
+                previous.manifest
+            );
+
+            for output in &previous.outputs {
+                let output_id = &output.summary.output_id;
+                assert_eq!(
+                    repository
+                        .geometry_output(&initial.id, &initial.desired_source_revision, output_id)
+                        .await
+                        .expect("previous geometry"),
+                    output.glb
+                );
+                assert_eq!(
+                    repository
+                        .preview_output(&initial.id, &initial.desired_source_revision, output_id)
+                        .await
+                        .expect("previous preview"),
+                    output.preview
+                );
+                assert_eq!(
+                    repository
+                        .geometry_output(
+                            &initial.id,
+                            &replacement_model.desired_source_revision,
+                            output_id,
+                        )
+                        .await,
+                    Err(RepositoryError::NotFound)
+                );
+                assert_eq!(
+                    repository
+                        .preview_output(
+                            &initial.id,
+                            &replacement_model.desired_source_revision,
+                            output_id,
+                        )
+                        .await,
+                    Err(RepositoryError::NotFound)
+                );
+                for projection in TechnicalProjection::ALL {
+                    assert_eq!(
+                        repository
+                            .output_projection_image(
+                                &initial.id,
+                                &initial.desired_source_revision,
+                                output_id,
+                                projection,
+                            )
+                            .await
+                            .expect("previous technical projection"),
+                        output.projections.get(projection).clone()
+                    );
+                    assert_eq!(
+                        repository
+                            .output_projection_image(
+                                &initial.id,
+                                &replacement_model.desired_source_revision,
+                                output_id,
+                                projection,
+                            )
+                            .await,
+                        Err(RepositoryError::NotFound)
+                    );
+                    if let Some(shaded) = &output.shaded {
+                        assert_eq!(
+                            repository
+                                .shaded_projection_image(
+                                    &initial.id,
+                                    &initial.desired_source_revision,
+                                    projection,
+                                )
+                                .await
+                                .expect("previous shaded projection"),
+                            shaded.get(projection).clone()
+                        );
+                        assert_eq!(
+                            repository
+                                .shaded_projection_image(
+                                    &initial.id,
+                                    &replacement_model.desired_source_revision,
+                                    projection,
+                                )
+                                .await,
+                            Err(RepositoryError::NotFound)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                repository
+                    .geometry(&initial.id, &initial.desired_source_revision)
+                    .await
+                    .expect("previous primary geometry"),
+                previous.outputs[1].glb
+            );
+            assert_eq!(
+                repository
+                    .preview(&initial.id, &initial.desired_source_revision)
+                    .await
+                    .expect("previous primary preview"),
+                previous.outputs[1].preview
+            );
+        }
     }
 
     #[tokio::test]
@@ -2159,9 +3152,10 @@ mod tests {
         store
             .inner
             .put(
-                &shaded_projection_key(
+                &output_shaded_projection_key(
                     &model.id,
                     &model.desired_source_revision,
+                    "primary",
                     TechnicalProjection::Isometric,
                 ),
                 Bytes::from_static(b"different-shaded"),
@@ -2199,15 +3193,15 @@ mod tests {
             if mismatch_preview {
                 store
                     .put(
-                        &geometry_key(&model.id, &model.desired_source_revision),
-                        output.glb.clone(),
+                        &output_geometry_key(&model.id, &model.desired_source_revision, "primary"),
+                        output.outputs[0].glb.clone(),
                         PutCondition::Absent,
                     )
                     .await
                     .expect("store matching GLB");
                 store
                     .put(
-                        &preview_key(&model.id, &model.desired_source_revision),
+                        &output_preview_key(&model.id, &model.desired_source_revision, "primary"),
                         Bytes::from_static(b"<svg><path/></svg>"),
                         PutCondition::Absent,
                     )
@@ -2216,7 +3210,7 @@ mod tests {
             } else {
                 store
                     .put(
-                        &geometry_key(&model.id, &model.desired_source_revision),
+                        &output_geometry_key(&model.id, &model.desired_source_revision, "primary"),
                         Bytes::from_static(b"different-glb"),
                         PutCondition::Absent,
                     )
@@ -2306,7 +3300,7 @@ mod tests {
             .record;
         store
             .put(
-                &geometry_key(&first.id, &first.desired_source_revision),
+                &output_geometry_key(&first.id, &first.desired_source_revision, "primary"),
                 Bytes::from_static(b"stale-glb"),
                 PutCondition::Absent,
             )
@@ -2314,7 +3308,7 @@ mod tests {
             .expect("store orphaned GLB");
         store
             .put(
-                &preview_key(&first.id, &first.desired_source_revision),
+                &output_preview_key(&first.id, &first.desired_source_revision, "primary"),
                 Bytes::from_static(b"<svg></svg>"),
                 PutCondition::Absent,
             )
@@ -2334,7 +3328,17 @@ mod tests {
             .expect("return to first source")
             .record;
         let mut unrelated = rendered(b"new-glb");
-        unrelated.facts.volume_cubic_millimeters = 999.0;
+        unrelated.outputs[0].summary.facts.volume_cubic_millimeters = 999.0;
+        unrelated.manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: unrelated
+                .outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect(),
+        }
+        .canonical_bytes()
+        .expect("manifest");
 
         assert_eq!(
             repository
@@ -2613,6 +3617,7 @@ mod tests {
             render_error: String::new(),
             default_view_id: String::new(),
             current_successful_facts: None,
+            current_successful_outputs: Vec::new(),
             updated_at: model.updated_at,
         };
         store
@@ -2644,7 +3649,7 @@ mod tests {
         let loaded = repository.get_model(&model.id).await.expect("model");
         let mut invalid = loaded.record;
         invalid.current_successful_source_revision = invalid.desired_source_revision.clone();
-        invalid.current_successful_facts = Some(rendered(b"").facts);
+        invalid.current_successful_facts = Some(rendered(b"").outputs[0].summary.facts);
         invalid.render_state = StoredRenderState::Ready;
         repository
             .save_model(&invalid, PutCondition::Matches(loaded.storage_etag))
@@ -2679,6 +3684,35 @@ mod tests {
                 .expect("isolate model")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_incomplete_multipart_artifacts() {
+        let repository = repository();
+        let model = repository
+            .create_model("part", "Part", b"source")
+            .await
+            .expect("accept source");
+        repository
+            .complete_render(&model.id, &model.desired_source_revision, rendered(b"glb"))
+            .await
+            .expect("complete render");
+        repository.ready().await.expect("complete multipart graph");
+
+        let key = output_projection_key(
+            &model.id,
+            &model.desired_source_revision,
+            "primary",
+            TechnicalProjection::Bottom,
+        );
+        let stored = repository.store.get(&key).await.expect("stored projection");
+        repository
+            .store
+            .delete(&key, &stored.etag)
+            .await
+            .expect("remove projection");
+
+        assert_eq!(repository.ready().await, Err(RepositoryError::NotFound));
     }
 
     #[tokio::test]

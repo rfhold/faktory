@@ -205,6 +205,7 @@ mod tests {
                     z: 1.0,
                 },
             }),
+            current_successful_outputs: Vec::new(),
             updated_at: TimestampRecord {
                 seconds: 1,
                 nanos: 0,
@@ -310,6 +311,7 @@ mod tests {
                     z: 1.0,
                 },
             }),
+            current_successful_outputs: Vec::new(),
             updated_at: TimestampRecord {
                 seconds: 1,
                 nanos: 0,

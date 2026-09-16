@@ -20,6 +20,18 @@ class VisualRendererPipelineTest(unittest.TestCase):
             self.assertNotIn(unsupported_build, pipeline)
             self.assertIn("/faktory-visual-renderer", pipeline)
 
+    def test_renderer_smoke_exercises_complete_multipart_worker_contract(self) -> None:
+        for pipeline in (self.preview, self.release):
+            self.assertEqual(pipeline.count('Output("secondary", "part"'), 2)
+            self.assertEqual(pipeline.count('bundle / "outputs.json"'), 2)
+            self.assertEqual(pipeline.count('root / "model.glb"'), 4)
+            self.assertEqual(pipeline.count('root / "preview.svg"'), 2)
+            self.assertEqual(pipeline.count('root / "facts.json"'), 2)
+            self.assertEqual(pipeline.count('root / "projections"'), 2)
+            self.assertEqual(pipeline.count('bundle.rglob("*.png")'), 2)
+            self.assertEqual(pipeline.count('path.name == "renders"'), 2)
+            self.assertNotIn("renderer/examples/box.py", pipeline)
+
     def test_native_verification_is_hardened_and_blocks_deployment(self) -> None:
         for pipeline in (self.preview, self.release):
             task_run = re.search(

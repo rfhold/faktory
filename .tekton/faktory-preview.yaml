@@ -237,38 +237,47 @@ spec:
                 project_root="$output_dir/project"
                 library_root="$output_dir/libraries"
                 mkdir "$project_root" "$library_root"
-                cp /opt/faktory/renderer/examples/box.py "$project_root/main.py"
+                cat > "$project_root/main.py" <<'PY'
+                import cadquery as cq
+                from faktory_design.v1 import Design, Output
+
+                result = Design((
+                    Output("primary", "assembly", cq.Assembly(cq.Workplane("XY").box(2, 2, 2)), primary=True),
+                    Output("secondary", "part", cq.Workplane("XY").cylinder(1, 2)),
+                ))
+                PY
                 /opt/faktory/env/bin/python -m renderer \
                   "$project_root" \
                   main.py \
                   "$library_root" \
-                  "$output_dir/model.glb" \
-                  "$output_dir/model.svg" \
-                  "$output_dir/model.json" \
-                  "$output_dir/isometric.svg" \
-                  "$output_dir/front.svg" \
-                  "$output_dir/back.svg" \
-                  "$output_dir/left.svg" \
-                  "$output_dir/right.svg" \
-                  "$output_dir/top.svg" \
-                  "$output_dir/bottom.svg"
+                  "$output_dir/bundle"
                 /opt/faktory/env/bin/python -c '
+                import json
                 import struct
                 import sys
                 from pathlib import Path
 
-                path = Path(sys.argv[1])
-                content = path.read_bytes()
-                if len(content) < 12:
-                    raise SystemExit("GLB header is truncated")
-                magic, version, declared_size = struct.unpack("<4sII", content[:12])
-                if magic != b"glTF":
-                    raise SystemExit("invalid GLB magic")
-                if version != 2:
-                    raise SystemExit("invalid GLB version")
-                if declared_size != len(content):
-                    raise SystemExit("invalid GLB declared size")
-                ' "$output_dir/model.glb"
+                bundle = Path(sys.argv[1])
+                manifest = json.loads((bundle / "outputs.json").read_text())
+                expected = [("primary", "assembly", True), ("secondary", "part", False)]
+                actual = [(item["output_id"], item["role"], item["primary"]) for item in manifest["outputs"]]
+                if manifest["format"] != "faktory-outputs-v1" or actual != expected:
+                    raise SystemExit("invalid multipart output manifest")
+                for output_id, _, _ in expected:
+                    root = bundle / "outputs" / output_id
+                    required = [root / "model.glb", root / "preview.svg", root / "facts.json"]
+                    required.extend(root / "projections" / f"{name}.svg" for name in ("isometric", "front", "back", "left", "right", "top", "bottom"))
+                    if not all(path.is_file() for path in required):
+                        raise SystemExit("multipart worker artifacts are incomplete")
+                    content = (root / "model.glb").read_bytes()
+                    if len(content) < 12:
+                        raise SystemExit("GLB header is truncated")
+                    magic, version, declared_size = struct.unpack("<4sII", content[:12])
+                    if magic != b"glTF" or version != 2 or declared_size != len(content):
+                        raise SystemExit("invalid GLB framing")
+                if list(bundle.rglob("*.png")) or any(path.name == "renders" for path in bundle.rglob("*")):
+                    raise SystemExit("Python worker produced server-owned shaded artifacts")
+                ' "$output_dir/bundle"
         params:
           - { name: image, value: "$(params.base-image):preview-$(params.revision)-amd64" }
 
@@ -289,38 +298,47 @@ spec:
                 project_root="$output_dir/project"
                 library_root="$output_dir/libraries"
                 mkdir "$project_root" "$library_root"
-                cp /opt/faktory/renderer/examples/box.py "$project_root/main.py"
+                cat > "$project_root/main.py" <<'PY'
+                import cadquery as cq
+                from faktory_design.v1 import Design, Output
+
+                result = Design((
+                    Output("primary", "assembly", cq.Assembly(cq.Workplane("XY").box(2, 2, 2)), primary=True),
+                    Output("secondary", "part", cq.Workplane("XY").cylinder(1, 2)),
+                ))
+                PY
                 /opt/faktory/env/bin/python -m renderer \
                   "$project_root" \
                   main.py \
                   "$library_root" \
-                  "$output_dir/model.glb" \
-                  "$output_dir/model.svg" \
-                  "$output_dir/model.json" \
-                  "$output_dir/isometric.svg" \
-                  "$output_dir/front.svg" \
-                  "$output_dir/back.svg" \
-                  "$output_dir/left.svg" \
-                  "$output_dir/right.svg" \
-                  "$output_dir/top.svg" \
-                  "$output_dir/bottom.svg"
+                  "$output_dir/bundle"
                 /opt/faktory/env/bin/python -c '
+                import json
                 import struct
                 import sys
                 from pathlib import Path
 
-                path = Path(sys.argv[1])
-                content = path.read_bytes()
-                if len(content) < 12:
-                    raise SystemExit("GLB header is truncated")
-                magic, version, declared_size = struct.unpack("<4sII", content[:12])
-                if magic != b"glTF":
-                    raise SystemExit("invalid GLB magic")
-                if version != 2:
-                    raise SystemExit("invalid GLB version")
-                if declared_size != len(content):
-                    raise SystemExit("invalid GLB declared size")
-                ' "$output_dir/model.glb"
+                bundle = Path(sys.argv[1])
+                manifest = json.loads((bundle / "outputs.json").read_text())
+                expected = [("primary", "assembly", True), ("secondary", "part", False)]
+                actual = [(item["output_id"], item["role"], item["primary"]) for item in manifest["outputs"]]
+                if manifest["format"] != "faktory-outputs-v1" or actual != expected:
+                    raise SystemExit("invalid multipart output manifest")
+                for output_id, _, _ in expected:
+                    root = bundle / "outputs" / output_id
+                    required = [root / "model.glb", root / "preview.svg", root / "facts.json"]
+                    required.extend(root / "projections" / f"{name}.svg" for name in ("isometric", "front", "back", "left", "right", "top", "bottom"))
+                    if not all(path.is_file() for path in required):
+                        raise SystemExit("multipart worker artifacts are incomplete")
+                    content = (root / "model.glb").read_bytes()
+                    if len(content) < 12:
+                        raise SystemExit("GLB header is truncated")
+                    magic, version, declared_size = struct.unpack("<4sII", content[:12])
+                    if magic != b"glTF" or version != 2 or declared_size != len(content):
+                        raise SystemExit("invalid GLB framing")
+                if list(bundle.rglob("*.png")) or any(path.name == "renders" for path in bundle.rglob("*")):
+                    raise SystemExit("Python worker produced server-owned shaded artifacts")
+                ' "$output_dir/bundle"
         params:
           - { name: image, value: "$(params.base-image):preview-$(params.revision)-arm64" }
 

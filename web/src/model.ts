@@ -1,4 +1,10 @@
-import { RenderState, type Model } from "../../proto/gen/ts/faktory/v1/faktory_pb";
+import {
+  OutputRole,
+  RenderState,
+  type Model,
+  type ModelGeometryFacts,
+  type ModelOutputSummary,
+} from "../../proto/gen/ts/faktory/v1/faktory_pb";
 import { timestampDate, type Timestamp } from "@bufbuild/protobuf/wkt";
 
 const missingValue = "—";
@@ -28,25 +34,65 @@ export function artifactUrl(model: Pick<Model, "id" | "currentSuccessfulSourceRe
   return `/artifacts/${encodeURIComponent(model.id)}/${encodeURIComponent(model.currentSuccessfulSourceRevision)}/model.glb`;
 }
 
+export function outputArtifactUrl(
+  model: Pick<Model, "id" | "currentSuccessfulSourceRevision">,
+  outputId: string,
+) {
+  if (!model.currentSuccessfulSourceRevision || !outputId) return undefined;
+  return `/artifacts/${encodeURIComponent(model.id)}/${encodeURIComponent(model.currentSuccessfulSourceRevision)}/outputs/${encodeURIComponent(outputId)}/model.glb`;
+}
+
 export function previewUrl(model: Pick<Model, "id" | "currentSuccessfulSourceRevision">) {
   if (!model.currentSuccessfulSourceRevision) return undefined;
   return `/artifacts/${encodeURIComponent(model.id)}/${encodeURIComponent(model.currentSuccessfulSourceRevision)}/preview.svg`;
 }
 
-export function formatDimensions(model: Pick<Model, "currentSuccessfulFacts">) {
-  const size = model.currentSuccessfulFacts?.sizeMillimeters;
+export function formatFactsDimensions(facts?: ModelGeometryFacts) {
+  const size = facts?.sizeMillimeters;
   if (!size || [size.x, size.y, size.z].some((value) => !Number.isFinite(value) || value < 0)) {
     return missingValue;
   }
   return `${conciseNumber.format(size.x)} × ${conciseNumber.format(size.y)} × ${conciseNumber.format(size.z)} mm`;
 }
 
-export function formatVolume(model: Pick<Model, "currentSuccessfulFacts">) {
-  const volume = model.currentSuccessfulFacts?.volumeCubicMillimeters;
+export function formatDimensions(model: Pick<Model, "currentSuccessfulFacts">) {
+  return formatFactsDimensions(model.currentSuccessfulFacts);
+}
+
+export function formatFactsVolume(facts?: ModelGeometryFacts) {
+  const volume = facts?.volumeCubicMillimeters;
   if (volume === undefined || !Number.isFinite(volume) || volume < 0) return missingValue;
   if (volume >= 1_000_000_000) return `${conciseNumber.format(volume / 1_000_000_000)} m³`;
   if (volume >= 1_000) return `${conciseNumber.format(volume / 1_000)} cm³`;
   return `${conciseNumber.format(volume)} mm³`;
+}
+
+export function formatVolume(model: Pick<Model, "currentSuccessfulFacts">) {
+  return formatFactsVolume(model.currentSuccessfulFacts);
+}
+
+export function outputRoleLabel(role: OutputRole) {
+  switch (role) {
+    case OutputRole.ASSEMBLY:
+      return "Assembly";
+    case OutputRole.PART:
+      return "Part";
+    case OutputRole.TOOL:
+      return "Tool";
+    default:
+      return "Output";
+  }
+}
+
+export function primaryOutput(outputs: readonly ModelOutputSummary[]) {
+  return outputs.find((output) => output.primary) ?? outputs[0];
+}
+
+export function resolveOutput(
+  outputs: readonly ModelOutputSummary[],
+  selectedOutputId?: string,
+) {
+  return outputs.find((output) => output.outputId === selectedOutputId) ?? primaryOutput(outputs);
 }
 
 export function timestampDateTime(timestamp?: Timestamp) {

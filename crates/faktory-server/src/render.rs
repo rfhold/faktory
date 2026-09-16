@@ -21,8 +21,9 @@ use tokio::{
 };
 
 use crate::model::{
-    GeometryFactsRecord, RenderedOutput, Repository, RepositoryError, ShadedProjectionImages,
-    TechnicalProjection, TechnicalProjectionImages, validate_geometry_facts,
+    GeometryFactsRecord, OutputManifest, RenderedModelOutput, RenderedOutput, Repository,
+    RepositoryError, ShadedProjectionImages, TechnicalProjection, TechnicalProjectionImages,
+    validate_geometry_facts, validate_output_summaries,
 };
 use crate::visual::{UnavailableVisualRenderer, VisualCoordinator, VisualRendererError};
 
@@ -30,6 +31,8 @@ pub(crate) const PROJECTION_WIDTH: u32 = 640;
 pub(crate) const PROJECTION_HEIGHT: u32 = 480;
 pub(crate) const MAX_PROJECTION_IMAGE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_VISUAL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_GLB_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BUNDLE_BYTES: u64 = 192 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RenderConfig {
@@ -323,24 +326,14 @@ async fn render(
     let directory = tempfile::tempdir().map_err(|_| "temporary storage unavailable")?;
     let (project_root, entrypoint, library_root) =
         materialize_render_inputs(repository, directory.path(), job).await?;
-    let glb_path = directory.path().join("model.glb");
-    let preview_path = directory.path().join("preview.svg");
-    let facts_path = directory.path().join("facts.json");
-    let projection_paths = TechnicalProjection::ALL.map(|projection| {
-        directory
-            .path()
-            .join(format!("projection-{}.svg", projection.as_str()))
-    });
+    let output_root = directory.path().join("output");
     let mut command = tokio::process::Command::new(&config.command[0]);
     command
         .args(&config.command[1..])
         .arg(&project_root)
         .arg(&entrypoint)
         .arg(&library_root)
-        .arg(&glb_path)
-        .arg(&preview_path)
-        .arg(&facts_path)
-        .args(&projection_paths)
+        .arg(&output_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -357,23 +350,60 @@ async fn render(
     if !status.success() {
         return Err("renderer rejected source");
     }
-    let glb = read_glb(&glb_path, config.max_output_bytes).await?;
-    let preview = read_svg(&preview_path, config.max_output_bytes).await?;
-    let facts = read_facts(&facts_path, config.max_output_bytes).await?;
-    let mut projection_images = Vec::with_capacity(TechnicalProjection::ALL.len());
-    for path in &projection_paths {
-        let svg = read_svg(path, config.max_output_bytes).await?;
-        projection_images.push(rasterize_projection(&svg)?);
+    read_rendered_bundle(&output_root, config.max_output_bytes, visual).await
+}
+
+async fn read_rendered_bundle(
+    output_root: &Path,
+    max_bytes: usize,
+    visual: &VisualCoordinator,
+) -> Result<RenderedOutput, &'static str> {
+    let manifest = read_bounded(
+        &output_root.join("outputs.json"),
+        max_bytes,
+        "renderer produced no output manifest",
+        "rendered manifest",
+    )
+    .await?;
+    let parsed: OutputManifest =
+        serde_json::from_slice(&manifest).map_err(|_| "rendered output manifest is invalid")?;
+    if parsed.format != OutputManifest::FORMAT
+        || parsed.outputs.is_empty()
+        || parsed.outputs.len() > 64
+        || parsed
+            .canonical_bytes()
+            .map_err(|_| "rendered output manifest is invalid")?
+            != manifest
+    {
+        return Err("rendered output manifest is invalid");
     }
-    let [isometric, front, back, left, right, top, bottom] = projection_images
-        .try_into()
-        .map_err(|_| "renderer produced incomplete projections")?;
-    let shaded = render_shaded(visual, glb.clone()).await?;
-    Ok(RenderedOutput {
-        glb,
-        preview,
-        facts,
-        projections: TechnicalProjectionImages {
+    validate_output_summaries(&parsed.outputs)
+        .map_err(|_| "rendered output manifest is invalid")?;
+    validate_bundle_size(output_root, &parsed).await?;
+    let mut outputs = Vec::with_capacity(parsed.outputs.len());
+    for summary in parsed.outputs {
+        let root = output_root.join("outputs").join(&summary.output_id);
+        let glb = read_glb(&root.join("model.glb"), max_bytes).await?;
+        let preview = read_svg(&root.join("preview.svg"), max_bytes).await?;
+        let facts = read_facts(&root.join("facts.json"), max_bytes).await?;
+        if facts != summary.facts {
+            return Err("rendered facts do not match output manifest");
+        }
+        let mut images = Vec::with_capacity(TechnicalProjection::ALL.len());
+        for projection in TechnicalProjection::ALL {
+            let svg = read_svg(
+                &root
+                    .join("projections")
+                    .join(format!("{}.svg", projection.as_str())),
+                max_bytes,
+            )
+            .await?;
+            images.push(rasterize_projection(&svg)?);
+        }
+        let [isometric, front, back, left, right, top, bottom] = images
+            .try_into()
+            .map_err(|_| "renderer produced incomplete projections")?;
+        let projections = TechnicalProjectionImages {
             isometric,
             front,
             back,
@@ -381,9 +411,63 @@ async fn render(
             right,
             top,
             bottom,
-        },
-        shaded,
-    })
+        };
+        let shaded = if summary.primary {
+            Some(render_shaded(visual, glb.clone()).await?)
+        } else {
+            None
+        };
+        outputs.push(RenderedModelOutput {
+            summary,
+            glb,
+            preview,
+            projections,
+            shaded,
+        });
+    }
+    Ok(RenderedOutput { manifest, outputs })
+}
+
+async fn validate_bundle_size(
+    output_root: &Path,
+    manifest: &OutputManifest,
+) -> Result<(), &'static str> {
+    let mut total = 0_u64;
+    add_bundle_file_size(&mut total, &output_root.join("outputs.json")).await?;
+    for summary in &manifest.outputs {
+        let root = output_root.join("outputs").join(&summary.output_id);
+        for relative in ["model.glb", "preview.svg", "facts.json"] {
+            add_bundle_file_size(&mut total, &root.join(relative)).await?;
+        }
+        for projection in TechnicalProjection::ALL {
+            add_bundle_file_size(
+                &mut total,
+                &root
+                    .join("projections")
+                    .join(format!("{}.svg", projection.as_str())),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn add_bundle_file_size(total: &mut u64, path: &Path) -> Result<(), &'static str> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|_| "rendered output bundle is invalid")?;
+    if !metadata.is_file() {
+        return Err("rendered output bundle is invalid");
+    }
+    *total =
+        checked_bundle_total(*total, metadata.len()).ok_or("rendered output bundle is invalid")?;
+    Ok(())
+}
+
+fn checked_bundle_total(total: u64, file_size: u64) -> Option<u64> {
+    total
+        .checked_add(file_size)
+        .filter(|total| *total <= MAX_BUNDLE_BYTES)
 }
 
 async fn materialize_render_inputs(
@@ -602,6 +686,7 @@ async fn terminate_renderer(child: &mut tokio::process::Child) {
 }
 
 async fn read_glb(path: &Path, max_bytes: usize) -> Result<Bytes, &'static str> {
+    let max_bytes = max_bytes.min(MAX_GLB_BYTES);
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|_| "renderer produced no artifact")?;
@@ -1031,9 +1116,10 @@ mod tests {
     }
 
     fn rendered_output(glb: &'static [u8]) -> RenderedOutput {
-        RenderedOutput {
-            glb: Bytes::from_static(glb),
-            preview: Bytes::from_static(b"<svg></svg>"),
+        let summary = crate::model::ModelOutputSummaryRecord {
+            output_id: "primary".to_owned(),
+            role: crate::model::OutputRoleRecord::Assembly,
+            primary: true,
             facts: GeometryFactsRecord {
                 volume_cubic_millimeters: 1.0,
                 size_millimeters: crate::model::GeometrySizeRecord {
@@ -1042,8 +1128,23 @@ mod tests {
                     z: 1.0,
                 },
             },
-            projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
-            shaded: ShadedProjectionImages::all(Bytes::from_static(b"shaded-png")),
+        };
+        RenderedOutput {
+            manifest: OutputManifest {
+                format: OutputManifest::FORMAT.to_owned(),
+                outputs: vec![summary.clone()],
+            }
+            .canonical_bytes()
+            .expect("manifest"),
+            outputs: vec![RenderedModelOutput {
+                summary,
+                glb: Bytes::from_static(glb),
+                preview: Bytes::from_static(b"<svg></svg>"),
+                projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
+                shaded: Some(ShadedProjectionImages::all(Bytes::from_static(
+                    b"shaded-png",
+                ))),
+            }],
         }
     }
 
@@ -1143,8 +1244,17 @@ mod tests {
             tokio::fs::write(&path, &valid)
                 .await
                 .expect("write fixture");
+            assert_eq!(
+                read_glb(&path, valid.len()).await.expect("exact limit"),
+                valid
+            );
+            assert_eq!(
+                read_glb(&path, valid.len() - 1).await,
+                Err("rendered artifact has invalid size")
+            );
             assert_eq!(read_glb(&path, 100).await.expect("valid GLB"), valid);
         }
+        assert_eq!(MAX_GLB_BYTES, 64 * 1024 * 1024);
 
         let mut zero_json = b"glTF\x02\0\0\0\x14\0\0\0\0\0\0\0JSON".to_vec();
         let mut invalid_json = glb_fixture(None);
@@ -1171,6 +1281,17 @@ mod tests {
                 .expect("write fixture");
             assert!(read_glb(&path, 100).await.is_err());
         }
+    }
+
+    #[test]
+    fn enforces_exact_aggregate_bundle_boundary_with_checked_arithmetic() {
+        assert_eq!(
+            checked_bundle_total(MAX_BUNDLE_BYTES - 1, 1),
+            Some(MAX_BUNDLE_BYTES)
+        );
+        assert_eq!(checked_bundle_total(MAX_BUNDLE_BYTES, 1), None);
+        assert_eq!(checked_bundle_total(u64::MAX, 1), None);
+        assert_eq!(MAX_BUNDLE_BYTES, 192 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -1289,7 +1410,7 @@ mod tests {
         let script_path = directory.path().join("renderer.sh");
         tokio::fs::write(
             &script_path,
-            b"test \"$#\" -eq 13 || exit 2\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$4\"\nprintf '<svg></svg>' > \"$5\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$6\"\nfor output in \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\" \"${12}\" \"${13}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
+            b"test \"$#\" -eq 4 || exit 2\nmkdir -p \"$4.tmp/outputs/primary/projections\"\nprintf '{\"format\":\"faktory-outputs-v1\",\"outputs\":[{\"output_id\":\"primary\",\"role\":\"assembly\",\"primary\":true,\"facts\":{\"volume_cubic_millimeters\":24.0,\"size_millimeters\":{\"x\":2.0,\"y\":3.0,\"z\":4.0}}}]}\\n' > \"$4.tmp/outputs.json\"\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$4.tmp/outputs/primary/model.glb\"\nprintf '<svg></svg>' > \"$4.tmp/outputs/primary/preview.svg\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4.tmp/outputs/primary/facts.json\"\nfor name in isometric front back left right top bottom; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$4.tmp/outputs/primary/projections/$name.svg\"; done\nmv \"$4.tmp\" \"$4\"\n",
         )
         .await
         .expect("write renderer");
@@ -1318,12 +1439,71 @@ mod tests {
         )
         .await
         .expect("render outputs");
-        assert_eq!(output.glb, glb_fixture(None));
+        assert_eq!(output.outputs[0].glb, glb_fixture(None));
         for projection in TechnicalProjection::ALL {
-            validate_projection_png(output.projections.get(projection)).expect("valid PNG");
+            validate_projection_png(output.outputs[0].projections.get(projection))
+                .expect("valid PNG");
         }
-        assert_eq!(output.preview, Bytes::from_static(b"<svg></svg>"));
-        assert!((output.facts.volume_cubic_millimeters - 24.0).abs() < f64::EPSILON);
+        assert_eq!(
+            output.outputs[0].preview,
+            Bytes::from_static(b"<svg></svg>")
+        );
+        assert!(
+            (output.outputs[0].summary.facts.volume_cubic_millimeters - 24.0).abs() < f64::EPSILON
+        );
+    }
+
+    #[tokio::test]
+    async fn python_worker_bundle_is_consumed_by_rust_reader() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let model = repository
+            .create_model(
+                "python-worker",
+                "Python worker",
+                b"import cadquery as cq\nresult = cq.Workplane(\"XY\").box(2, 3, 4)\n",
+            )
+            .await
+            .expect("create model");
+        let output = render(
+            &repository,
+            &RenderConfig {
+                command: vec![
+                    "uv".to_owned(),
+                    "run".to_owned(),
+                    "--directory".to_owned(),
+                    workspace.to_string_lossy().into_owned(),
+                    "python".to_owned(),
+                    "-m".to_owned(),
+                    "renderer".to_owned(),
+                ],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_secs(30),
+                max_output_bytes: 64 * 1024 * 1024,
+            },
+            &visual(),
+            &RenderJob {
+                model_id: model.id,
+                revision: model.desired_source_revision,
+            },
+        )
+        .await
+        .expect("consume Python worker bundle");
+
+        assert_eq!(output.outputs.len(), 1);
+        assert_eq!(output.outputs[0].summary.output_id, "primary");
+        assert_eq!(
+            output.outputs[0].summary.role,
+            crate::model::OutputRoleRecord::Part
+        );
+        for projection in TechnicalProjection::ALL {
+            validate_projection_png(output.outputs[0].projections.get(projection))
+                .expect("valid projection PNG");
+        }
     }
 
     #[cfg(unix)]
@@ -1333,7 +1513,7 @@ mod tests {
         let script_path = directory.path().join("renderer.sh");
         tokio::fs::write(
             &script_path,
-            b"printf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$4\"\nprintf '<svg></svg>' > \"$5\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$6\"\nfor output in \"$7\" \"$8\" \"$9\" \"${10}\" \"${11}\" \"${12}\" \"${13}\"; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$output\"; done\n",
+            b"mkdir -p \"$4.tmp/outputs/primary/projections\"\nprintf '{\"format\":\"faktory-outputs-v1\",\"outputs\":[{\"output_id\":\"primary\",\"role\":\"assembly\",\"primary\":true,\"facts\":{\"volume_cubic_millimeters\":24.0,\"size_millimeters\":{\"x\":2.0,\"y\":3.0,\"z\":4.0}}}]}\\n' > \"$4.tmp/outputs.json\"\nprintf 'glTF\\002\\000\\000\\000\\060\\000\\000\\000\\034\\000\\000\\000JSON{\"asset\":{\"version\":\"2.0\"}} ' > \"$4.tmp/outputs/primary/model.glb\"\nprintf '<svg></svg>' > \"$4.tmp/outputs/primary/preview.svg\"\nprintf '{\"volume_cubic_millimeters\":24,\"size_millimeters\":{\"x\":2,\"y\":3,\"z\":4}}' > \"$4.tmp/outputs/primary/facts.json\"\nfor name in isometric front back left right top bottom; do printf '<svg width=\"640\" height=\"480\"></svg>' > \"$4.tmp/outputs/primary/projections/$name.svg\"; done\nmv \"$4.tmp\" \"$4\"\n",
         )
         .await
         .expect("write renderer");
@@ -1516,7 +1696,11 @@ mod tests {
         );
         store
             .put(
-                &crate::model::geometry_key(&replacement.id, &replacement.desired_source_revision),
+                &crate::model::output_geometry_key(
+                    &replacement.id,
+                    &replacement.desired_source_revision,
+                    "primary",
+                ),
                 Bytes::from_static(b"conflicting-glb"),
                 PutCondition::Absent,
             )
@@ -1548,7 +1732,10 @@ mod tests {
             failed.current_successful_source_revision,
             first.desired_source_revision
         );
-        assert_eq!(failed.current_successful_facts, Some(first_output.facts));
+        assert_eq!(
+            failed.current_successful_facts,
+            Some(first_output.outputs[0].summary.facts)
+        );
     }
 
     #[tokio::test]

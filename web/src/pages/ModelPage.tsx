@@ -8,7 +8,15 @@ import {
 import { faktoryClient } from "../api/client";
 import { modelKeys, setViewsDefault, upsertModel } from "../api/queries";
 import { StatusBadge } from "../components/StatusBadge";
-import { artifactUrl, modelAvailability } from "../model";
+import {
+  formatFactsDimensions,
+  formatFactsVolume,
+  modelAvailability,
+  outputArtifactUrl,
+  outputRoleLabel,
+  primaryOutput,
+  resolveOutput,
+} from "../model";
 import { ModelViewer, type CameraSnapshot } from "../viewer/ModelViewer";
 import { convertCameraProjection } from "../viewer/threeRecipe";
 import {
@@ -39,8 +47,10 @@ export function ModelPage() {
   const [viewerState, setViewerState] = createSignal<"loading" | "ready" | "error">("loading");
   const [loadedGeometryUrl, setLoadedGeometryUrl] = createSignal<string>();
   const [actionError, setActionError] = createSignal("");
+  const [selectedOutputId, setSelectedOutputId] = createSignal<string>();
   let defaultViewInitialization: DefaultViewInitialization | undefined;
   let activeModelId = modelId();
+  let activeOutputSetKey = "";
 
   const model = createQuery(() => ({
     queryKey: modelKeys.detail(modelId()),
@@ -56,7 +66,13 @@ export function ModelPage() {
     queryFn: () => faktoryClient.listViews({ modelId: modelId() }),
     staleTime: 30_000,
   }));
-  const geometryUrl = () => model.data ? artifactUrl(model.data) : undefined;
+  const outputs = () => model.data?.currentSuccessfulOutputs ?? [];
+  const selectedOutput = createMemo(() => resolveOutput(outputs(), selectedOutputId()));
+  const geometryUrl = () => {
+    const record = model.data;
+    const output = selectedOutput();
+    return record && output ? outputArtifactUrl(record, output.outputId) : undefined;
+  };
   const loadKey = () => `${modelId()}:${geometryUrl() ?? ""}`;
   const editingView = createMemo(() => views.data?.views.find((view) => view.id === editingId()));
 
@@ -71,6 +87,20 @@ export function ModelPage() {
     setViewerState("loading");
     setLoadedGeometryUrl(undefined);
     setActionError("");
+    setSelectedOutputId(undefined);
+  });
+
+  createEffect(() => {
+    const record = model.data;
+    const availableOutputs = record?.currentSuccessfulOutputs ?? [];
+    const nextKey = [
+      modelId(),
+      record?.currentSuccessfulSourceRevision ?? "",
+      ...availableOutputs.map((output) => `${output.outputId}:${output.primary}`),
+    ].join("\u0000");
+    if (nextKey === activeOutputSetKey) return;
+    activeOutputSetKey = nextKey;
+    setSelectedOutputId(primaryOutput(availableOutputs)?.outputId);
   });
 
   createEffect(() => {
@@ -201,10 +231,54 @@ export function ModelPage() {
                 </Show>
               </div>
 
+              <Show when={record().currentSuccessfulOutputs.length > 0}>
+                <section class="output-panel panel" aria-labelledby="output-heading">
+                  <div class="output-heading">
+                    <div>
+                      <p class="eyebrow">Design bundle</p>
+                      <h2 id="output-heading">Inspect output</h2>
+                    </div>
+                    <span aria-live="polite">
+                      {selectedOutput()?.outputId} / {outputRoleLabel(selectedOutput()!.role)}
+                    </span>
+                  </div>
+                  <div class="output-list" role="group" aria-label="Model outputs">
+                    <For each={record().currentSuccessfulOutputs}>
+                      {(output) => (
+                        <button
+                          type="button"
+                          classList={{ "output-option": true, selected: selectedOutput()?.outputId === output.outputId }}
+                          aria-pressed={selectedOutput()?.outputId === output.outputId}
+                          aria-label={`${output.outputId}, ${outputRoleLabel(output.role)}${output.primary ? ", primary output" : ""}`}
+                          onClick={() => setSelectedOutputId(output.outputId)}
+                        >
+                          <strong>{output.outputId}</strong>
+                          <span>{outputRoleLabel(output.role)}{output.primary ? " / Primary" : ""}</span>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                  <dl class="output-facts">
+                    <div>
+                      <dt>Role</dt>
+                      <dd>{outputRoleLabel(selectedOutput()!.role)}</dd>
+                    </div>
+                    <div>
+                      <dt>Volume</dt>
+                      <dd>{formatFactsVolume(selectedOutput()?.facts)}</dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>{formatFactsDimensions(selectedOutput()?.facts)}</dd>
+                    </div>
+                  </dl>
+                </section>
+              </Show>
+
               <div class="detail-grid">
                 <section class="viewer-panel panel" aria-label="Model geometry">
                   <Show
-                    when={artifactUrl(record())}
+                    when={geometryUrl()}
                     fallback={
                       <div class="viewer-placeholder">
                         <span class="empty-mark">GLB</span>

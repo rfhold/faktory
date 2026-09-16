@@ -30,6 +30,13 @@ enum Projection {
   PROJECTION_ORTHOGRAPHIC = 2;
 }
 
+enum OutputRole {
+  OUTPUT_ROLE_UNSPECIFIED = 0;
+  OUTPUT_ROLE_ASSEMBLY = 1;
+  OUTPUT_ROLE_PART = 2;
+  OUTPUT_ROLE_TOOL = 3;
+}
+
 message Vector3 {
   double x = 1;
   double y = 2;
@@ -48,6 +55,13 @@ message ModelGeometryFacts {
   Vector3 size_millimeters = 2;
 }
 
+message ModelOutputSummary {
+  string output_id = 1;
+  OutputRole role = 2;
+  bool primary = 3;
+  ModelGeometryFacts facts = 4;
+}
+
 message Model {
   string id = 1;
   string name = 2;
@@ -58,6 +72,7 @@ message Model {
   string default_view_id = 7;
   ModelGeometryFacts current_successful_facts = 8;
   google.protobuf.Timestamp updated_at = 9;
+  repeated ModelOutputSummary current_successful_outputs = 10;
 }
 
 message NamedView {

@@ -232,7 +232,8 @@ mod tests {
     use super::*;
     use crate::{
         model::{
-            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, TechnicalProjectionImages,
+            GeometryFactsRecord, GeometrySizeRecord, ModelOutputSummaryRecord, OutputManifest,
+            OutputRoleRecord, RenderedModelOutput, RenderedOutput, TechnicalProjectionImages,
             library::LibraryRelease,
             project::{
                 DependencyGuidance, DirectRequirement, LibraryLock, ProjectBundle, ProjectFile,
@@ -300,12 +301,11 @@ mod tests {
             .await
             .expect("model");
         repository
-            .complete_render(
-                &model.id,
-                &model.desired_source_revision,
-                RenderedOutput {
-                    glb: bytes::Bytes::from_static(b"glb"),
-                    preview: bytes::Bytes::from_static(b"svg"),
+            .complete_render(&model.id, &model.desired_source_revision, {
+                let summary = ModelOutputSummaryRecord {
+                    output_id: "primary".to_owned(),
+                    role: OutputRoleRecord::Assembly,
+                    primary: true,
                     facts: GeometryFactsRecord {
                         volume_cubic_millimeters: 1.0,
                         size_millimeters: GeometrySizeRecord {
@@ -314,10 +314,27 @@ mod tests {
                             z: 1.0,
                         },
                     },
-                    projections: TechnicalProjectionImages::all(bytes::Bytes::from_static(b"png")),
-                    shaded: TechnicalProjectionImages::all(bytes::Bytes::from_static(b"png")),
-                },
-            )
+                };
+                RenderedOutput {
+                    manifest: OutputManifest {
+                        format: OutputManifest::FORMAT.to_owned(),
+                        outputs: vec![summary.clone()],
+                    }
+                    .canonical_bytes()
+                    .expect("manifest"),
+                    outputs: vec![RenderedModelOutput {
+                        summary,
+                        glb: bytes::Bytes::from_static(b"glb"),
+                        preview: bytes::Bytes::from_static(b"svg"),
+                        projections: TechnicalProjectionImages::all(bytes::Bytes::from_static(
+                            b"png",
+                        )),
+                        shaded: Some(TechnicalProjectionImages::all(bytes::Bytes::from_static(
+                            b"png",
+                        ))),
+                    }],
+                }
+            })
             .await
             .expect("render");
         let next = repository

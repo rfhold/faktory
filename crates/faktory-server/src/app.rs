@@ -363,18 +363,8 @@ fn build_disabled_router(
         repository,
         readiness: AuthReadiness::Disabled,
     };
-    let artifact_state = state.clone();
-    let preview_state = state.clone();
-    let router = base_router(state)
-        .route(
-            "/artifacts/{model_id}/{revision}/model.glb",
-            get(move |path, headers| geometry(State(artifact_state.clone()), path, headers)),
-        )
-        .route(
-            "/artifacts/{model_id}/{revision}/preview.svg",
-            get(move |path, headers| preview(State(preview_state.clone()), path, headers)),
-        )
-        .merge(mcp);
+    let artifact_routes = artifact_router(state.clone());
+    let router = base_router(state).merge(artifact_routes).merge(mcp);
     let mut router = router;
     if let Some(directory) = &config.static_directory {
         router = router
@@ -429,19 +419,9 @@ fn build_production_router(
         repository,
         readiness: AuthReadiness::Production(production.clone()),
     };
-    let artifact_state = state.clone();
-    let preview_state = state.clone();
+    let artifact_routes = artifact_router(state.clone()).layer(browser_auth.clone());
     let router = base_router(state)
-        .route(
-            "/artifacts/{model_id}/{revision}/model.glb",
-            get(move |path, headers| geometry(State(artifact_state.clone()), path, headers))
-                .layer(browser_auth.clone()),
-        )
-        .route(
-            "/artifacts/{model_id}/{revision}/preview.svg",
-            get(move |path, headers| preview(State(preview_state.clone()), path, headers))
-                .layer(browser_auth.clone()),
-        )
+        .merge(artifact_routes)
         .merge(access_auth_router(production.browser.clone()))
         .merge(production.oauth.router())
         .merge(production.oidc_owner.router())
@@ -469,6 +449,34 @@ fn build_production_router(
             );
     }
     Ok(with_http_telemetry(router.fallback_service(grpc)))
+}
+
+fn artifact_router(state: AppState) -> Router {
+    let artifact_state = state.clone();
+    let output_artifact_state = state.clone();
+    let preview_state = state.clone();
+    let output_preview_state = state;
+    Router::new()
+        .route(
+            "/artifacts/{model_id}/{revision}/model.glb",
+            get(move |path, headers| geometry(State(artifact_state.clone()), path, headers)),
+        )
+        .route(
+            "/artifacts/{model_id}/{revision}/preview.svg",
+            get(move |path, headers| preview(State(preview_state.clone()), path, headers)),
+        )
+        .route(
+            "/artifacts/{model_id}/{revision}/outputs/{output_id}/model.glb",
+            get(move |path, headers| {
+                output_geometry(State(output_artifact_state.clone()), path, headers)
+            }),
+        )
+        .route(
+            "/artifacts/{model_id}/{revision}/outputs/{output_id}/preview.svg",
+            get(move |path, headers| {
+                output_preview(State(output_preview_state.clone()), path, headers)
+            }),
+        )
 }
 
 fn with_http_telemetry(router: Router) -> Router {
@@ -644,14 +652,40 @@ async fn geometry(
     Path((model_id, revision)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let bytes = match state.repository.geometry(&model_id, &revision).await {
+    let output_id = match current_primary_output_id(&state.repository, &model_id, &revision).await {
+        Ok(output_id) => output_id,
+        Err(response) => return response,
+    };
+    geometry_response(state, model_id, revision, output_id, headers).await
+}
+
+async fn output_geometry(
+    State(state): State<AppState>,
+    Path((model_id, revision, output_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    geometry_response(state, model_id, revision, output_id, headers).await
+}
+
+async fn geometry_response(
+    state: AppState,
+    model_id: String,
+    revision: String,
+    output_id: String,
+    headers: HeaderMap,
+) -> Response {
+    let bytes = match state
+        .repository
+        .geometry_output(&model_id, &revision, &output_id)
+        .await
+    {
         Ok(geometry) => geometry,
         Err(RepositoryError::Invalid | RepositoryError::NotFound) => {
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let etag = format!("\"{revision}\"");
+    let etag = format!("\"{revision}:{output_id}\"");
     if if_none_match(&headers, &etag) {
         return response_with_headers(StatusCode::NOT_MODIFIED, Body::empty(), &etag, None, 0);
     }
@@ -685,14 +719,40 @@ async fn preview(
     Path((model_id, revision)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let bytes = match state.repository.preview(&model_id, &revision).await {
+    let output_id = match current_primary_output_id(&state.repository, &model_id, &revision).await {
+        Ok(output_id) => output_id,
+        Err(response) => return response,
+    };
+    preview_response(state, model_id, revision, output_id, headers).await
+}
+
+async fn output_preview(
+    State(state): State<AppState>,
+    Path((model_id, revision, output_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    preview_response(state, model_id, revision, output_id, headers).await
+}
+
+async fn preview_response(
+    state: AppState,
+    model_id: String,
+    revision: String,
+    output_id: String,
+    headers: HeaderMap,
+) -> Response {
+    let bytes = match state
+        .repository
+        .preview_output(&model_id, &revision, &output_id)
+        .await
+    {
         Ok(preview) => preview,
         Err(RepositoryError::Invalid | RepositoryError::NotFound) => {
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let etag = format!("\"{revision}\"");
+    let etag = format!("\"{revision}:{output_id}\"");
     let not_modified = if_none_match(&headers, &etag);
     let (status, body, content_length) = if not_modified {
         (StatusCode::NOT_MODIFIED, Body::empty(), 0)
@@ -725,6 +785,34 @@ async fn preview(
         HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
     );
     response
+}
+
+async fn current_primary_output_id(
+    repository: &Repository,
+    model_id: &str,
+    revision: &str,
+) -> Result<String, Response> {
+    let model = repository
+        .get_model(model_id)
+        .await
+        .map_err(repository_response)?;
+    if model.record.current_successful_source_revision != revision {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    model
+        .record
+        .primary_output()
+        .map(|output| output.output_id)
+        .map_err(repository_response)
+}
+
+fn repository_response(error: RepositoryError) -> Response {
+    match error {
+        RepositoryError::Invalid | RepositoryError::NotFound => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 fn if_none_match(headers: &HeaderMap, current_etag: &str) -> bool {
@@ -824,9 +912,10 @@ mod tests {
     ];
 
     fn rendered(glb: &'static [u8]) -> crate::model::RenderedOutput {
-        crate::model::RenderedOutput {
-            glb: bytes::Bytes::from_static(glb),
-            preview: bytes::Bytes::from_static(b"<svg></svg>"),
+        let summary = crate::model::ModelOutputSummaryRecord {
+            output_id: "primary".to_owned(),
+            role: crate::model::OutputRoleRecord::Assembly,
+            primary: true,
             facts: crate::model::GeometryFactsRecord {
                 volume_cubic_millimeters: 24.0,
                 size_millimeters: crate::model::GeometrySizeRecord {
@@ -835,12 +924,25 @@ mod tests {
                     z: 4.0,
                 },
             },
-            projections: crate::model::TechnicalProjectionImages::all(bytes::Bytes::from_static(
-                b"png",
-            )),
-            shaded: crate::model::ShadedProjectionImages::all(bytes::Bytes::from_static(
-                b"shaded-png",
-            )),
+        };
+        crate::model::RenderedOutput {
+            manifest: crate::model::OutputManifest {
+                format: crate::model::OutputManifest::FORMAT.to_owned(),
+                outputs: vec![summary.clone()],
+            }
+            .canonical_bytes()
+            .expect("manifest"),
+            outputs: vec![crate::model::RenderedModelOutput {
+                summary,
+                glb: bytes::Bytes::from_static(glb),
+                preview: bytes::Bytes::from_static(b"<svg></svg>"),
+                projections: crate::model::TechnicalProjectionImages::all(
+                    bytes::Bytes::from_static(b"png"),
+                ),
+                shaded: Some(crate::model::ShadedProjectionImages::all(
+                    bytes::Bytes::from_static(b"shaded-png"),
+                )),
+            }],
         }
     }
 
@@ -1475,13 +1577,34 @@ mod tests {
             .create_model("part", "Part", b"first")
             .await
             .expect("first source");
+        let mut output = rendered(b"glTF-artifact");
+        let secondary_summary = crate::model::ModelOutputSummaryRecord {
+            output_id: "fastener".to_owned(),
+            role: crate::model::OutputRoleRecord::Part,
+            primary: false,
+            facts: output.outputs[0].summary.facts,
+        };
+        output.outputs.insert(
+            0,
+            crate::model::RenderedModelOutput {
+                summary: secondary_summary.clone(),
+                glb: bytes::Bytes::from_static(b"secondary-glTF"),
+                preview: bytes::Bytes::from_static(b"<svg id=\"fastener\"></svg>"),
+                projections: crate::model::TechnicalProjectionImages::all(
+                    bytes::Bytes::from_static(b"secondary-png"),
+                ),
+                shaded: None,
+            },
+        );
+        output.manifest = crate::model::OutputManifest {
+            format: crate::model::OutputManifest::FORMAT.to_owned(),
+            outputs: vec![secondary_summary, output.outputs[1].summary.clone()],
+        }
+        .canonical_bytes()
+        .expect("manifest");
         runtime
             .repository()
-            .complete_render(
-                &model.id,
-                &model.desired_source_revision,
-                rendered(b"glTF-artifact"),
-            )
+            .complete_render(&model.id, &model.desired_source_revision, output)
             .await
             .expect("first render");
         (runtime, model)
@@ -1509,6 +1632,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn disabled_artifact_route_requires_no_session_and_serves_current_revision() {
         let (runtime, first) = runtime_with_completed_model().await;
         let path = format!(
@@ -1521,6 +1645,25 @@ mod tests {
             to_bytes(response.into_body(), 1024)
                 .await
                 .expect("artifact body"),
+            bytes::Bytes::from_static(b"glTF-artifact")
+        );
+        let explicit = artifact_request(
+            runtime.router(),
+            format!(
+                "/artifacts/{}/{}/outputs/primary/model.glb",
+                first.id, first.desired_source_revision
+            ),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        assert_eq!(
+            explicit.headers()[header::ETAG],
+            format!("\"{}:primary\"", first.desired_source_revision)
+        );
+        assert_eq!(
+            to_bytes(explicit.into_body(), 1024)
+                .await
+                .expect("explicit artifact body"),
             bytes::Bytes::from_static(b"glTF-artifact")
         );
         let preview = artifact_request(
@@ -1544,7 +1687,7 @@ mod tests {
         );
         assert_eq!(
             preview.headers()[header::ETAG],
-            format!("\"{}\"", first.desired_source_revision)
+            format!("\"{}:primary\"", first.desired_source_revision)
         );
         assert_eq!(preview.headers()[header::CONTENT_LENGTH], "11");
         assert_eq!(
@@ -1552,6 +1695,34 @@ mod tests {
                 .await
                 .expect("preview body"),
             bytes::Bytes::from_static(b"<svg></svg>")
+        );
+        let missing_output = artifact_request(
+            runtime.router(),
+            format!(
+                "/artifacts/{}/{}/outputs/missing/preview.svg",
+                first.id, first.desired_source_revision
+            ),
+        )
+        .await;
+        assert_eq!(missing_output.status(), StatusCode::NOT_FOUND);
+        let secondary = artifact_request(
+            runtime.router(),
+            format!(
+                "/artifacts/{}/{}/outputs/fastener/model.glb",
+                first.id, first.desired_source_revision
+            ),
+        )
+        .await;
+        assert_eq!(secondary.status(), StatusCode::OK);
+        assert_eq!(
+            secondary.headers()[header::ETAG],
+            format!("\"{}:fastener\"", first.desired_source_revision)
+        );
+        assert_eq!(
+            to_bytes(secondary.into_body(), 1024)
+                .await
+                .expect("secondary artifact body"),
+            bytes::Bytes::from_static(b"secondary-glTF")
         );
         let wrong = artifact_request(
             runtime.router(),
@@ -1589,7 +1760,7 @@ mod tests {
         for path in [glb_path.clone(), preview_path.clone()] {
             for validator in [
                 "*".to_owned(),
-                format!("W/\"{}\"", first.desired_source_revision),
+                format!("W/\"{}:primary\"", first.desired_source_revision),
             ] {
                 let response = artifact_request_with_header(
                     runtime.router(),

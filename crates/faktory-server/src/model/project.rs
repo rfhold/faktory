@@ -791,6 +791,7 @@ impl Repository {
             render_error: String::new(),
             default_view_id: String::new(),
             current_successful_facts: None,
+            current_successful_outputs: Vec::new(),
             updated_at: mutation_timestamp(None)?,
         };
         self.save_model(&record, PutCondition::Absent).await?;

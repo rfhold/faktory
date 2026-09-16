@@ -2,7 +2,7 @@
 
 ## Status and Authority
 
-This document defines the implemented model-project and shared-library contract. The project API, library API, rollout worker, and migration exist in the repository as one hard cutover; no compatibility schema exposes singular `source` input or output. This repository state does not prove a preview or production deployment. [`storage-rendering.md`](storage-rendering.md) owns object keys and render advancement, while [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) owns legacy conversion.
+This document defines the implemented model-project and shared-library contract. The project API, library API, rollout worker, and migration exist in the repository as one hard cutover; no compatibility schema exposes singular `source` input or output. This repository state does not prove a preview or production deployment. [`design-bundles.md`](design-bundles.md) owns the Python result contract. [`storage-rendering.md`](storage-rendering.md) owns object keys and render advancement, while [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) owns legacy conversion.
 
 The MCP API is the only source-bearing interface. Protobuf and browser APIs continue to expose model metadata and current-successful artifacts only. Existing protobuf field names such as `desired_source_revision` remain unchanged; their values identify project revisions after the cutover.
 
@@ -130,6 +130,8 @@ The canonical release bundle is one UTF-8 JSON object with keys in exact `format
 ```
 
 Major versions may break consumers. Minor and patch versions must remain backward compatible with every earlier release in the same major. A new version must be greater than every previously published version of that library. Publication is permanent: versions and bytes cannot be replaced, yanked, or deleted. A release has no dependency section and must not use a static import statement for another `faktory_shared` package. Server publication validation rejects forbidden static statement forms before storage. Before execution, the Python worker parses every library file and rejects syntax-aware multiline, aliased, and relative cross-library imports. Models must declare every shared library they use directly; transitive shared-library dependencies are unsupported.
+
+Concrete hardware definitions belong in exact immutable releases. Any geometry-affecting change to a physical definition, mating interface, fit, or clearance requires a new major release. The publisher owns this semantic version choice because Faktory cannot infer physical compatibility from Python source. Source-level Python constraint and interface helpers remain library APIs; Faktory does not persist them as structured server constraints. [`design-bundles.md`](design-bundles.md) defines this boundary.
 
 Faktory provides no external dependency declaration, installation, or resolution. Trusted projects and libraries can import modules already present in the fixed renderer runtime or Python standard library. This availability does not create a supported dependency contract. Dynamic import tricks that bypass static validation fall outside the trusted-source guarantee; the renderer is not a hostile-code sandbox.
 

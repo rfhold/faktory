@@ -2,7 +2,7 @@
 
 ## Status
 
-The server, CadQuery renderer, visual renderer, authentication modes, MCP issuer, object-store migrations, shared-library rollout recovery, and local Garage and PostgreSQL topology exist in the repository. Preview and production stacks declare the isolated visual-renderer workload, artifact and backup buckets, database backups, and telemetry targets. No repository implementation or declaration proves that a production bucket, backup, collector, Authentik resource, route, pipeline run, preview deployment, or production deployment exists.
+The server, CadQuery renderer, visual renderer, authentication modes, MCP issuer, object-store migrations, shared-library rollout recovery, and local Garage and PostgreSQL topology exist in the repository. The multipart recovery rules below define approved behavior under implementation. Preview and production stacks declare the isolated visual-renderer workload, artifact and backup buckets, database backups, and telemetry targets. No repository implementation or declaration proves that a production bucket, backup, collector, Authentik resource, route, pipeline run, preview deployment, or production deployment exists.
 
 ## Topology
 
@@ -18,11 +18,11 @@ At startup, the server runs every ordered object-store migration to completion b
 
 After migrations complete, the server enumerates authoritative model metadata. Every model in `PENDING` or `RENDERING` is returned to `PENDING` and queued once, including an explicit same-project rerender whose desired and current successful revisions match. A `FAILED` desired revision is not retried automatically. Operators can use render retry, or an MCP project edit can create new work. Durable compatible-library rollout records also resume idempotently and may create new desired project revisions.
 
-Missing desired project bundles or exact locked releases and invalid metadata make the affected model unhealthy and must produce safe diagnostics. A current revision without its GLB, preview, or matching facts is also unhealthy. Reconciliation must not delete objects, resolve dependencies, or advance the current successful revision.
+Missing desired project bundles or exact locked releases and invalid metadata make the affected model unhealthy and must produce safe diagnostics. A multipart current revision is unhealthy if it lacks its manifest, any declared required artifact, output summaries, or matching facts. A legacy current revision remains valid without a manifest when its synthetic primary artifact set is complete. Reconciliation must not delete objects, backfill manifests, resolve dependencies, or advance the current successful revision.
 
 ## Failure Handling
 
-- Render failure preserves the last successful GLB, preview, technical images, shaded images, and facts. It reports `FAILED` for the desired revision.
+- Any output render failure preserves the complete last-successful manifest, output artifacts, summaries, and facts. It reports `FAILED` for the desired revision.
 - Process restart may interrupt rendering; startup reconciliation retries only interrupted pending work.
 - Garage unavailability prevents authoritative mutation and artifact retrieval. The server advances success only after every required artifact write.
 - Visual-renderer unavailability, timeout, crash, malformed output, or saturation fails the desired project render. Restart alone does not retry a `FAILED` revision.
@@ -30,10 +30,11 @@ Missing desired project bundles or exact locked releases and invalid metadata ma
 - `model.render.retry` reuses the exact desired project and library locks. It never resolves a newly published release.
 - Compatible-library rollout resumes from its durable record after interruption. It re-evaluates concurrently edited models and never overwrites a newer desired project.
 - A visual-renderer crash can leave only worker-local temporary data. The read-only root and memory-backed `/tmp` make that data disposable.
-- A failed named-view render leaves no selectable cache entry. Retry the same `view.inspect` after worker recovery.
+- A failed primary named-view render leaves no selectable cache entry. Retry the same `view.inspect` after worker recovery.
 - A view or revision race can leave an unreachable immutable cache object. Current identity checks prevent its return; no cache cleanup operation exists.
+- A legacy current revision has one synthetic primary output and needs no manifest backfill. Its fixed keys remain selectable.
 - A legacy current revision can lack canonical shaded images. No rerender or backfill operation exists for that gap; a later project revision must succeed.
-- A saved-view inspect can render from a legacy current GLB after worker recovery, even when canonical shaded images remain absent.
+- A saved-view inspect can render from a legacy primary GLB after worker recovery, even when canonical shaded images remain absent.
 - Watch disconnection is recovered by reconnecting and accepting a new authoritative snapshot.
 - View etag conflicts are user-visible concurrency conflicts, not automatic overwrite opportunities.
 

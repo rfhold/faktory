@@ -2,7 +2,7 @@
 
 ## Status
 
-Explicit disabled and production authentication paths are implemented. Compose sets exact `FAKTORY_AUTH_MODE=disabled` and contains no identity provider. Pulumi declares the production Authentik application/provider and externally supplied secrets. No Authentik resource, OAuth client, session key, credential, or route has been created externally.
+Explicit disabled and production authentication paths are implemented. The output-aware artifact routes reuse the same boundary under the approved multipart contract. Compose sets exact `FAKTORY_AUTH_MODE=disabled` and contains no identity provider. Pulumi declares the production Authentik application/provider and externally supplied secrets. No Authentik resource, OAuth client, session key, credential, or route has been created externally.
 
 ## Browser Access
 
@@ -12,7 +12,7 @@ Production requires HTTPS for the public URL and OIDC issuer. Userinfo, query st
 
 Disabled mode is accepted only through exact `FAKTORY_AUTH_MODE=disabled`. It applies no browser middleware or interceptor to the SPA, gRPC-web, or artifact routes, and serves MCP without OAuth or bearer authentication. Compose publishes this unauthenticated service on `0.0.0.0:8080` for `http://172.16.1.40:8080`. Use it only on a trusted private network, and restrict TCP 8080 with the host firewall. Garage remains loopback-only, and the visual renderer remains unexposed.
 
-Every authenticated web user may list models, inspect render state, retrieve current successful geometry, list shared views, create or update a named view, delete a named view, and select a default view. Views are shared model state rather than per-user preferences.
+Every authenticated web user may list models, inspect render state, and retrieve every current-successful output's GLB and preview. Users may also list shared views, mutate them, and select a default view. Views target only the primary output and remain shared model state rather than per-user preferences.
 
 ## MCP Access
 
@@ -24,7 +24,7 @@ When CIMD is enabled, Faktory can retrieve a client metadata document from an HT
 
 Pulumi creates one 256-bit OAuth wrapping key for each configured version. The keyring names one active version and retains older versions for encrypted database records. Version identifiers use unique DNS labels. The configuration accepts from 1 through 32 versions. Pulumi stores key material as secret state and projects it only through the `faktory-oauth-wrapping-keys` Secret. A secret-derived checksum rolls the server pod after a keyring change. The runtime rejects a keyring that cannot decrypt required OAuth signing state.
 
-Any authenticated MCP principal can create, open, discover, read, patch, and edit model projects under the `faktory:use` scope. The same principal can list, open, read, retrieve, and publish shared-library releases. The principal can inspect one technical or shaded canonical projection per call and one exact saved shaded view. The MVP defines no narrower source-author or publisher role. Project and library source, generated guidance, and bundled docs remain MCP-only. Workspace tools expose views over canonical objects, not server filesystem paths or a second storage model. MCP tools do not expose arbitrary object keys, Python execution arguments, renderer commands, storage credentials, GLB bytes, or storage-internal metadata. PNG bytes appear only in authorized semantic inspect results. Browser artifact URLs and browser sessions do not apply to MCP. [`protocol.md`](protocol.md) defines tool results and errors. [`model-projects-libraries.md`](model-projects-libraries.md) defines project and library semantics.
+Any authenticated MCP principal can create, open, discover, read, patch, and edit model projects under the `faktory:use` scope. The same principal can list, open, read, retrieve, and publish shared-library releases. The principal can inspect one selected output's technical projection per call. Shaded projection and saved-view inspection remain primary-only. The MVP defines no narrower source-author or publisher role. Project and library source, generated guidance, and bundled docs remain MCP-only. Workspace tools expose views over canonical objects, not server filesystem paths or a second storage model. MCP tools do not expose arbitrary object keys, Python execution arguments, renderer commands, storage credentials, GLB bytes, or storage-internal metadata. PNG bytes appear only in authorized semantic inspect results. Browser artifact URLs and browser sessions do not apply to MCP. [`protocol.md`](protocol.md) defines tool results and errors. [`model-projects-libraries.md`](model-projects-libraries.md) defines project and library semantics.
 
 ## Visual Renderer Boundary
 

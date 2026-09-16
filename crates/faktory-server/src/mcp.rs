@@ -157,6 +157,7 @@ impl FaktoryMcp {
         match inspect_model(
             &self.repository,
             &input.model_id,
+            input.output_id.as_deref(),
             input.projection,
             input.render_style,
         )
@@ -386,6 +387,7 @@ async fn get_model_with_project(
 async fn inspect_model(
     repository: &Repository,
     model_id: &str,
+    output_id: Option<&str>,
     projection: TechnicalProjection,
     render_style: RenderStyle,
 ) -> Result<McpToolResult, RepositoryError> {
@@ -394,15 +396,31 @@ async fn inspect_model(
     if rendered_revision.is_empty() {
         return Err(RepositoryError::NotFound);
     }
+    let output = match output_id {
+        Some(output_id) => model
+            .effective_outputs()
+            .into_iter()
+            .find(|output| output.output_id == output_id)
+            .ok_or(RepositoryError::NotFound)?,
+        None => model.primary_output()?,
+    };
     let image = match render_style {
         RenderStyle::Technical => {
             let image = repository
-                .projection_image(model_id, &rendered_revision, projection)
+                .output_projection_image(
+                    model_id,
+                    &rendered_revision,
+                    &output.output_id,
+                    projection,
+                )
                 .await?;
             validate_projection_png(&image).map_err(|_| RepositoryError::Corrupt)?;
             image
         }
         RenderStyle::Shaded => {
+            if !output.primary {
+                return Err(RepositoryError::Invalid);
+            }
             let image = repository
                 .shaded_projection_image(model_id, &rendered_revision, projection)
                 .await?;
@@ -427,6 +445,9 @@ async fn inspect_model(
     };
     let mut metadata = json!({
         "model_id": model.id,
+        "output_id": output.output_id,
+        "output_role": output.role,
+        "primary": output.primary,
         "projection": projection,
         "width": PROJECTION_WIDTH,
         "height": PROJECTION_HEIGHT,
@@ -450,6 +471,7 @@ async fn inspect_model(
     })))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn inspect_view(
     repository: &Repository,
     visual: &VisualCoordinator,
@@ -462,8 +484,10 @@ async fn inspect_view(
         return Err(RepositoryError::NotFound);
     }
     let view = repository.get_view(model_id, view_id).await?.record;
+    let primary = model.primary_output()?;
     let identity = ViewRenderIdentity {
         revision: revision.clone(),
+        output_id: primary.output_id.clone(),
         view_id: view.id.clone(),
         view_etag: view.etag.clone(),
     };
@@ -510,6 +534,9 @@ async fn inspect_view(
     };
     let metadata = json!({
         "model_id": current.id,
+        "output_id": primary.output_id,
+        "output_role": primary.role,
+        "primary": true,
         "view_id": current_view.id,
         "view_etag": current_view.etag,
         "style": "shaded",
@@ -799,6 +826,7 @@ struct EmptyInput {}
 #[serde(deny_unknown_fields)]
 struct InspectInput {
     model_id: String,
+    output_id: Option<String>,
     projection: TechnicalProjection,
     #[serde(default)]
     render_style: RenderStyle,
@@ -1087,6 +1115,13 @@ fn model_inspect_definition() -> McpToolDefinition {
             "type": "object",
             "properties": {
                 "model_id": model_id_property(),
+                "output_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                    "description": "Optional output ID; defaults to the primary output. Shaded inspection is primary-only."
+                },
                 "projection": {
                     "type": "string",
                     "enum": ["isometric", "front", "back", "left", "right", "top", "bottom"],
@@ -1581,8 +1616,9 @@ mod tests {
     use super::*;
     use crate::{
         model::{
-            GeometryFactsRecord, GeometrySizeRecord, RenderedOutput, SourcePatch,
-            StoredRenderState, TechnicalProjectionImages,
+            GeometryFactsRecord, GeometrySizeRecord, ModelOutputSummaryRecord, OutputManifest,
+            OutputRoleRecord, RenderedModelOutput, RenderedOutput, SourcePatch, StoredRenderState,
+            TechnicalProjectionImages,
             project::{ExactPatch, project_key},
         },
         render::RenderConfig,
@@ -1719,9 +1755,10 @@ mod tests {
     }
 
     fn rendered_output(image: Bytes) -> RenderedOutput {
-        RenderedOutput {
-            glb: Bytes::from_static(b"glb"),
-            preview: Bytes::from_static(b"<svg></svg>"),
+        let summary = ModelOutputSummaryRecord {
+            output_id: "primary".to_owned(),
+            role: OutputRoleRecord::Assembly,
+            primary: true,
             facts: GeometryFactsRecord {
                 volume_cubic_millimeters: 1.0,
                 size_millimeters: GeometrySizeRecord {
@@ -1730,8 +1767,21 @@ mod tests {
                     z: 1.0,
                 },
             },
-            projections: TechnicalProjectionImages::all(image),
-            shaded: TechnicalProjectionImages::all(valid_projection_png()),
+        };
+        RenderedOutput {
+            manifest: OutputManifest {
+                format: OutputManifest::FORMAT.to_owned(),
+                outputs: vec![summary.clone()],
+            }
+            .canonical_bytes()
+            .expect("manifest"),
+            outputs: vec![RenderedModelOutput {
+                summary,
+                glb: Bytes::from_static(b"glb"),
+                preview: Bytes::from_static(b"<svg></svg>"),
+                projections: TechnicalProjectionImages::all(image),
+                shaded: Some(TechnicalProjectionImages::all(valid_projection_png())),
+            }],
         }
     }
 
@@ -1907,20 +1957,7 @@ mod tests {
             .complete_render(
                 &created.id,
                 &created.desired_source_revision,
-                RenderedOutput {
-                    glb: Bytes::from_static(b"glb"),
-                    preview: Bytes::from_static(b"<svg></svg>"),
-                    facts: GeometryFactsRecord {
-                        volume_cubic_millimeters: 1.0,
-                        size_millimeters: GeometrySizeRecord {
-                            x: 1.0,
-                            y: 1.0,
-                            z: 1.0,
-                        },
-                    },
-                    projections: TechnicalProjectionImages::all(Bytes::from_static(b"png")),
-                    shaded: TechnicalProjectionImages::all(Bytes::from_static(b"shaded-png")),
-                },
+                rendered_output(Bytes::from_static(b"png")),
             )
             .await
             .expect("complete initial render");
@@ -1982,6 +2019,7 @@ mod tests {
         let output = inspect_model(
             &repository,
             "part",
+            None,
             TechnicalProjection::Front,
             RenderStyle::Technical,
         )
@@ -2051,6 +2089,7 @@ mod tests {
                 "part",
                 &ViewRenderIdentity {
                     revision: model.desired_source_revision.clone(),
+                    output_id: "primary".to_owned(),
                     view_id: view.id.clone(),
                     view_etag: view.etag.clone(),
                 },
@@ -2205,6 +2244,7 @@ mod tests {
         let output = inspect_model(
             &repository,
             "part",
+            None,
             TechnicalProjection::Top,
             RenderStyle::Shaded,
         )
@@ -2234,6 +2274,7 @@ mod tests {
         let stale = inspect_model(
             &repository,
             "part",
+            None,
             TechnicalProjection::Top,
             RenderStyle::Shaded,
         )
@@ -2241,9 +2282,10 @@ mod tests {
         .expect("stale shaded inspect");
         assert_eq!(stale.raw["structuredContent"]["metadata"]["stale"], true);
 
-        let key = crate::model::shaded_projection_key(
+        let key = crate::model::output_shaded_projection_key(
             "part",
             &created.desired_source_revision,
+            "primary",
             TechnicalProjection::Top,
         );
         let stored = store.get(&key).await.expect("stored shaded image");
@@ -2255,6 +2297,7 @@ mod tests {
             inspect_model(
                 &repository,
                 "part",
+                None,
                 TechnicalProjection::Top,
                 RenderStyle::Shaded,
             )
@@ -2269,7 +2312,7 @@ mod tests {
             .await
             .expect("create corrupt model");
         let mut output = rendered_output(valid_projection_png());
-        output.shaded = TechnicalProjectionImages::all(pseudo_projection_png());
+        output.outputs[0].shaded = Some(TechnicalProjectionImages::all(pseudo_projection_png()));
         corrupt_repository
             .complete_render(&corrupt.id, &corrupt.desired_source_revision, output)
             .await
@@ -2278,6 +2321,7 @@ mod tests {
             inspect_model(
                 &corrupt_repository,
                 "corrupt",
+                None,
                 TechnicalProjection::Top,
                 RenderStyle::Shaded,
             )
@@ -2409,6 +2453,7 @@ mod tests {
                 "part",
                 &ViewRenderIdentity {
                     revision: created.desired_source_revision.clone(),
+                    output_id: "primary".to_owned(),
                     view_id: changed.id.clone(),
                     view_etag: changed.etag.clone(),
                 },
@@ -2539,6 +2584,7 @@ mod tests {
         let output = inspect_model(
             &repository,
             "part",
+            None,
             TechnicalProjection::Top,
             RenderStyle::Technical,
         )
@@ -2577,6 +2623,7 @@ mod tests {
         let error = inspect_model(
             &repository,
             "part",
+            None,
             TechnicalProjection::Bottom,
             RenderStyle::Technical,
         )
@@ -2601,9 +2648,10 @@ mod tests {
             )
             .await
             .expect("complete legacy fixture");
-        let key = crate::model::projection_key(
+        let key = crate::model::output_projection_key(
             &rendered.id,
             &rendered.desired_source_revision,
+            "primary",
             TechnicalProjection::Bottom,
         );
         let image = store.get(&key).await.expect("stored image");
@@ -2611,6 +2659,7 @@ mod tests {
         let missing = inspect_model(
             &legacy_repository,
             "legacy",
+            None,
             TechnicalProjection::Bottom,
             RenderStyle::Technical,
         )
@@ -2619,6 +2668,85 @@ mod tests {
         assert_eq!(
             tool_error(missing).raw["structuredContent"]["error"]["code"],
             "not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_inspect_selects_secondary_technical_output_and_rejects_shaded() {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let model = repository
+            .create_model("bundle", "Bundle", b"source")
+            .await
+            .expect("create model");
+        let mut rendered = rendered_output(valid_projection_png());
+        let secondary = RenderedModelOutput {
+            summary: ModelOutputSummaryRecord {
+                output_id: "secondary".to_owned(),
+                role: OutputRoleRecord::Part,
+                primary: false,
+                facts: GeometryFactsRecord {
+                    volume_cubic_millimeters: 1.0,
+                    size_millimeters: GeometrySizeRecord {
+                        x: 1.0,
+                        y: 1.0,
+                        z: 1.0,
+                    },
+                },
+            },
+            glb: Bytes::from_static(b"secondary-glb"),
+            preview: Bytes::from_static(b"<svg></svg>"),
+            projections: TechnicalProjectionImages::all(valid_projection_png()),
+            shaded: None,
+        };
+        rendered.outputs.push(secondary);
+        rendered.manifest = OutputManifest {
+            format: OutputManifest::FORMAT.to_owned(),
+            outputs: rendered
+                .outputs
+                .iter()
+                .map(|output| output.summary.clone())
+                .collect(),
+        }
+        .canonical_bytes()
+        .expect("manifest");
+        repository
+            .complete_render(&model.id, &model.desired_source_revision, rendered)
+            .await
+            .expect("complete bundle");
+
+        let inspected = inspect_model(
+            &repository,
+            &model.id,
+            Some("secondary"),
+            TechnicalProjection::Top,
+            RenderStyle::Technical,
+        )
+        .await
+        .expect("inspect secondary");
+        assert_eq!(
+            inspected.raw["structuredContent"]["metadata"]["output_id"],
+            "secondary"
+        );
+        assert_eq!(
+            inspected.raw["structuredContent"]["metadata"]["output_role"],
+            "part"
+        );
+        assert_eq!(
+            inspected.raw["structuredContent"]["metadata"]["primary"],
+            false
+        );
+
+        assert_eq!(
+            inspect_model(
+                &repository,
+                &model.id,
+                Some("secondary"),
+                TechnicalProjection::Top,
+                RenderStyle::Shaded,
+            )
+            .await
+            .expect_err("secondary shaded inspection is forbidden"),
+            RepositoryError::Invalid
         );
     }
 
@@ -2641,6 +2769,7 @@ mod tests {
         let error = inspect_model(
             &repository,
             "corrupt",
+            None,
             TechnicalProjection::Isometric,
             RenderStyle::Technical,
         )
@@ -2888,6 +3017,10 @@ mod tests {
         assert_eq!(
             inspect.input_schema["required"],
             json!(["model_id", "projection"])
+        );
+        assert_eq!(
+            inspect.input_schema["properties"]["output_id"]["pattern"],
+            "^[a-z0-9]+(-[a-z0-9]+)*$"
         );
         assert_eq!(inspect.input_schema["additionalProperties"], false);
 

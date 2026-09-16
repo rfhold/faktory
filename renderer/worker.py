@@ -5,6 +5,8 @@ import contextlib
 import json
 import math
 import os
+import shutil
+import stat
 import struct
 import sys
 import sysconfig
@@ -22,8 +24,16 @@ from OCP.BRepLib import BRepLib
 from OCP.HLRAlgo import HLRAlgo_Projector
 from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+from renderer import faktory_design as _design_package
+from renderer.faktory_design import v1 as _design_v1
+from renderer.faktory_design.v1 import Design, Output
+
+sys.modules.setdefault("faktory_design", _design_package)
+sys.modules.setdefault("faktory_design.v1", _design_v1)
 
 ERROR_PREFIX: Final = "renderer_error="
+MAX_GLB_BYTES: Final = 64 * 1024 * 1024
+MAX_BUNDLE_BYTES: Final = 192 * 1024 * 1024
 PROJECTIONS: Final = (
     ("isometric", (1, -1, 1), (1, 1, 0)),
     ("front", (0, -1, 0), (1, 0, 0)),
@@ -122,15 +132,15 @@ def _validate_paths(
     project_root: Path,
     entrypoint: Path,
     library_root: Path,
-    output_paths: tuple[Path, ...],
-) -> tuple[str | None, Path | None, Path | None, Path | None]:
+    output_root: Path,
+) -> tuple[str | None, Path | None, Path | None, Path | None, Path | None]:
     try:
         if not project_root.is_dir() or project_root.is_symlink():
-            return "invalid_project_root", None, None, None
+            return "invalid_project_root", None, None, None, None
         if not library_root.is_dir() or library_root.is_symlink():
-            return "invalid_library_root", None, None, None
+            return "invalid_library_root", None, None, None, None
         if entrypoint.is_absolute() or ".." in entrypoint.parts:
-            return "invalid_entrypoint", None, None, None
+            return "invalid_entrypoint", None, None, None, None
         resolved_project_root = project_root.resolve(strict=True)
         resolved_library_root = library_root.resolve(strict=True)
         lexical_entrypoint = resolved_project_root / entrypoint
@@ -138,38 +148,42 @@ def _validate_paths(
         for part in entrypoint.parts:
             current /= part
             if current.is_symlink():
-                return "invalid_entrypoint", None, None, None
+                return "invalid_entrypoint", None, None, None, None
         if not lexical_entrypoint.is_file():
-            return "invalid_entrypoint", None, None, None
+            return "invalid_entrypoint", None, None, None, None
         resolved_entrypoint = lexical_entrypoint.resolve(strict=True)
         if (
             not _is_relative_to(resolved_entrypoint, resolved_project_root)
             or not resolved_entrypoint.is_file()
             or resolved_entrypoint.suffix != ".py"
         ):
-            return "invalid_entrypoint", None, None, None
+            return "invalid_entrypoint", None, None, None, None
+        if (
+            not output_root.name
+            or not output_root.parent.is_dir()
+            or output_root.parent.is_symlink()
+            or output_root.parent.resolve(strict=True) != output_root.parent.absolute()
+            or output_root.exists()
+            or output_root.is_symlink()
+        ):
+            return "invalid_output_path", None, None, None, None
+        resolved_output_root = output_root.resolve()
         resolved_paths = [
             resolved_entrypoint,
             resolved_project_root,
             resolved_library_root,
-            *(path.resolve() for path in output_paths),
+            resolved_output_root,
         ]
         if len(set(resolved_paths)) != len(resolved_paths):
-            return "invalid_output_path", None, None, None
-        for output_path in output_paths:
-            if (
-                not output_path.parent.is_dir()
-                or output_path.exists()
-                or output_path.is_symlink()
-            ):
-                return "invalid_output_path", None, None, None
+            return "invalid_output_path", None, None, None, None
     except (OSError, RuntimeError):
-        return "invalid_path", None, None, None
+        return "invalid_path", None, None, None, None
     return (
         None,
         resolved_project_root,
         resolved_entrypoint,
         resolved_library_root,
+        resolved_output_root,
     )
 
 
@@ -300,7 +314,9 @@ def _execution_environment(
         ]
         for name in tuple(sys.modules):
             top_level = name.partition(".")[0]
-            if top_level == "faktory_shared" or top_level in project_names:
+            if top_level == "faktory_shared" or (
+                top_level in project_names and top_level != "faktory_design"
+            ):
                 del sys.modules[name]
         sys.modules["__main__"] = main_module
         yield main_module.__dict__
@@ -399,12 +415,51 @@ def _validate_facts(output_path: Path) -> bool:
     )
 
 
-def _remove_outputs(output_paths: tuple[Path, ...]) -> None:
-    for output_path in output_paths:
-        try:
-            output_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+def _remove_output_tree(output_root: Path) -> None:
+    try:
+        shutil.rmtree(output_root)
+    except OSError:
+        pass
+
+
+def _regular_file_size(path: Path) -> int | None:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return metadata.st_size
+
+
+def _regular_file_within_limit(path: Path, max_bytes: int) -> bool | None:
+    size = _regular_file_size(path)
+    return None if size is None else size <= max_bytes
+
+
+def _expected_bundle_paths(output_root: Path, outputs: tuple[Output, ...]) -> Iterator[Path]:
+    yield output_root / "outputs.json"
+    for output in outputs:
+        artifact_root = output_root / "outputs" / output.output_id
+        yield artifact_root / "model.glb"
+        yield artifact_root / "preview.svg"
+        yield artifact_root / "facts.json"
+        for name, _, _ in PROJECTIONS:
+            yield artifact_root / "projections" / f"{name}.svg"
+
+
+def _bundle_within_limit(
+    output_root: Path,
+    outputs: tuple[Output, ...],
+    max_bytes: int = MAX_BUNDLE_BYTES,
+) -> bool:
+    total = 0
+    for path in _expected_bundle_paths(output_root, outputs):
+        size = _regular_file_size(path)
+        if size is None or size < 0 or size > max_bytes - total:
+            return False
+        total += size
+    return True
 
 
 def _stabilize_assembly_names(assembly: cq.Assembly) -> None:
@@ -421,39 +476,148 @@ def _stabilize_assembly_names(assembly: cq.Assembly) -> None:
     visit(assembly, "result")
 
 
+def _normalize_result(result: object) -> tuple[str | None, tuple[Output, ...] | None]:
+    if type(result) is Design:
+        try:
+            outputs = tuple(
+                Output(
+                    output_id=output.output_id,
+                    role=output.role,
+                    geometry=output.geometry,
+                    primary=output.primary,
+                )
+                for output in result.outputs
+                if type(output) is Output
+            )
+            if len(outputs) != len(result.outputs):
+                return "invalid_design", None
+            normalized = Design(outputs)
+        except BaseException:
+            return "invalid_design", None
+        return None, normalized.outputs
+    if isinstance(result, cq.Assembly):
+        role = "assembly"
+    elif isinstance(result, (cq.Workplane, cq.Shape)):
+        role = "part"
+    else:
+        return "unsupported_result", None
+    return None, (Output("primary", role, result, primary=True),)
+
+
+def _render_output(
+    output: Output, output_root: Path
+) -> tuple[str | None, dict[str, object] | None]:
+    if isinstance(output.geometry, cq.Assembly):
+        assembly = output.geometry
+    elif isinstance(output.geometry, (cq.Workplane, cq.Shape)):
+        try:
+            assembly = cq.Assembly(output.geometry, name="result")
+        except Exception:
+            return "unsupported_geometry", None
+    else:
+        return "unsupported_geometry", None
+    _stabilize_assembly_names(assembly)
+
+    try:
+        compound = assembly.toCompound()
+        bounding_box = compound.BoundingBox()
+        facts: dict[str, object] = {
+            "volume_cubic_millimeters": compound.Volume(),
+            "size_millimeters": {
+                "x": bounding_box.xlen,
+                "y": bounding_box.ylen,
+                "z": bounding_box.zlen,
+            },
+        }
+        size = facts["size_millimeters"]
+        if not _valid_number(facts["volume_cubic_millimeters"]) or not isinstance(
+            size, dict
+        ) or not all(_valid_number(size[axis]) for axis in ("x", "y", "z")):
+            raise ValueError("invalid geometry facts")
+    except BaseException:
+        return "geometry_failed", None
+
+    projection_root = output_root / "projections"
+    try:
+        projection_root.mkdir(parents=True)
+        facts_path = output_root / "facts.json"
+        facts_path.write_text(
+            json.dumps(facts, allow_nan=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    except BaseException:
+        return "facts_export_failed", None
+    if not _validate_facts(facts_path):
+        return "invalid_facts", None
+
+    preview_path = output_root / "preview.svg"
+    for name, direction, screen_right in PROJECTIONS:
+        projection_path = projection_root / f"{name}.svg"
+        try:
+            svg = _get_svg(compound, direction, screen_right)
+            projection_path.write_text(svg, encoding="utf-8")
+            if name == "isometric":
+                preview_path.write_text(svg, encoding="utf-8")
+        except BaseException:
+            return "svg_export_failed", None
+        if not _validate_svg(projection_path):
+            return "invalid_svg", None
+    if not _validate_svg(preview_path):
+        return "invalid_svg", None
+
+    glb_path = output_root / "model.glb"
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                exported = exportGLTF(assembly, str(glb_path), binary=True)
+        if exported is False:
+            raise RuntimeError("CadQuery reported an unsuccessful export")
+    except BaseException:
+        return "export_failed", None
+    glb_within_limit = _regular_file_within_limit(glb_path, MAX_GLB_BYTES)
+    if glb_within_limit is None:
+        return "invalid_glb", None
+    if not glb_within_limit:
+        return "glb_too_large", None
+    if not _validate_glb(glb_path):
+        return "invalid_glb", None
+    return None, facts
+
+
 def render(
     project_root: Path,
     entrypoint: Path,
     library_root: Path,
-    glb_path: Path,
-    svg_path: Path,
-    facts_path: Path,
-    projection_paths: tuple[Path, ...],
+    output_root: Path,
 ) -> str | None:
-    if len(projection_paths) != len(PROJECTIONS):
-        return "invalid_arguments"
-    output_paths = (glb_path, svg_path, facts_path, *projection_paths)
-    path_error, project_root, source_path, library_root = _validate_paths(
-        project_root, entrypoint, library_root, output_paths
+    path_error, project_root, source_path, library_root, output_root = _validate_paths(
+        project_root, entrypoint, library_root, output_root
     )
     if path_error is not None:
         return path_error
     assert project_root is not None
     assert source_path is not None
     assert library_root is not None
+    assert output_root is not None
+
+    temporary_root = output_root.with_name(f".{output_root.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary_root.mkdir(mode=0o700)
+    except OSError:
+        return "output_create_failed"
 
     library_error = _validate_library_sources(library_root)
     if library_error is not None:
-        _remove_outputs(output_paths)
+        _remove_output_tree(temporary_root)
         return library_error
 
     try:
         source = source_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        _remove_outputs(output_paths)
+        _remove_output_tree(temporary_root)
         return "invalid_utf8"
     except OSError:
-        _remove_outputs(output_paths)
+        _remove_output_tree(temporary_root)
         return "source_read_failed"
 
     try:
@@ -465,96 +629,57 @@ def render(
                 ) as namespace:
                     exec(code, namespace)
     except BaseException:
-        _remove_outputs(output_paths)
+        _remove_output_tree(temporary_root)
         return "source_execution_failed"
 
     if "result" not in namespace:
-        _remove_outputs(output_paths)
+        _remove_output_tree(temporary_root)
         return "missing_result"
 
-    result = namespace["result"]
-    if isinstance(result, cq.Assembly):
-        assembly = result
-    elif isinstance(result, (cq.Workplane, cq.Shape)):
-        try:
-            assembly = cq.Assembly(result, name="result")
-        except Exception:
-            _remove_outputs(output_paths)
-            return "unsupported_result"
-    else:
-        _remove_outputs(output_paths)
-        return "unsupported_result"
-    _stabilize_assembly_names(assembly)
+    result_error, outputs = _normalize_result(namespace["result"])
+    if result_error is not None or outputs is None:
+        _remove_output_tree(temporary_root)
+        return result_error
 
-    try:
-        compound = assembly.toCompound()
-        bounding_box = compound.BoundingBox()
-        facts = {
-            "volume_cubic_millimeters": compound.Volume(),
-            "size_millimeters": {
-                "x": bounding_box.xlen,
-                "y": bounding_box.ylen,
-                "z": bounding_box.zlen,
-            },
-        }
-        if not _valid_number(facts["volume_cubic_millimeters"]) or not all(
-            _valid_number(facts["size_millimeters"][axis])
-            for axis in ("x", "y", "z")
-        ):
-            raise ValueError("invalid geometry facts")
-    except BaseException:
-        _remove_outputs(output_paths)
-        return "geometry_failed"
+    summaries = []
+    for output in outputs:
+        output_path = temporary_root / "outputs" / output.output_id
+        output_error, facts = _render_output(output, output_path)
+        if output_error is not None or facts is None:
+            _remove_output_tree(temporary_root)
+            return output_error
+        summaries.append(
+            {
+                "output_id": output.output_id,
+                "role": output.role,
+                "primary": output.primary,
+                "facts": facts,
+            }
+        )
 
+    manifest = {"format": "faktory-outputs-v1", "outputs": summaries}
     try:
-        facts_path.write_text(
-            json.dumps(facts, allow_nan=False, separators=(",", ":")) + "\n",
+        (temporary_root / "outputs.json").write_text(
+            json.dumps(manifest, allow_nan=False, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
     except BaseException:
-        _remove_outputs(output_paths)
-        return "facts_export_failed"
-    if not _validate_facts(facts_path):
-        _remove_outputs(output_paths)
-        return "invalid_facts"
-
-    for (name, direction, screen_right), projection_path in zip(
-        PROJECTIONS, projection_paths, strict=True
-    ):
-        try:
-            svg = _get_svg(compound, direction, screen_right)
-            projection_path.write_text(svg, encoding="utf-8")
-            if name == "isometric":
-                svg_path.write_text(svg, encoding="utf-8")
-        except BaseException:
-            _remove_outputs(output_paths)
-            return "svg_export_failed"
-        if not _validate_svg(projection_path):
-            _remove_outputs(output_paths)
-            return "invalid_svg"
-    if not _validate_svg(svg_path):
-        _remove_outputs(output_paths)
-        return "invalid_svg"
-
+        _remove_output_tree(temporary_root)
+        return "manifest_export_failed"
+    if not _bundle_within_limit(temporary_root, outputs):
+        _remove_output_tree(temporary_root)
+        return "bundle_too_large"
     try:
-        with open(os.devnull, "w", encoding="utf-8") as devnull:
-            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                exported = exportGLTF(assembly, str(glb_path), binary=True)
-        if exported is False:
-            raise RuntimeError("CadQuery reported an unsuccessful export")
-    except BaseException:
-        _remove_outputs(output_paths)
-        return "export_failed"
-
-    if not _validate_glb(glb_path):
-        _remove_outputs(output_paths)
-        return "invalid_glb"
+        temporary_root.rename(output_root)
+    except OSError:
+        _remove_output_tree(temporary_root)
+        return "output_publish_failed"
     return None
 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 13:
+    if len(args) != 4:
         print(f"{ERROR_PREFIX}invalid_arguments", file=sys.stderr)
         return 2
 
@@ -563,9 +688,6 @@ def main(argv: list[str] | None = None) -> int:
         Path(args[1]),
         Path(args[2]),
         Path(args[3]),
-        Path(args[4]),
-        Path(args[5]),
-        tuple(Path(path) for path in args[6:]),
     )
     if error is not None:
         print(f"{ERROR_PREFIX}{error}", file=sys.stderr)

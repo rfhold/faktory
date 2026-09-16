@@ -186,6 +186,14 @@ describe("preview declarations", () => {
     assert.equal(secret.FAKTORY_S3_REGION, "us-east-1");
     assert.equal(secret.FAKTORY_VISUAL_RENDERER_URL, "http://visual-renderer.faktory-test.svc.cluster.local:8081");
     assert.equal(secret.FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS, "30");
+    assert.deepEqual(
+      container.volumeMounts.find(({ name }: { name: string }) => name === "tmp"),
+      { name: "tmp", mountPath: "/tmp" },
+    );
+    assert.deepEqual(
+      pod.volumes.find(({ name }: { name: string }) => name === "tmp"),
+      { name: "tmp", emptyDir: { sizeLimit: "512Mi" } },
+    );
   });
 
   test("declares one isolated amd64 visual renderer", () => {

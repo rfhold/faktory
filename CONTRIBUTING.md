@@ -4,6 +4,8 @@ Read [the documentation index](docs/README.md) and the nearest contract before c
 
 The implemented model-project hard cutover is defined by [Model Projects and Shared Libraries](docs/architecture/model-projects-libraries.md) and [Object-Store Migrations](docs/operations/object-store-migrations.md). Preserve its bulk MCP contracts, agent-oriented virtual workspace, canonical bundle, shared-library rollout, and legacy migration together. Do not reintroduce a singular-source schema. Workspace tools must remain views and transactions over canonical objects, not OS filesystem or arbitrary object-store access. This behavior adds no protobuf fields, HTTP source route, or browser source interface.
 
+The approved multipart result contract is defined by [Multipart Design Bundles](docs/architecture/design-bundles.md), with storage and protocol details in the linked architecture documents. It is under implementation on this branch. Preserve project revision identity, exact locks, source confidentiality, current-only artifact gates, retained-last-good behavior, and all-output atomicity. Keep legacy result types and revisions as one synthetic primary output without destructive migration.
+
 ## Toolchains
 
 - Rust `1.96.0` with edition 2024.
@@ -56,7 +58,7 @@ git diff --check
 
 Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Each Faktory image receives a matching native renderer check before manifest publication.
 
-The pipelines build `faktory-visual-renderer` only for AMD64 from the `visual-renderer-runtime` target. A native AMD64 task starts the packaged service under the production hardening policy. It renders a colored GLB and validates all seven PNG responses. Deployment receives the worker image by immutable digest.
+The pipelines exercise each native Faktory image with a small explicit multipart `Design`, validating the manifest, primary and secondary worker artifacts, GLB framing, and absence of server-owned shaded files. They build `faktory-visual-renderer` only for AMD64 from the `visual-renderer-runtime` target. A native AMD64 task starts the packaged service under the production hardening policy. It renders a colored GLB and validates all seven PNG responses. Deployment receives the worker image by immutable digest.
 
 ## Releases
 
@@ -94,35 +96,33 @@ output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
 trap '\''rm -rf "$output_dir"'\'' EXIT
 mkdir "$output_dir/libraries"
 /opt/faktory/env/bin/python -m renderer \
-  /opt/faktory/renderer/examples \
-  box.py \
+  /opt/faktory/renderer/examples/constraint_bench \
+  main.py \
   "$output_dir/libraries" \
-  "$output_dir/model.glb" \
-  "$output_dir/model.svg" \
-  "$output_dir/model.json" \
-  "$output_dir/isometric.svg" \
-  "$output_dir/front.svg" \
-  "$output_dir/back.svg" \
-  "$output_dir/left.svg" \
-  "$output_dir/right.svg" \
-  "$output_dir/top.svg" \
-  "$output_dir/bottom.svg"
+  "$output_dir/bundle"
 /opt/faktory/env/bin/python -c '\''
+import json
 import struct
 import sys
 from pathlib import Path
 
-content = Path(sys.argv[1]).read_bytes()
+root = Path(sys.argv[1])
+manifest = json.loads((root / "outputs.json").read_text(encoding="utf-8"))
+if [output["output_id"] for output in manifest["outputs"]] != [
+    "bench", "base", "leg", "router-template"
+]:
+    raise SystemExit("invalid output manifest")
+content = (root / "outputs" / "bench" / "model.glb").read_bytes()
 if len(content) < 12:
     raise SystemExit("GLB header is truncated")
 magic, version, declared_size = struct.unpack("<4sII", content[:12])
 if magic != b"glTF" or version != 2 or declared_size != len(content):
     raise SystemExit("invalid GLB header")
-'\'' "$output_dir/model.glb"
+'\'' "$output_dir/bundle"
 '
 ```
 
-This local command validates only the architecture executed by the local Docker engine. It does not replace the pipeline's native AMD64 and ARM64 tasks or prove either remote task has run.
+This local command renders the constraint-derived bench example and validates its four-output manifest and primary GLB. It validates only the architecture executed by the local Docker engine. It does not replace the pipeline's native AMD64 and ARM64 tasks or prove either remote task has run.
 
 ## Local Compose Integration
 

@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file faktory/v1/faktory.proto.
  */
 export const file_faktory_v1_faktory: GenFile = /*@__PURE__*/
-  fileDesc("ChhmYWt0b3J5L3YxL2Zha3RvcnkucHJvdG8SCmZha3RvcnkudjEiKgoHVmVjdG9yMxIJCgF4GAEgASgBEgkKAXkYAiABKAESCQoBehgDIAEoASI4CgpRdWF0ZXJuaW9uEgkKAXgYASABKAESCQoBeRgCIAEoARIJCgF6GAMgASgBEgkKAXcYBCABKAEiZQoSTW9kZWxHZW9tZXRyeUZhY3RzEiAKGHZvbHVtZV9jdWJpY19taWxsaW1ldGVycxgBIAEoARItChBzaXplX21pbGxpbWV0ZXJzGAIgASgLMhMuZmFrdG9yeS52MS5WZWN0b3IzIr4CCgVNb2RlbBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEh8KF2Rlc2lyZWRfc291cmNlX3JldmlzaW9uGAMgASgJEioKImN1cnJlbnRfc3VjY2Vzc2Z1bF9zb3VyY2VfcmV2aXNpb24YBCABKAkSLQoMcmVuZGVyX3N0YXRlGAUgASgOMhcuZmFrdG9yeS52MS5SZW5kZXJTdGF0ZRIUCgxyZW5kZXJfZXJyb3IYBiABKAkSFwoPZGVmYXVsdF92aWV3X2lkGAcgASgJEkAKGGN1cnJlbnRfc3VjY2Vzc2Z1bF9mYWN0cxgIIAEoCzIeLmZha3RvcnkudjEuTW9kZWxHZW9tZXRyeUZhY3RzEi4KCnVwZGF0ZWRfYXQYCSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIvsBCglOYW1lZFZpZXcSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIjCgZ0YXJnZXQYAyABKAsyEy5mYWt0b3J5LnYxLlZlY3RvcjMSKAoIcm90YXRpb24YBCABKAsyFi5mYWt0b3J5LnYxLlF1YXRlcm5pb24SKgoKcHJvamVjdGlvbhgFIAEoDjIWLmZha3RvcnkudjEuUHJvamVjdGlvbhIQCghkaXN0YW5jZRgGIAEoARIdChVmaWVsZF9vZl92aWV3X2RlZ3JlZXMYByABKAESGgoSb3J0aG9ncmFwaGljX3NjYWxlGAggASgBEgwKBGV0YWcYCSABKAkiEwoRTGlzdE1vZGVsc1JlcXVlc3QiNwoSTGlzdE1vZGVsc1Jlc3BvbnNlEiEKBm1vZGVscxgBIAMoCzIRLmZha3RvcnkudjEuTW9kZWwiIwoPR2V0TW9kZWxSZXF1ZXN0EhAKCG1vZGVsX2lkGAEgASgJIjQKEEdldE1vZGVsUmVzcG9uc2USIAoFbW9kZWwYASABKAsyES5mYWt0b3J5LnYxLk1vZGVsIiQKEExpc3RWaWV3c1JlcXVlc3QSEAoIbW9kZWxfaWQYASABKAkiUgoRTGlzdFZpZXdzUmVzcG9uc2USJAoFdmlld3MYASADKAsyFS5mYWt0b3J5LnYxLk5hbWVkVmlldxIXCg9kZWZhdWx0X3ZpZXdfaWQYAiABKAkidQoOUHV0Vmlld1JlcXVlc3QSEAoIbW9kZWxfaWQYASABKAkSIwoEdmlldxgCIAEoCzIVLmZha3RvcnkudjEuTmFtZWRWaWV3EhoKDWV4cGVjdGVkX2V0YWcYAyABKAlIAIgBAUIQCg5fZXhwZWN0ZWRfZXRhZyI2Cg9QdXRWaWV3UmVzcG9uc2USIwoEdmlldxgBIAEoCzIVLmZha3RvcnkudjEuTmFtZWRWaWV3Ik0KEURlbGV0ZVZpZXdSZXF1ZXN0EhAKCG1vZGVsX2lkGAEgASgJEg8KB3ZpZXdfaWQYAiABKAkSFQoNZXhwZWN0ZWRfZXRhZxgDIAEoCSIUChJEZWxldGVWaWV3UmVzcG9uc2UiOgoVU2V0RGVmYXVsdFZpZXdSZXF1ZXN0EhAKCG1vZGVsX2lkGAEgASgJEg8KB3ZpZXdfaWQYAiABKAkiOgoWU2V0RGVmYXVsdFZpZXdSZXNwb25zZRIgCgVtb2RlbBgBIAEoCzIRLmZha3RvcnkudjEuTW9kZWwiFAoSV2F0Y2hNb2RlbHNSZXF1ZXN0IjIKDU1vZGVsU25hcHNob3QSIQoGbW9kZWxzGAEgAygLMhEuZmFrdG9yeS52MS5Nb2RlbCIwCgxNb2RlbENoYW5nZWQSIAoFbW9kZWwYASABKAsyES5mYWt0b3J5LnYxLk1vZGVsIogBChNXYXRjaE1vZGVsc1Jlc3BvbnNlEjUKEGluaXRpYWxfc25hcHNob3QYASABKAsyGS5mYWt0b3J5LnYxLk1vZGVsU25hcHNob3RIABIxCg1tb2RlbF9jaGFuZ2VkGAIgASgLMhguZmFrdG9yeS52MS5Nb2RlbENoYW5nZWRIAEIHCgVldmVudCqSAQoLUmVuZGVyU3RhdGUSHAoYUkVOREVSX1NUQVRFX1VOU1BFQ0lGSUVEEAASGAoUUkVOREVSX1NUQVRFX1BFTkRJTkcQARIaChZSRU5ERVJfU1RBVEVfUkVOREVSSU5HEAISFgoSUkVOREVSX1NUQVRFX1JFQURZEAMSFwoTUkVOREVSX1NUQVRFX0ZBSUxFRBAEKmEKClByb2plY3Rpb24SGgoWUFJPSkVDVElPTl9VTlNQRUNJRklFRBAAEhoKFlBST0pFQ1RJT05fUEVSU1BFQ1RJVkUQARIbChdQUk9KRUNUSU9OX09SVEhPR1JBUEhJQxACMqoECg5GYWt0b3J5U2VydmljZRJLCgpMaXN0TW9kZWxzEh0uZmFrdG9yeS52MS5MaXN0TW9kZWxzUmVxdWVzdBoeLmZha3RvcnkudjEuTGlzdE1vZGVsc1Jlc3BvbnNlEkUKCEdldE1vZGVsEhsuZmFrdG9yeS52MS5HZXRNb2RlbFJlcXVlc3QaHC5mYWt0b3J5LnYxLkdldE1vZGVsUmVzcG9uc2USSAoJTGlzdFZpZXdzEhwuZmFrdG9yeS52MS5MaXN0Vmlld3NSZXF1ZXN0Gh0uZmFrdG9yeS52MS5MaXN0Vmlld3NSZXNwb25zZRJCCgdQdXRWaWV3EhouZmFrdG9yeS52MS5QdXRWaWV3UmVxdWVzdBobLmZha3RvcnkudjEuUHV0Vmlld1Jlc3BvbnNlEksKCkRlbGV0ZVZpZXcSHS5mYWt0b3J5LnYxLkRlbGV0ZVZpZXdSZXF1ZXN0Gh4uZmFrdG9yeS52MS5EZWxldGVWaWV3UmVzcG9uc2USVwoOU2V0RGVmYXVsdFZpZXcSIS5mYWt0b3J5LnYxLlNldERlZmF1bHRWaWV3UmVxdWVzdBoiLmZha3RvcnkudjEuU2V0RGVmYXVsdFZpZXdSZXNwb25zZRJQCgtXYXRjaE1vZGVscxIeLmZha3RvcnkudjEuV2F0Y2hNb2RlbHNSZXF1ZXN0Gh8uZmFrdG9yeS52MS5XYXRjaE1vZGVsc1Jlc3BvbnNlMAFiBnByb3RvMw", [file_google_protobuf_timestamp]);
+  fileDesc("ChhmYWt0b3J5L3YxL2Zha3RvcnkucHJvdG8SCmZha3RvcnkudjEiKgoHVmVjdG9yMxIJCgF4GAEgASgBEgkKAXkYAiABKAESCQoBehgDIAEoASI4CgpRdWF0ZXJuaW9uEgkKAXgYASABKAESCQoBeRgCIAEoARIJCgF6GAMgASgBEgkKAXcYBCABKAEiZQoSTW9kZWxHZW9tZXRyeUZhY3RzEiAKGHZvbHVtZV9jdWJpY19taWxsaW1ldGVycxgBIAEoARItChBzaXplX21pbGxpbWV0ZXJzGAIgASgLMhMuZmFrdG9yeS52MS5WZWN0b3IzIo0BChJNb2RlbE91dHB1dFN1bW1hcnkSEQoJb3V0cHV0X2lkGAEgASgJEiQKBHJvbGUYAiABKA4yFi5mYWt0b3J5LnYxLk91dHB1dFJvbGUSDwoHcHJpbWFyeRgDIAEoCBItCgVmYWN0cxgEIAEoCzIeLmZha3RvcnkudjEuTW9kZWxHZW9tZXRyeUZhY3RzIoIDCgVNb2RlbBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEh8KF2Rlc2lyZWRfc291cmNlX3JldmlzaW9uGAMgASgJEioKImN1cnJlbnRfc3VjY2Vzc2Z1bF9zb3VyY2VfcmV2aXNpb24YBCABKAkSLQoMcmVuZGVyX3N0YXRlGAUgASgOMhcuZmFrdG9yeS52MS5SZW5kZXJTdGF0ZRIUCgxyZW5kZXJfZXJyb3IYBiABKAkSFwoPZGVmYXVsdF92aWV3X2lkGAcgASgJEkAKGGN1cnJlbnRfc3VjY2Vzc2Z1bF9mYWN0cxgIIAEoCzIeLmZha3RvcnkudjEuTW9kZWxHZW9tZXRyeUZhY3RzEi4KCnVwZGF0ZWRfYXQYCSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEkIKGmN1cnJlbnRfc3VjY2Vzc2Z1bF9vdXRwdXRzGAogAygLMh4uZmFrdG9yeS52MS5Nb2RlbE91dHB1dFN1bW1hcnki+wEKCU5hbWVkVmlldxIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiMKBnRhcmdldBgDIAEoCzITLmZha3RvcnkudjEuVmVjdG9yMxIoCghyb3RhdGlvbhgEIAEoCzIWLmZha3RvcnkudjEuUXVhdGVybmlvbhIqCgpwcm9qZWN0aW9uGAUgASgOMhYuZmFrdG9yeS52MS5Qcm9qZWN0aW9uEhAKCGRpc3RhbmNlGAYgASgBEh0KFWZpZWxkX29mX3ZpZXdfZGVncmVlcxgHIAEoARIaChJvcnRob2dyYXBoaWNfc2NhbGUYCCABKAESDAoEZXRhZxgJIAEoCSITChFMaXN0TW9kZWxzUmVxdWVzdCI3ChJMaXN0TW9kZWxzUmVzcG9uc2USIQoGbW9kZWxzGAEgAygLMhEuZmFrdG9yeS52MS5Nb2RlbCIjCg9HZXRNb2RlbFJlcXVlc3QSEAoIbW9kZWxfaWQYASABKAkiNAoQR2V0TW9kZWxSZXNwb25zZRIgCgVtb2RlbBgBIAEoCzIRLmZha3RvcnkudjEuTW9kZWwiJAoQTGlzdFZpZXdzUmVxdWVzdBIQCghtb2RlbF9pZBgBIAEoCSJSChFMaXN0Vmlld3NSZXNwb25zZRIkCgV2aWV3cxgBIAMoCzIVLmZha3RvcnkudjEuTmFtZWRWaWV3EhcKD2RlZmF1bHRfdmlld19pZBgCIAEoCSJ1Cg5QdXRWaWV3UmVxdWVzdBIQCghtb2RlbF9pZBgBIAEoCRIjCgR2aWV3GAIgASgLMhUuZmFrdG9yeS52MS5OYW1lZFZpZXcSGgoNZXhwZWN0ZWRfZXRhZxgDIAEoCUgAiAEBQhAKDl9leHBlY3RlZF9ldGFnIjYKD1B1dFZpZXdSZXNwb25zZRIjCgR2aWV3GAEgASgLMhUuZmFrdG9yeS52MS5OYW1lZFZpZXciTQoRRGVsZXRlVmlld1JlcXVlc3QSEAoIbW9kZWxfaWQYASABKAkSDwoHdmlld19pZBgCIAEoCRIVCg1leHBlY3RlZF9ldGFnGAMgASgJIhQKEkRlbGV0ZVZpZXdSZXNwb25zZSI6ChVTZXREZWZhdWx0Vmlld1JlcXVlc3QSEAoIbW9kZWxfaWQYASABKAkSDwoHdmlld19pZBgCIAEoCSI6ChZTZXREZWZhdWx0Vmlld1Jlc3BvbnNlEiAKBW1vZGVsGAEgASgLMhEuZmFrdG9yeS52MS5Nb2RlbCIUChJXYXRjaE1vZGVsc1JlcXVlc3QiMgoNTW9kZWxTbmFwc2hvdBIhCgZtb2RlbHMYASADKAsyES5mYWt0b3J5LnYxLk1vZGVsIjAKDE1vZGVsQ2hhbmdlZBIgCgVtb2RlbBgBIAEoCzIRLmZha3RvcnkudjEuTW9kZWwiiAEKE1dhdGNoTW9kZWxzUmVzcG9uc2USNQoQaW5pdGlhbF9zbmFwc2hvdBgBIAEoCzIZLmZha3RvcnkudjEuTW9kZWxTbmFwc2hvdEgAEjEKDW1vZGVsX2NoYW5nZWQYAiABKAsyGC5mYWt0b3J5LnYxLk1vZGVsQ2hhbmdlZEgAQgcKBWV2ZW50KpIBCgtSZW5kZXJTdGF0ZRIcChhSRU5ERVJfU1RBVEVfVU5TUEVDSUZJRUQQABIYChRSRU5ERVJfU1RBVEVfUEVORElORxABEhoKFlJFTkRFUl9TVEFURV9SRU5ERVJJTkcQAhIWChJSRU5ERVJfU1RBVEVfUkVBRFkQAxIXChNSRU5ERVJfU1RBVEVfRkFJTEVEEAQqYQoKUHJvamVjdGlvbhIaChZQUk9KRUNUSU9OX1VOU1BFQ0lGSUVEEAASGgoWUFJPSkVDVElPTl9QRVJTUEVDVElWRRABEhsKF1BST0pFQ1RJT05fT1JUSE9HUkFQSElDEAIqbwoKT3V0cHV0Um9sZRIbChdPVVRQVVRfUk9MRV9VTlNQRUNJRklFRBAAEhgKFE9VVFBVVF9ST0xFX0FTU0VNQkxZEAESFAoQT1VUUFVUX1JPTEVfUEFSVBACEhQKEE9VVFBVVF9ST0xFX1RPT0wQAzKqBAoORmFrdG9yeVNlcnZpY2USSwoKTGlzdE1vZGVscxIdLmZha3RvcnkudjEuTGlzdE1vZGVsc1JlcXVlc3QaHi5mYWt0b3J5LnYxLkxpc3RNb2RlbHNSZXNwb25zZRJFCghHZXRNb2RlbBIbLmZha3RvcnkudjEuR2V0TW9kZWxSZXF1ZXN0GhwuZmFrdG9yeS52MS5HZXRNb2RlbFJlc3BvbnNlEkgKCUxpc3RWaWV3cxIcLmZha3RvcnkudjEuTGlzdFZpZXdzUmVxdWVzdBodLmZha3RvcnkudjEuTGlzdFZpZXdzUmVzcG9uc2USQgoHUHV0VmlldxIaLmZha3RvcnkudjEuUHV0Vmlld1JlcXVlc3QaGy5mYWt0b3J5LnYxLlB1dFZpZXdSZXNwb25zZRJLCgpEZWxldGVWaWV3Eh0uZmFrdG9yeS52MS5EZWxldGVWaWV3UmVxdWVzdBoeLmZha3RvcnkudjEuRGVsZXRlVmlld1Jlc3BvbnNlElcKDlNldERlZmF1bHRWaWV3EiEuZmFrdG9yeS52MS5TZXREZWZhdWx0Vmlld1JlcXVlc3QaIi5mYWt0b3J5LnYxLlNldERlZmF1bHRWaWV3UmVzcG9uc2USUAoLV2F0Y2hNb2RlbHMSHi5mYWt0b3J5LnYxLldhdGNoTW9kZWxzUmVxdWVzdBofLmZha3RvcnkudjEuV2F0Y2hNb2RlbHNSZXNwb25zZTABYgZwcm90bzM", [file_google_protobuf_timestamp]);
 
 /**
  * @generated from message faktory.v1.Vector3
@@ -96,6 +96,38 @@ export const ModelGeometryFactsSchema: GenMessage<ModelGeometryFacts> = /*@__PUR
   messageDesc(file_faktory_v1_faktory, 2);
 
 /**
+ * @generated from message faktory.v1.ModelOutputSummary
+ */
+export type ModelOutputSummary = Message<"faktory.v1.ModelOutputSummary"> & {
+  /**
+   * @generated from field: string output_id = 1;
+   */
+  outputId: string;
+
+  /**
+   * @generated from field: faktory.v1.OutputRole role = 2;
+   */
+  role: OutputRole;
+
+  /**
+   * @generated from field: bool primary = 3;
+   */
+  primary: boolean;
+
+  /**
+   * @generated from field: faktory.v1.ModelGeometryFacts facts = 4;
+   */
+  facts?: ModelGeometryFacts | undefined;
+};
+
+/**
+ * Describes the message faktory.v1.ModelOutputSummary.
+ * Use `create(ModelOutputSummarySchema)` to create a new message.
+ */
+export const ModelOutputSummarySchema: GenMessage<ModelOutputSummary> = /*@__PURE__*/
+  messageDesc(file_faktory_v1_faktory, 3);
+
+/**
  * @generated from message faktory.v1.Model
  */
 export type Model = Message<"faktory.v1.Model"> & {
@@ -143,6 +175,11 @@ export type Model = Message<"faktory.v1.Model"> & {
    * @generated from field: google.protobuf.Timestamp updated_at = 9;
    */
   updatedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: repeated faktory.v1.ModelOutputSummary current_successful_outputs = 10;
+   */
+  currentSuccessfulOutputs: ModelOutputSummary[];
 };
 
 /**
@@ -150,7 +187,7 @@ export type Model = Message<"faktory.v1.Model"> & {
  * Use `create(ModelSchema)` to create a new message.
  */
 export const ModelSchema: GenMessage<Model> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 3);
+  messageDesc(file_faktory_v1_faktory, 4);
 
 /**
  * @generated from message faktory.v1.NamedView
@@ -207,7 +244,7 @@ export type NamedView = Message<"faktory.v1.NamedView"> & {
  * Use `create(NamedViewSchema)` to create a new message.
  */
 export const NamedViewSchema: GenMessage<NamedView> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 4);
+  messageDesc(file_faktory_v1_faktory, 5);
 
 /**
  * @generated from message faktory.v1.ListModelsRequest
@@ -220,7 +257,7 @@ export type ListModelsRequest = Message<"faktory.v1.ListModelsRequest"> & {
  * Use `create(ListModelsRequestSchema)` to create a new message.
  */
 export const ListModelsRequestSchema: GenMessage<ListModelsRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 5);
+  messageDesc(file_faktory_v1_faktory, 6);
 
 /**
  * @generated from message faktory.v1.ListModelsResponse
@@ -237,7 +274,7 @@ export type ListModelsResponse = Message<"faktory.v1.ListModelsResponse"> & {
  * Use `create(ListModelsResponseSchema)` to create a new message.
  */
 export const ListModelsResponseSchema: GenMessage<ListModelsResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 6);
+  messageDesc(file_faktory_v1_faktory, 7);
 
 /**
  * @generated from message faktory.v1.GetModelRequest
@@ -254,7 +291,7 @@ export type GetModelRequest = Message<"faktory.v1.GetModelRequest"> & {
  * Use `create(GetModelRequestSchema)` to create a new message.
  */
 export const GetModelRequestSchema: GenMessage<GetModelRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 7);
+  messageDesc(file_faktory_v1_faktory, 8);
 
 /**
  * @generated from message faktory.v1.GetModelResponse
@@ -271,7 +308,7 @@ export type GetModelResponse = Message<"faktory.v1.GetModelResponse"> & {
  * Use `create(GetModelResponseSchema)` to create a new message.
  */
 export const GetModelResponseSchema: GenMessage<GetModelResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 8);
+  messageDesc(file_faktory_v1_faktory, 9);
 
 /**
  * @generated from message faktory.v1.ListViewsRequest
@@ -288,7 +325,7 @@ export type ListViewsRequest = Message<"faktory.v1.ListViewsRequest"> & {
  * Use `create(ListViewsRequestSchema)` to create a new message.
  */
 export const ListViewsRequestSchema: GenMessage<ListViewsRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 9);
+  messageDesc(file_faktory_v1_faktory, 10);
 
 /**
  * @generated from message faktory.v1.ListViewsResponse
@@ -310,7 +347,7 @@ export type ListViewsResponse = Message<"faktory.v1.ListViewsResponse"> & {
  * Use `create(ListViewsResponseSchema)` to create a new message.
  */
 export const ListViewsResponseSchema: GenMessage<ListViewsResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 10);
+  messageDesc(file_faktory_v1_faktory, 11);
 
 /**
  * @generated from message faktory.v1.PutViewRequest
@@ -337,7 +374,7 @@ export type PutViewRequest = Message<"faktory.v1.PutViewRequest"> & {
  * Use `create(PutViewRequestSchema)` to create a new message.
  */
 export const PutViewRequestSchema: GenMessage<PutViewRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 11);
+  messageDesc(file_faktory_v1_faktory, 12);
 
 /**
  * @generated from message faktory.v1.PutViewResponse
@@ -354,7 +391,7 @@ export type PutViewResponse = Message<"faktory.v1.PutViewResponse"> & {
  * Use `create(PutViewResponseSchema)` to create a new message.
  */
 export const PutViewResponseSchema: GenMessage<PutViewResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 12);
+  messageDesc(file_faktory_v1_faktory, 13);
 
 /**
  * @generated from message faktory.v1.DeleteViewRequest
@@ -381,7 +418,7 @@ export type DeleteViewRequest = Message<"faktory.v1.DeleteViewRequest"> & {
  * Use `create(DeleteViewRequestSchema)` to create a new message.
  */
 export const DeleteViewRequestSchema: GenMessage<DeleteViewRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 13);
+  messageDesc(file_faktory_v1_faktory, 14);
 
 /**
  * @generated from message faktory.v1.DeleteViewResponse
@@ -394,7 +431,7 @@ export type DeleteViewResponse = Message<"faktory.v1.DeleteViewResponse"> & {
  * Use `create(DeleteViewResponseSchema)` to create a new message.
  */
 export const DeleteViewResponseSchema: GenMessage<DeleteViewResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 14);
+  messageDesc(file_faktory_v1_faktory, 15);
 
 /**
  * @generated from message faktory.v1.SetDefaultViewRequest
@@ -416,7 +453,7 @@ export type SetDefaultViewRequest = Message<"faktory.v1.SetDefaultViewRequest"> 
  * Use `create(SetDefaultViewRequestSchema)` to create a new message.
  */
 export const SetDefaultViewRequestSchema: GenMessage<SetDefaultViewRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 15);
+  messageDesc(file_faktory_v1_faktory, 16);
 
 /**
  * @generated from message faktory.v1.SetDefaultViewResponse
@@ -433,7 +470,7 @@ export type SetDefaultViewResponse = Message<"faktory.v1.SetDefaultViewResponse"
  * Use `create(SetDefaultViewResponseSchema)` to create a new message.
  */
 export const SetDefaultViewResponseSchema: GenMessage<SetDefaultViewResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 16);
+  messageDesc(file_faktory_v1_faktory, 17);
 
 /**
  * @generated from message faktory.v1.WatchModelsRequest
@@ -446,7 +483,7 @@ export type WatchModelsRequest = Message<"faktory.v1.WatchModelsRequest"> & {
  * Use `create(WatchModelsRequestSchema)` to create a new message.
  */
 export const WatchModelsRequestSchema: GenMessage<WatchModelsRequest> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 17);
+  messageDesc(file_faktory_v1_faktory, 18);
 
 /**
  * @generated from message faktory.v1.ModelSnapshot
@@ -463,7 +500,7 @@ export type ModelSnapshot = Message<"faktory.v1.ModelSnapshot"> & {
  * Use `create(ModelSnapshotSchema)` to create a new message.
  */
 export const ModelSnapshotSchema: GenMessage<ModelSnapshot> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 18);
+  messageDesc(file_faktory_v1_faktory, 19);
 
 /**
  * @generated from message faktory.v1.ModelChanged
@@ -480,7 +517,7 @@ export type ModelChanged = Message<"faktory.v1.ModelChanged"> & {
  * Use `create(ModelChangedSchema)` to create a new message.
  */
 export const ModelChangedSchema: GenMessage<ModelChanged> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 19);
+  messageDesc(file_faktory_v1_faktory, 20);
 
 /**
  * @generated from message faktory.v1.WatchModelsResponse
@@ -509,7 +546,7 @@ export type WatchModelsResponse = Message<"faktory.v1.WatchModelsResponse"> & {
  * Use `create(WatchModelsResponseSchema)` to create a new message.
  */
 export const WatchModelsResponseSchema: GenMessage<WatchModelsResponse> = /*@__PURE__*/
-  messageDesc(file_faktory_v1_faktory, 20);
+  messageDesc(file_faktory_v1_faktory, 21);
 
 /**
  * @generated from enum faktory.v1.RenderState
@@ -572,6 +609,37 @@ export enum Projection {
  */
 export const ProjectionSchema: GenEnum<Projection> = /*@__PURE__*/
   enumDesc(file_faktory_v1_faktory, 1);
+
+/**
+ * @generated from enum faktory.v1.OutputRole
+ */
+export enum OutputRole {
+  /**
+   * @generated from enum value: OUTPUT_ROLE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: OUTPUT_ROLE_ASSEMBLY = 1;
+   */
+  ASSEMBLY = 1,
+
+  /**
+   * @generated from enum value: OUTPUT_ROLE_PART = 2;
+   */
+  PART = 2,
+
+  /**
+   * @generated from enum value: OUTPUT_ROLE_TOOL = 3;
+   */
+  TOOL = 3,
+}
+
+/**
+ * Describes the enum faktory.v1.OutputRole.
+ */
+export const OutputRoleSchema: GenEnum<OutputRole> = /*@__PURE__*/
+  enumDesc(file_faktory_v1_faktory, 2);
 
 /**
  * FaktoryService exposes model metadata and shared named camera views.

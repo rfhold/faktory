@@ -316,7 +316,7 @@ new k8s.apps.v1.Deployment("faktory", {
           ],
         }],
         volumes: [
-          { name: "tmp", emptyDir: { sizeLimit: "256Mi" } },
+          { name: "tmp", emptyDir: { sizeLimit: "512Mi" } },
           { name: "oauth", secret: { secretName: wrappingKeySecret.metadata.name, defaultMode: 0o440 } },
           { name: "postgres-ca", secret: { secretName: "faktory-postgres-ca", defaultMode: 0o444, items: [{ key: "ca.crt", path: "ca.crt" }] } },
         ],

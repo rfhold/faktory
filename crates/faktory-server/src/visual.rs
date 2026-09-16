@@ -822,6 +822,7 @@ mod tests {
         let coordinator = VisualCoordinator::new(renderer.clone(), Duration::from_secs(1));
         let identity = ViewRenderIdentity {
             revision: "a".repeat(64),
+            output_id: "primary".to_owned(),
             view_id: "view-id".to_owned(),
             view_etag: "view-etag".to_owned(),
         };
@@ -886,6 +887,7 @@ mod tests {
                     .render_view(
                         ViewRenderIdentity {
                             revision: "a".repeat(64),
+                            output_id: "primary".to_owned(),
                             view_id: format!("view-{index}"),
                             view_etag: format!("etag-{index}"),
                         },
@@ -915,6 +917,7 @@ mod tests {
                 .render_view(
                     ViewRenderIdentity {
                         revision: "a".repeat(64),
+                        output_id: "primary".to_owned(),
                         view_id: "overflow".to_owned(),
                         view_etag: "overflow-etag".to_owned(),
                     },

@@ -3,7 +3,9 @@ import { timestampFromDate, TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { describe, expect, it } from "vitest";
 import {
   ModelGeometryFactsSchema,
+  ModelOutputSummarySchema,
   ModelSchema,
+  OutputRole,
   RenderState,
   Vector3Schema,
 } from "../../proto/gen/ts/faktory/v1/faktory_pb";
@@ -13,7 +15,11 @@ import {
   formatTimestamp,
   formatVolume,
   modelAvailability,
+  outputArtifactUrl,
+  outputRoleLabel,
+  primaryOutput,
   previewUrl,
+  resolveOutput,
   timestampDateTime,
 } from "./model";
 
@@ -30,6 +36,44 @@ describe("artifactUrl", () => {
 
   it("does not produce a URL without a successful revision", () => {
     expect(artifactUrl(model())).toBeUndefined();
+  });
+});
+
+describe("outputArtifactUrl", () => {
+  it("encodes model, revision, and output identity as path segments", () => {
+    expect(outputArtifactUrl(
+      model({ id: "bracket/a", currentSuccessfulSourceRevision: "rev/#1" }),
+      "fixture / clamp",
+    )).toBe("/artifacts/bracket%2Fa/rev%2F%231/outputs/fixture%20%2F%20clamp/model.glb");
+  });
+
+  it("does not produce a URL without a successful revision or output identity", () => {
+    expect(outputArtifactUrl(model(), "part")).toBeUndefined();
+    expect(outputArtifactUrl(model({ currentSuccessfulSourceRevision: "rev" }), "")).toBeUndefined();
+  });
+});
+
+describe("output selection", () => {
+  const output = (outputId: string, role: OutputRole, primary = false) =>
+    create(ModelOutputSummarySchema, { outputId, role, primary });
+  const outputs = [
+    output("bracket", OutputRole.PART),
+    output("assembly", OutputRole.ASSEMBLY, true),
+    output("fixture", OutputRole.TOOL),
+  ];
+
+  it("defaults to the declared primary and preserves explicit selection", () => {
+    expect(primaryOutput(outputs)?.outputId).toBe("assembly");
+    expect(resolveOutput(outputs)?.outputId).toBe("assembly");
+    expect(resolveOutput(outputs, "fixture")?.outputId).toBe("fixture");
+    expect(resolveOutput(outputs, "removed")?.outputId).toBe("assembly");
+  });
+
+  it("labels generated output roles without numeric assumptions", () => {
+    expect(outputRoleLabel(OutputRole.ASSEMBLY)).toBe("Assembly");
+    expect(outputRoleLabel(OutputRole.PART)).toBe("Part");
+    expect(outputRoleLabel(OutputRole.TOOL)).toBe("Tool");
+    expect(outputRoleLabel(OutputRole.UNSPECIFIED)).toBe("Output");
   });
 });
 
