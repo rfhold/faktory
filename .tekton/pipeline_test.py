@@ -22,6 +22,12 @@ class VisualRendererPipelineTest(unittest.TestCase):
 
     def test_renderer_smoke_exercises_complete_multipart_worker_contract(self) -> None:
         for pipeline in (self.preview, self.release):
+            self.assertEqual(pipeline.count('dependency_root="$output_dir/dependencies"'), 2)
+            self.assertEqual(pipeline.count('"format":"faktory-model-dependencies-v1"'), 2)
+            self.assertEqual(pipeline.count('"root_model_id":"pipeline-smoke"'), 2)
+            self.assertEqual(pipeline.count('"package":"faktory_models.m_pipeline_smoke"'), 2)
+            self.assertEqual(pipeline.count('> "$dependency_root/dependencies.json"'), 2)
+            self.assertNotIn('library_root="$output_dir/libraries"', pipeline)
             self.assertEqual(pipeline.count('Output("secondary", "part"'), 2)
             self.assertEqual(pipeline.count('bundle / "outputs.json"'), 2)
             self.assertEqual(pipeline.count('root / "model.glb"'), 4)

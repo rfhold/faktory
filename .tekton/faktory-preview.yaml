@@ -235,8 +235,12 @@ spec:
                 output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
                 trap 'rm -rf "$output_dir"' EXIT
                 project_root="$output_dir/project"
-                library_root="$output_dir/libraries"
-                mkdir "$project_root" "$library_root"
+                dependency_root="$output_dir/dependencies"
+                package_root="$dependency_root/faktory_models/m_pipeline_smoke"
+                mkdir -p "$project_root" "$package_root"
+                : > "$dependency_root/faktory_models/__init__.py"
+                : > "$package_root/__init__.py"
+                printf '%s\n' '{"format":"faktory-model-dependencies-v1","root_model_id":"pipeline-smoke","nodes":[{"model_id":"pipeline-smoke","package":"faktory_models.m_pipeline_smoke","project_revision":"0000000000000000000000000000000000000000000000000000000000000000","dependencies":[]}]}' > "$dependency_root/dependencies.json"
                 cat > "$project_root/main.py" <<'PY'
                 import cadquery as cq
                 from faktory_design.v1 import Design, Output
@@ -249,7 +253,7 @@ spec:
                 /opt/faktory/env/bin/python -m renderer \
                   "$project_root" \
                   main.py \
-                  "$library_root" \
+                  "$dependency_root" \
                   "$output_dir/bundle"
                 /opt/faktory/env/bin/python -c '
                 import json
@@ -296,8 +300,12 @@ spec:
                 output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
                 trap 'rm -rf "$output_dir"' EXIT
                 project_root="$output_dir/project"
-                library_root="$output_dir/libraries"
-                mkdir "$project_root" "$library_root"
+                dependency_root="$output_dir/dependencies"
+                package_root="$dependency_root/faktory_models/m_pipeline_smoke"
+                mkdir -p "$project_root" "$package_root"
+                : > "$dependency_root/faktory_models/__init__.py"
+                : > "$package_root/__init__.py"
+                printf '%s\n' '{"format":"faktory-model-dependencies-v1","root_model_id":"pipeline-smoke","nodes":[{"model_id":"pipeline-smoke","package":"faktory_models.m_pipeline_smoke","project_revision":"0000000000000000000000000000000000000000000000000000000000000000","dependencies":[]}]}' > "$dependency_root/dependencies.json"
                 cat > "$project_root/main.py" <<'PY'
                 import cadquery as cq
                 from faktory_design.v1 import Design, Output
@@ -310,7 +318,7 @@ spec:
                 /opt/faktory/env/bin/python -m renderer \
                   "$project_root" \
                   main.py \
-                  "$library_root" \
+                  "$dependency_root" \
                   "$output_dir/bundle"
                 /opt/faktory/env/bin/python -c '
                 import json
