@@ -91,6 +91,11 @@ describe("ModelPage outputs", () => {
     );
     expect(host.querySelector(".output-facts")?.textContent).toContain("Assembly");
     expect(host.querySelector(".output-facts")?.textContent).toContain("2 cm³");
+    const download = () => host.querySelector<HTMLAnchorElement>("a.stl-download");
+    expect(download()?.getAttribute("href")).toBe(
+      "/artifacts/model%2Fa/revision%2F1/outputs/main%20assembly/model.stl",
+    );
+    expect(download()?.getAttribute("download")).toBe("model-a-main-assembly-revision-1.stl");
 
     options[2].click();
     expect(options[2].getAttribute("aria-pressed")).toBe("true");
@@ -99,6 +104,10 @@ describe("ModelPage outputs", () => {
     );
     expect(host.querySelector(".output-facts")?.textContent).toContain("Tool");
     expect(host.querySelector(".output-facts")?.textContent).toContain("3 cm³");
+    expect(download()?.getAttribute("href")).toBe(
+      "/artifacts/model%2Fa/revision%2F1/outputs/fixture/model.stl",
+    );
+    expect(download()?.getAttribute("download")).toBe("model-a-fixture-revision-1.stl");
 
     setModel(create(ModelSchema, {
       id: "model/a",
@@ -115,6 +124,14 @@ describe("ModelPage outputs", () => {
     expect(host.querySelector('[data-testid="viewer"]')?.getAttribute("data-url")).toContain(
       "/revision-2/outputs/replacement/model.glb",
     );
+    expect(download()?.getAttribute("href")).toBe(
+      "/artifacts/model%2Fa/revision-2/outputs/replacement/model.stl",
+    );
+    expect(download()?.getAttribute("download")).toBe("model-a-replacement-revision-2.stl");
+
+    setModel(create(ModelSchema, { id: "model/a", name: "Multipart model" }));
+    expect(download()).toBeNull();
+    expect(host.querySelector('.stl-download[aria-disabled="true"]')).not.toBeNull();
   });
 
   it("shows the no-success state without an output selector or viewer", () => {
@@ -126,6 +143,22 @@ describe("ModelPage outputs", () => {
 
     expect(host.querySelector(".output-panel")).toBeNull();
     expect(host.querySelector('[data-testid="viewer"]')).toBeNull();
+    expect(host.querySelector("a.stl-download")).toBeNull();
+    expect(host.querySelector('.stl-download[aria-disabled="true"]')?.textContent).toBe("Download STL unavailable");
     expect(host.textContent).toContain("No successful geometry");
+  });
+
+  it("does not link when output metadata has no successful revision", () => {
+    const [model] = createSignal(create(ModelSchema, {
+      id: "model/a",
+      currentSuccessfulOutputs: [output("part", OutputRole.PART, true, 500)],
+    }));
+    mocks.model = model;
+    const host = document.createElement("div");
+    document.body.append(host);
+    disposers.push(render(() => <ModelPage />, host));
+
+    expect(host.querySelector("a.stl-download")).toBeNull();
+    expect(host.querySelector('.stl-download[aria-disabled="true"]')).not.toBeNull();
   });
 });

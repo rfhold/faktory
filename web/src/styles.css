@@ -69,6 +69,9 @@ button { border: 0; cursor: pointer; }
 .availability > div { display: flex; flex-wrap: wrap; gap: .8rem 1.5rem; }
 .availability-label { color: var(--muted); }
 .availability p { margin: 0; color: var(--red); }
+.stl-download { align-self: center; margin-left: auto; padding: .55rem .75rem; color: var(--ink); border: 1px solid #56604f; text-decoration: none; white-space: nowrap; }
+.stl-download:hover { border-color: var(--acid); }
+.stl-download.unavailable { color: var(--muted); opacity: .6; }
 .output-panel { margin: 0 0 1rem; padding: 1.25rem; }
 .output-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
 .output-heading h2 { margin: 0; font-size: 1.65rem; letter-spacing: -.04em; }
@@ -137,6 +140,7 @@ button { border: 0; cursor: pointer; }
   .viewer-panel { min-height: 55vh; }
   .views-panel { min-height: 20rem; }
   .availability { flex-direction: column; }
+  .stl-download { align-self: start; margin-left: 0; }
   .output-option { min-width: min(11rem, 65vw); }
 }
 

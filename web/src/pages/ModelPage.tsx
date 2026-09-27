@@ -14,6 +14,8 @@ import {
   modelAvailability,
   outputArtifactUrl,
   outputRoleLabel,
+  outputStlFilename,
+  outputStlUrl,
   primaryOutput,
   resolveOutput,
 } from "../model";
@@ -72,6 +74,11 @@ export function ModelPage() {
     const record = model.data;
     const output = selectedOutput();
     return record && output ? outputArtifactUrl(record, output.outputId) : undefined;
+  };
+  const stlUrl = () => {
+    const record = model.data;
+    const output = selectedOutput();
+    return record && output ? outputStlUrl(record, output.outputId) : undefined;
   };
   const loadKey = () => `${modelId()}:${geometryUrl() ?? ""}`;
   const editingView = createMemo(() => views.data?.views.find((view) => view.id === editingId()));
@@ -228,6 +235,18 @@ export function ModelPage() {
                 </div>
                 <Show when={record().renderError}>
                   <p role="alert">{record().renderError}</p>
+                </Show>
+                <Show
+                  when={stlUrl()}
+                  fallback={<span class="stl-download unavailable" aria-disabled="true">Download STL unavailable</span>}
+                >
+                  {(url) => (
+                    <a
+                      class="stl-download"
+                      href={url()}
+                      download={outputStlFilename(record(), selectedOutput()!.outputId)}
+                    >Download STL</a>
+                  )}
                 </Show>
               </div>
 

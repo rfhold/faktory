@@ -46,11 +46,15 @@ For orthographic views, `orthographic_scale` means the effective visible vertica
 
 Project files, dependency source, generated guidance, requirements, locks, geometry, preview, and projection bytes never travel in protobuf messages. Source text travels only through authorized MCP model tools. Output summaries, facts, and `updated_at` travel in complete `Model` records. Projection PNGs travel only in semantic MCP image results, never through browser artifact URLs.
 
-The server adds `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/model.glb` and `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/preview.svg`. These authenticated routes serve any declared output. The current routes, `GET /artifacts/{model_id}/{revision}/model.glb` and `GET /artifacts/{model_id}/{revision}/preview.svg`, remain stable aliases for the primary output.
+The server exposes `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/model.glb`, `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/preview.svg`, and `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/model.stl`. These browser routes serve any declared current-successful output. The current routes, `GET /artifacts/{model_id}/{revision}/model.glb` and `GET /artifacts/{model_id}/{revision}/preview.svg`, remain stable aliases for the primary output. No primary STL alias, 3MF route, or MCP binary STL result exists.
 
 Production requires a browser session. Explicit disabled mode requires no credentials. Each route serves an artifact only when `revision` matches the model's current successful revision. This gate includes the retained last-good revision after a failed replacement. A model without a successful render returns `404`. A request for any other revision or an output absent from that revision also returns `404`.
 
 Successful responses use `model/gltf-binary` or `image/svg+xml` as appropriate. They use `Cache-Control: private, no-cache` and an entity tag derived from the project revision and selected output ID. Alias and output-aware routes for the primary return equivalent bytes and validators. All routes support conditional requests. GLB responses also support single-range requests.
+
+STL success returns `200` with binary `model/stl`, `Content-Disposition: attachment` with filename `{model_id}-{output_id}.stl`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, no-cache`, and the format-specific `"stl-v1:{revision}:{output_id}"` ETag. A matching `If-None-Match` returns `304` after cache lookup or export; STL does not implement GLB range handling. An absent model, non-current revision, or unknown output returns `404`. Export geometry rejection returns `422`, timeout returns `504`, and unavailable capacity, worker, invalid cached bytes, or storage returns `503`. A failed STL export does not change the model's render state.
+
+The model page offers a download link for the selected output and current-successful revision. Its HTML `download` filename includes the revision; the HTTP attachment filename does not. The page shows an unavailable state before the first successful render.
 
 ## Internal Visual Renderer RPC
 

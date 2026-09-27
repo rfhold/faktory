@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import stat
 import struct
@@ -34,6 +35,7 @@ sys.modules.setdefault("faktory_design.v1", _design_v1)
 
 ERROR_PREFIX: Final = "renderer_error="
 MAX_GLB_BYTES: Final = 64 * 1024 * 1024
+MAX_STL_BYTES: Final = 64 * 1024 * 1024
 MAX_BUNDLE_BYTES: Final = 192 * 1024 * 1024
 MAX_DEPENDENCY_MODELS: Final = 64
 MAX_DEPENDENCY_DEPTH: Final = 8
@@ -560,6 +562,29 @@ def _validate_glb(output_path: Path) -> bool:
     return offset == len(content)
 
 
+def _validate_stl(output_path: Path) -> bool:
+    size = _regular_file_size(output_path)
+    if size is None or not 134 <= size <= MAX_STL_BYTES:
+        return False
+    try:
+        with output_path.open("rb") as file:
+            header = file.read(84)
+            if len(header) != 84:
+                return False
+            triangles = struct.unpack_from("<I", header, 80)[0]
+            if triangles == 0 or size != 84 + triangles * 50:
+                return False
+            for _ in range(triangles):
+                record = file.read(50)
+                if len(record) != 50 or not all(
+                    math.isfinite(value) for value in struct.unpack_from("<12f", record)
+                ):
+                    return False
+            return not file.read(1)
+    except (OSError, struct.error):
+        return False
+
+
 def _validate_svg(output_path: Path) -> bool:
     try:
         content = output_path.read_text(encoding="utf-8")
@@ -686,6 +711,141 @@ def _normalize_result(result: object) -> tuple[str | None, tuple[Output, ...] | 
     return None, (Output("primary", role, result, primary=True),)
 
 
+def _load_outputs(
+    project_root: Path, source_path: Path, dependency_root: Path
+) -> tuple[str | None, tuple[Output, ...] | None]:
+    try:
+        source = source_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "invalid_utf8", None
+    except OSError:
+        return "source_read_failed", None
+
+    source_error, _ = _validate_sources(project_root, dependency_root)
+    if source_error is not None:
+        return source_error, None
+
+    try:
+        code = compile(source, str(source_path), "exec")
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                with _execution_environment(
+                    project_root, dependency_root, source_path
+                ) as namespace:
+                    exec(code, namespace)
+    except BaseException:
+        return "source_execution_failed", None
+
+    if "result" not in namespace:
+        return "missing_result", None
+    return _normalize_result(namespace["result"])
+
+
+def _export_stl_geometry(output: Output, temporary_file: Path) -> str | None:
+    try:
+        if isinstance(output.geometry, cq.Assembly):
+            compound = output.geometry.toCompound()
+        elif isinstance(output.geometry, (cq.Workplane, cq.Shape)):
+            compound = cq.Assembly(output.geometry, name="result").toCompound()
+        else:
+            return "unsupported_geometry"
+        solids = compound.Solids()
+        if (
+            not solids
+            or not compound.isValid()
+            or any(
+                not solid.isValid()
+                or not math.isfinite(solid.Volume())
+                or solid.Volume() <= 0
+                for solid in solids
+            )
+        ):
+            return "invalid_geometry"
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                with _stl_file_size_limit():
+                    exported = compound.exportStl(
+                        str(temporary_file),
+                        tolerance=0.1,
+                        angularTolerance=0.1,
+                        ascii=False,
+                        relative=False,
+                        parallel=False,
+                    )
+        if exported is False:
+            return "stl_export_failed"
+    except BaseException:
+        return "stl_export_failed"
+    return None if _validate_stl(temporary_file) else "invalid_stl"
+
+
+@contextlib.contextmanager
+def _stl_file_size_limit() -> Iterator[None]:
+    import resource
+
+    previous_limits = resource.getrlimit(resource.RLIMIT_FSIZE)
+    previous_handler = signal.getsignal(signal.SIGXFSZ)
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_FSIZE,
+            (min(previous_limits[0], MAX_STL_BYTES), previous_limits[1]),
+        )
+        try:
+            yield
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, previous_limits)
+    finally:
+        signal.signal(signal.SIGXFSZ, previous_handler)
+
+
+def export_stl(
+    project_root: Path,
+    entrypoint: Path,
+    dependency_root: Path,
+    output_file: Path,
+    output_id: str,
+) -> str | None:
+    if len(output_id) > 64 or MODEL_ID.fullmatch(output_id) is None:
+        return "invalid_output_id"
+    path_error, project_root, source_path, dependency_root, output_file = _validate_paths(
+        project_root, entrypoint, dependency_root, output_file
+    )
+    if path_error is not None:
+        return path_error
+    assert project_root is not None
+    assert source_path is not None
+    assert dependency_root is not None
+    assert output_file is not None
+
+    load_error, outputs = _load_outputs(project_root, source_path, dependency_root)
+    if load_error is not None or outputs is None:
+        return load_error
+    selected = next((output for output in outputs if output.output_id == output_id), None)
+    if selected is None:
+        return "missing_output"
+
+    temporary_file = output_file.with_name(
+        f".{output_file.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary_file.open("xb"):
+            pass
+        export_error = _export_stl_geometry(selected, temporary_file)
+        if export_error is not None:
+            return export_error
+        try:
+            temporary_file.rename(output_file)
+        except OSError:
+            return "output_publish_failed"
+        return None
+    except OSError:
+        return "output_create_failed"
+    finally:
+        with contextlib.suppress(OSError):
+            temporary_file.unlink(missing_ok=True)
+
+
 def _render_output(
     output: Output, output_root: Path
 ) -> tuple[str | None, dict[str, object] | None]:
@@ -788,37 +948,7 @@ def render(
     except OSError:
         return "output_create_failed"
 
-    try:
-        source = source_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        _remove_output_tree(temporary_root)
-        return "invalid_utf8"
-    except OSError:
-        _remove_output_tree(temporary_root)
-        return "source_read_failed"
-
-    source_error, _ = _validate_sources(project_root, dependency_root)
-    if source_error is not None:
-        _remove_output_tree(temporary_root)
-        return source_error
-
-    try:
-        code = compile(source, str(source_path), "exec")
-        with open(os.devnull, "w", encoding="utf-8") as devnull:
-            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                with _execution_environment(
-                    project_root, dependency_root, source_path
-                ) as namespace:
-                    exec(code, namespace)
-    except BaseException:
-        _remove_output_tree(temporary_root)
-        return "source_execution_failed"
-
-    if "result" not in namespace:
-        _remove_output_tree(temporary_root)
-        return "missing_result"
-
-    result_error, outputs = _normalize_result(namespace["result"])
+    result_error, outputs = _load_outputs(project_root, source_path, dependency_root)
     if result_error is not None or outputs is None:
         _remove_output_tree(temporary_root)
         return result_error
@@ -861,16 +991,13 @@ def render(
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 4:
+    if len(args) == 4:
+        error = render(*(Path(arg) for arg in args))
+    elif len(args) == 6 and args[0] == "export-stl":
+        error = export_stl(*(Path(arg) for arg in args[1:5]), args[5])
+    else:
         print(f"{ERROR_PREFIX}invalid_arguments", file=sys.stderr)
         return 2
-
-    error = render(
-        Path(args[0]),
-        Path(args[1]),
-        Path(args[2]),
-        Path(args[3]),
-    )
     if error is not None:
         print(f"{ERROR_PREFIX}{error}", file=sys.stderr)
         return 1

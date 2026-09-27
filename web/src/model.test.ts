@@ -17,6 +17,8 @@ import {
   modelAvailability,
   outputArtifactUrl,
   outputRoleLabel,
+  outputStlFilename,
+  outputStlUrl,
   primaryOutput,
   previewUrl,
   resolveOutput,
@@ -50,6 +52,26 @@ describe("outputArtifactUrl", () => {
   it("does not produce a URL without a successful revision or output identity", () => {
     expect(outputArtifactUrl(model(), "part")).toBeUndefined();
     expect(outputArtifactUrl(model({ currentSuccessfulSourceRevision: "rev" }), "")).toBeUndefined();
+  });
+});
+
+describe("STL download", () => {
+  it("escapes each immutable path segment and supplies a safe, identifiable filename", () => {
+    const record = model({ id: "bracket/a", currentSuccessfulSourceRevision: "rev/#1" });
+    expect(outputStlUrl(record, "fixture / clamp")).toBe(
+      "/artifacts/bracket%2Fa/rev%2F%231/outputs/fixture%20%2F%20clamp/model.stl",
+    );
+    expect(outputStlFilename(record, "fixture / clamp")).toBe("bracket-a-fixture-clamp-rev-1.stl");
+  });
+
+  it("does not link without both a successful revision and output identity", () => {
+    expect(outputStlUrl(model(), "part")).toBeUndefined();
+    expect(outputStlUrl(model({ currentSuccessfulSourceRevision: "rev" }), "")).toBeUndefined();
+  });
+
+  it("keeps hostile filename components inside a plain filename", () => {
+    expect(outputStlFilename(model({ id: "../../", currentSuccessfulSourceRevision: "../?" }), "\\a/b"))
+      .toBe("model-a-b-revision.stl");
   });
 });
 

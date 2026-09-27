@@ -770,6 +770,40 @@ impl Repository {
         Ok(self.store.get(&key).await?.bytes)
     }
 
+    pub async fn cached_stl(
+        &self,
+        model_id: &str,
+        revision: &str,
+        output_id: &str,
+    ) -> Result<Option<Bytes>, RepositoryError> {
+        let _guard = self.mutations.lock().await;
+        let model = self.current_model(model_id, revision).await?;
+        resolve_output(&model, output_id)?;
+        match self
+            .store
+            .get(&output_stl_key(model_id, revision, output_id))
+            .await
+        {
+            Ok(object) => Ok(Some(object.bytes)),
+            Err(StorageError::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn cache_stl(
+        &self,
+        model_id: &str,
+        revision: &str,
+        output_id: &str,
+        bytes: Bytes,
+    ) -> Result<(), RepositoryError> {
+        let _guard = self.mutations.lock().await;
+        let model = self.current_model(model_id, revision).await?;
+        resolve_output(&model, output_id)?;
+        self.put_immutable(&output_stl_key(model_id, revision, output_id), bytes)
+            .await
+    }
+
     pub async fn preview(&self, model_id: &str, revision: &str) -> Result<Bytes, RepositoryError> {
         let model = self.current_model(model_id, revision).await?;
         let primary = model.primary_output()?;
@@ -1474,6 +1508,10 @@ pub fn outputs_manifest_key(model_id: &str, revision: &str) -> String {
 #[must_use]
 pub fn output_geometry_key(model_id: &str, revision: &str, output_id: &str) -> String {
     format!("models/{model_id}/revisions/{revision}/outputs/{output_id}/model.glb")
+}
+#[must_use]
+pub fn output_stl_key(model_id: &str, revision: &str, output_id: &str) -> String {
+    format!("models/{model_id}/revisions/{revision}/outputs/{output_id}/exports/stl-v1/model.stl")
 }
 #[must_use]
 pub fn output_preview_key(model_id: &str, revision: &str, output_id: &str) -> String {

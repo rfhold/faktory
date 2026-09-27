@@ -11,6 +11,7 @@ models/{model_id}/model.json
 models/{model_id}/revisions/{project_sha256}/project.json
 models/{model_id}/revisions/{project_sha256}/outputs.json
 models/{model_id}/revisions/{project_sha256}/outputs/{output_id}/model.glb
+models/{model_id}/revisions/{project_sha256}/outputs/{output_id}/exports/stl-v1/model.stl
 models/{model_id}/revisions/{project_sha256}/outputs/{output_id}/preview.svg
 models/{model_id}/revisions/{project_sha256}/outputs/{output_id}/projections/{projection}.png
 models/{model_id}/revisions/{project_sha256}/outputs/{primary_output_id}/renders/three-v2/canonical/{projection}.png
@@ -25,6 +26,8 @@ system/migrations/{migration_id}.json
 `model_id` is a caller-supplied, immutable identifier. It contains at most 64 ASCII bytes and matches `^[a-z0-9]+(-[a-z0-9]+)*$`. `output_id` uses the same syntax and byte limit. View IDs and etags are server-issued opaque UUIDs. `project_sha256` is the lowercase hexadecimal SHA-256 of the canonical project bundle defined in [`model-projects-dependencies.md`](model-projects-dependencies.md). Project bundles, model-release records, output manifests, and artifacts are immutable.
 
 Each new successful revision owns `outputs.json` and one complete output directory per declared output. Every output directory contains one GLB, one preview, and seven technical PNGs. Each GLB has a 64 MiB cap. Only the primary directory contains seven canonical shaded PNGs and named-view cache entries. `projection` accepts only `isometric`, `front`, `back`, `left`, `right`, `top`, and `bottom`; arbitrary object-key input is forbidden. Recipe-versioned paths invalidate caches when visual semantics change. Named-view keys bind the project revision, primary output ID, view ID, etag, and recipe.
+
+The `exports/stl-v1/model.stl` object is optional and immutable. Its key binds model, project revision, output, and STL recipe; it is not part of the required bundle or the atomic success advance. A browser request first checks that the revision and output remain current-successful. A cache hit bypasses execution capacity. On a cache miss, the server materializes that exact project and dependency closure, runs the separate Python `export-stl` command, validates its binary STL, and writes it with immutable-write conflict protection. Concurrent requests for one key share in-process export work. STL has separate bounded admission outside the normal render queue, but a miss acquires every shared render execution slot before export; STL exports and normal renderer jobs do not execute together. Materialization and subprocess execution each use the configured render timeout; the whole request has a three-times-render-timeout bound. The server rechecks current-successful identity before the write and before return. A revision change prevents delivery; an obsolete cache object can remain unreachable. Invalid geometry, timeout, capacity, worker, and storage failures do not alter render state or the last-good bundle.
 
 Migration `0002-model-dependency-cutover` removes all prior revisions and fixed-key artifacts. Post-cutover revisions always use the multipart layout. The repository exposes no compatibility aliases for deleted storage.
 

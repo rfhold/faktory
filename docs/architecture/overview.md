@@ -9,7 +9,7 @@ The repository implements the model-dependency hard cutover and multipart design
 | Component | Responsibility |
 | --- | --- |
 | Rust server | Own authentication boundaries, model metadata, view mutations, render coordination, gRPC-web, HTTP artifacts, and MCP hosting. |
-| Solid SPA | Show one catalog row per model, lazily load previews, load GLB geometry, show semantic facts and render state, and edit shared views. |
+| Solid SPA | Show one catalog row per model, lazily load previews, load GLB geometry, offer selected-output STL downloads, show semantic facts and render state, and edit shared views. |
 | Garage | Persist model metadata, immutable v2 projects, model releases, revision artifacts, rollout and migration state, recipe-versioned shaded images, and named-view JSON objects. |
 | CadQuery renderer | Materialize one trusted project and its exact model dependency closure, execute the root entrypoint, and produce each declared output. |
 | Visual renderer | Render primary-only canonical and named-view shaded PNGs through isolated Node, Playwright, Chromium, and the shared Three.js recipe. |
@@ -30,10 +30,12 @@ The MVP runs one server replica and one AMD64 visual-renderer replica. This avoi
 7. Browser clients receive metadata through gRPC-web and retrieve current-successful artifacts through HTTP, subject to the active access mode.
 8. Web users create and edit shared named views through gRPC-web. MCP can render one exact saved view through the isolated visual renderer.
 
+The browser offers a per-output STL download only when a current-successful revision and selected output exist. The first request exports from the exact project and dependency closure; later requests use the immutable recipe-versioned cache. STL failure leaves the successful render intact. [`design-bundles.md`](design-bundles.md) defines the format and printability limits.
+
 The catalog displays one model per row. Existing browser fields and artifact URLs remain primary-output aliases. Models without successful geometry display unavailable facts.
 
 ## Exclusions
 
-Browser source editing, model deletion, release mutation, release yanking, prerelease versions, external dependency installation, CQGI parameters, hostile-code sandboxing, native clients, progressive mesh streaming, and multi-replica rendering are excluded. Structured server constraints, partial output success, manufacturing exports, and per-output named views are also excluded. The fixed renderer runtime and Python standard library remain available to trusted code. Native ARM64 visual-renderer support also remains excluded. The trusted-source assumption is an explicit MVP limitation, not a security sandbox.
+Browser source editing, model deletion, release mutation, release yanking, prerelease versions, external dependency installation, CQGI parameters, hostile-code sandboxing, native clients, progressive mesh streaming, and multi-replica rendering are excluded. Structured server constraints, partial output success, 3MF export, printability guarantees, and per-output named views are also excluded. The fixed renderer runtime and Python standard library remain available to trusted code. Native ARM64 visual-renderer support also remains excluded. The trusted-source assumption is an explicit MVP limitation, not a security sandbox.
 
 [`model-projects-dependencies.md`](model-projects-dependencies.md) defines project identity, model releases, exact dependency closure, MCP file operations, and compatible rollout. [`design-bundles.md`](design-bundles.md) defines multipart results. [`storage-rendering.md`](storage-rendering.md) defines replacement rendering.

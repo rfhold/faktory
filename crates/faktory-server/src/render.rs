@@ -5,7 +5,7 @@ use std::{
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -15,7 +15,7 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use tokio::{
-    io::AsyncWriteExt as _,
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
     sync::{Semaphore, mpsc},
     task::AbortHandle,
 };
@@ -32,6 +32,7 @@ pub(crate) const PROJECTION_HEIGHT: u32 = 480;
 pub(crate) const MAX_PROJECTION_IMAGE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_VISUAL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_GLB_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_STL_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_BUNDLE_BYTES: u64 = 192 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -61,6 +62,291 @@ struct RenderJob {
     revision: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct StlJob {
+    model_id: String,
+    revision: String,
+    output_id: String,
+}
+
+type InFlightStl = Arc<Mutex<HashMap<StlJob, Weak<tokio::sync::Mutex<()>>>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StlError {
+    NotFound,
+    InvalidGeometry,
+    Unavailable,
+    Timeout,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StlCoordinator {
+    repository: Repository,
+    config: RenderConfig,
+    admission: Arc<Semaphore>,
+    execution: Arc<Semaphore>,
+    execution_slots: u32,
+    in_flight: InFlightStl,
+}
+
+impl StlCoordinator {
+    pub(crate) fn new(repository: Repository, config: RenderConfig, renders: &RenderQueue) -> Self {
+        Self {
+            repository,
+            admission: Arc::new(Semaphore::new(config.queue_capacity.min(16) + 1)),
+            execution: renders.execution.clone(),
+            execution_slots: renders.execution_slots,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            config,
+        }
+    }
+
+    pub(crate) async fn get(
+        &self,
+        model_id: String,
+        revision: String,
+        output_id: String,
+    ) -> Result<Bytes, StlError> {
+        tokio::time::timeout(
+            self.config.timeout.saturating_mul(3),
+            self.get_inner(model_id, revision, output_id),
+        )
+        .await
+        .map_err(|_| StlError::Timeout)?
+    }
+
+    async fn get_inner(
+        &self,
+        model_id: String,
+        revision: String,
+        output_id: String,
+    ) -> Result<Bytes, StlError> {
+        let job = StlJob {
+            model_id,
+            revision,
+            output_id,
+        };
+        if let Some(bytes) = self.lookup(&job).await? {
+            return Ok(bytes);
+        }
+        let _admission = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| StlError::Unavailable)?;
+        let lock = {
+            let mut entries = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries.retain(|_, weak| weak.strong_count() > 0);
+            entries
+                .get(&job)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entries.insert(job.clone(), Arc::downgrade(&lock));
+                    lock
+                })
+        };
+        let _key = lock.lock().await;
+        if let Some(bytes) = self.lookup(&job).await? {
+            return Ok(bytes);
+        }
+        let _execution = self
+            .execution
+            .clone()
+            .acquire_many_owned(self.execution_slots)
+            .await
+            .map_err(|_| StlError::Unavailable)?;
+        // A different revision may have succeeded while this request waited for capacity.
+        if let Some(bytes) = self.lookup(&job).await? {
+            return Ok(bytes);
+        }
+        let bytes = export_stl(&self.repository, &self.config, &job).await?;
+        self.repository
+            .cache_stl(&job.model_id, &job.revision, &job.output_id, bytes)
+            .await
+            .map_err(stl_repository_error)?;
+        self.lookup(&job).await?.ok_or(StlError::Unavailable)
+    }
+
+    async fn lookup(&self, job: &StlJob) -> Result<Option<Bytes>, StlError> {
+        self.repository
+            .cached_stl(&job.model_id, &job.revision, &job.output_id)
+            .await
+            .map_err(stl_repository_error)?
+            .map(|bytes| {
+                validate_stl(&bytes)?;
+                Ok(bytes)
+            })
+            .transpose()
+    }
+}
+
+const fn stl_repository_error(error: RepositoryError) -> StlError {
+    match error {
+        RepositoryError::Invalid | RepositoryError::NotFound => StlError::NotFound,
+        RepositoryError::Conflict | RepositoryError::Unavailable | RepositoryError::Corrupt => {
+            StlError::Unavailable
+        }
+    }
+}
+
+#[cfg(unix)]
+struct StlProcessGuard(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for StlProcessGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.0
+            && let Ok(id) = i32::try_from(id)
+            && let Some(group) = rustix::process::Pid::from_raw(id)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+async fn export_stl(
+    repository: &Repository,
+    config: &RenderConfig,
+    job: &StlJob,
+) -> Result<Bytes, StlError> {
+    let directory = tempfile::tempdir().map_err(|_| StlError::Unavailable)?;
+    let (project_root, entrypoint, dependency_root) = tokio::time::timeout(
+        config.timeout,
+        materialize_render_inputs(
+            repository,
+            directory.path(),
+            &RenderJob {
+                model_id: job.model_id.clone(),
+                revision: job.revision.clone(),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| StlError::Timeout)?
+    .map_err(|_| StlError::Unavailable)?;
+    let destination = directory.path().join("model.stl");
+    run_stl_export(
+        config,
+        job,
+        (&project_root, &entrypoint, &dependency_root),
+        &destination,
+    )
+    .await?;
+    let metadata = tokio::fs::symlink_metadata(&destination)
+        .await
+        .map_err(|_| StlError::Unavailable)?;
+    if !metadata.is_file() || metadata.len() < 134 || metadata.len() > MAX_STL_BYTES as u64 {
+        return Err(StlError::Unavailable);
+    }
+    let bytes = tokio::fs::read(&destination)
+        .await
+        .map_err(|_| StlError::Unavailable)?;
+    validate_stl(&bytes)?;
+    Ok(Bytes::from(bytes))
+}
+
+async fn run_stl_export(
+    config: &RenderConfig,
+    job: &StlJob,
+    inputs: (&Path, &str, &Path),
+    destination: &Path,
+) -> Result<(), StlError> {
+    let (project_root, entrypoint, dependency_root) = inputs;
+    let mut command = tokio::process::Command::new(&config.command[0]);
+    command
+        .args(&config.command[1..])
+        .arg("export-stl")
+        .arg(project_root)
+        .arg(entrypoint)
+        .arg(dependency_root)
+        .arg(destination)
+        .arg(&job.output_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|_| StlError::Unavailable)?;
+    let deadline = tokio::time::Instant::now() + config.timeout;
+    #[cfg(unix)]
+    let mut process_guard = StlProcessGuard(child.id());
+    let mut stderr = child.stderr.take().ok_or(StlError::Unavailable)?;
+    let capture = async {
+        let mut first = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    first.extend_from_slice(&chunk[..n.min(256_usize.saturating_sub(first.len()))]);
+                }
+            }
+        }
+        first
+    };
+    let (status, stderr) = match tokio::time::timeout_at(deadline, async {
+        tokio::join!(child.wait(), capture)
+    })
+    .await
+    {
+        Ok((Ok(status), stderr)) => (status, stderr),
+        Ok((Err(_), _)) => return Err(StlError::Unavailable),
+        Err(_) => {
+            terminate_renderer(&mut child).await;
+            return Err(StlError::Timeout);
+        }
+    };
+    #[cfg(unix)]
+    {
+        process_guard.0 = None;
+    }
+    if !status.success() {
+        return Err(
+            if [
+                b"renderer_error=invalid_geometry".as_slice(),
+                b"renderer_error=unsupported_geometry",
+                b"renderer_error=missing_output",
+                b"renderer_error=invalid_stl",
+            ]
+            .iter()
+            .any(|code| stderr.windows(code.len()).any(|window| window == *code))
+            {
+                StlError::InvalidGeometry
+            } else {
+                StlError::Unavailable
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_stl(bytes: &[u8]) -> Result<(), StlError> {
+    if bytes.len() < 134 || bytes.len() > MAX_STL_BYTES {
+        return Err(StlError::Unavailable);
+    }
+    let triangles = u32::from_le_bytes(
+        bytes[80..84]
+            .try_into()
+            .map_err(|_| StlError::Unavailable)?,
+    ) as usize;
+    if triangles == 0
+        || triangles.checked_mul(50).and_then(|n| n.checked_add(84)) != Some(bytes.len())
+        || !bytes[84..].chunks_exact(50).all(|record| {
+            record[..48]
+                .chunks_exact(4)
+                .all(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes")).is_finite())
+        })
+    {
+        return Err(StlError::Unavailable);
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct DependencyManifest<'a> {
     format: &'static str,
@@ -79,6 +365,8 @@ struct DependencyNode<'a> {
 #[derive(Clone, Debug)]
 pub struct RenderQueue {
     sender: mpsc::Sender<RenderJob>,
+    execution: Arc<Semaphore>,
+    execution_slots: u32,
     admitted: Arc<Mutex<HashMap<RenderJob, usize>>>,
     repository: Repository,
     visual: VisualCoordinator,
@@ -135,6 +423,7 @@ impl RenderQueue {
         if config.command.is_empty()
             || config.queue_capacity == 0
             || config.concurrency == 0
+            || config.concurrency > Semaphore::MAX_PERMITS
             || config.timeout.is_zero()
             || config.max_output_bytes < 12
         {
@@ -142,10 +431,14 @@ impl RenderQueue {
         }
         let (sender, mut receiver) = mpsc::channel::<RenderJob>(config.queue_capacity);
         let semaphore = Arc::new(Semaphore::new(config.concurrency));
+        let execution = Arc::new(Semaphore::new(config.concurrency));
+        let execution_slots =
+            u32::try_from(config.concurrency).map_err(|_| RepositoryError::Invalid)?;
         let admitted = Arc::new(Mutex::new(HashMap::new()));
         let worker_admitted = admitted.clone();
         let worker_repository = repository.clone();
         let worker_visual = visual.clone();
+        let worker_execution = execution.clone();
         let worker = tokio::spawn(async move {
             loop {
                 let Ok(permit) = semaphore.clone().acquire_owned().await else {
@@ -158,9 +451,10 @@ impl RenderQueue {
                 let config = config.clone();
                 let admitted = worker_admitted.clone();
                 let visual = worker_visual.clone();
+                let execution = worker_execution.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    run_job(&repository, &config, &visual, &job).await;
+                    run_job(&repository, &config, &visual, &job, &execution).await;
                     let mut admitted = admitted
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -180,6 +474,8 @@ impl RenderQueue {
         drop(worker);
         Ok(Self {
             sender,
+            execution,
+            execution_slots,
             admitted,
             repository,
             visual,
@@ -253,11 +549,15 @@ async fn run_job(
     config: &RenderConfig,
     visual: &VisualCoordinator,
     job: &RenderJob,
+    execution: &Arc<Semaphore>,
 ) {
     if !claim_render(repository, job).await {
         return;
     }
-    let result = render(repository, config, visual, job).await;
+    let result = match execution.clone().acquire_owned().await {
+        Ok(_permit) => render(repository, config, visual, job).await,
+        Err(_) => Err("render capacity unavailable"),
+    };
     persist_terminal(repository, job, &result).await;
 }
 
@@ -1217,6 +1517,237 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stl_binary_validation_rejects_truncated_nonfinite_and_oversized_data() {
+        let mut valid = vec![0; 134];
+        valid[80..84].copy_from_slice(&1_u32.to_le_bytes());
+        valid[84..88].copy_from_slice(&1_f32.to_le_bytes());
+        assert_eq!(validate_stl(&valid), Ok(()));
+        let mut truncated = valid.clone();
+        truncated.pop();
+        assert_eq!(validate_stl(&truncated), Err(StlError::Unavailable));
+        let mut nonfinite = valid.clone();
+        nonfinite[84..88].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert_eq!(validate_stl(&nonfinite), Err(StlError::Unavailable));
+        assert_eq!(
+            validate_stl(&vec![0; MAX_STL_BYTES + 1]),
+            Err(StlError::Unavailable)
+        );
+        assert_eq!(MAX_STL_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stl_parent_exit_with_inherited_stderr_kills_descendant_on_timeout_and_cancel() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().expect("test directory");
+            let ready = directory.path().join("ready");
+            let survived = directory.path().join("survived");
+            let script = "( printf ready > \"$1\"; sleep 1; printf survived > \"$2\" ) & while [ ! -f \"$1\" ]; do sleep 0.01; done; exit 0";
+            let config = RenderConfig {
+                command: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    "stl-test".to_owned(),
+                    ready.to_string_lossy().into_owned(),
+                    survived.to_string_lossy().into_owned(),
+                ],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_millis(200),
+                max_output_bytes: 1024,
+            };
+            let job = StlJob {
+                model_id: "test".to_owned(),
+                revision: "test".to_owned(),
+                output_id: "primary".to_owned(),
+            };
+            let destination = directory.path().join("model.stl");
+            let mut export = tokio::spawn(async move {
+                run_stl_export(
+                    &config,
+                    &job,
+                    (Path::new("/"), "main.py", Path::new("/")),
+                    &destination,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("descendant started");
+            if cancel {
+                // Give the short-lived parent time to exit before cancelling the pipe wait.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!export.is_finished(), "stderr pipe should still be open");
+                export.abort();
+                assert!(export.await.expect_err("cancelled export").is_cancelled());
+            } else {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), &mut export)
+                        .await
+                        .expect("bounded stderr wait")
+                        .expect("export task"),
+                    Err(StlError::Timeout)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(!survived.exists(), "descendant survived export cleanup");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stl_export_drains_large_stderr_but_only_classifies_first_256_bytes() {
+        for category_first in [false, true] {
+            let directory = tempfile::tempdir().expect("test directory");
+            let script = if category_first {
+                "printf 'renderer_error=invalid_geometry' >&2; i=0; while [ $i -lt 10000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; exit 1"
+            } else {
+                "i=0; while [ $i -lt 10000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; printf 'renderer_error=invalid_geometry' >&2; exit 1"
+            };
+            let config = RenderConfig {
+                command: vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_secs(3),
+                max_output_bytes: 1024,
+            };
+            let job = StlJob {
+                model_id: "test".to_owned(),
+                revision: "test".to_owned(),
+                output_id: "primary".to_owned(),
+            };
+            assert_eq!(
+                run_stl_export(
+                    &config,
+                    &job,
+                    (Path::new("/"), "main.py", Path::new("/")),
+                    &directory.path().join("model.stl"),
+                )
+                .await,
+                Err(if category_first {
+                    StlError::InvalidGeometry
+                } else {
+                    StlError::Unavailable
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stl_and_render_share_exclusive_export_capacity() {
+        let (renders, stl, model, stl_bytes) = stl_capacity_fixture().await;
+        assert!(Arc::ptr_eq(&stl.execution, &renders.execution));
+        let render_one = renders
+            .execution
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("render slot");
+        let render_two = renders
+            .execution
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("render slot");
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                stl.get(
+                    model.id,
+                    model.desired_source_revision,
+                    "primary".to_owned()
+                ),
+            )
+            .await
+            .expect("cache hit bypasses execution capacity"),
+            Ok(Bytes::from(stl_bytes))
+        );
+        let mut export_task = tokio::spawn({
+            let execution = stl.execution.clone();
+            let slots = stl.execution_slots;
+            async move {
+                execution
+                    .acquire_many_owned(slots)
+                    .await
+                    .expect("export slots")
+            }
+        });
+        tokio::task::yield_now().await;
+        drop(render_one);
+        assert!(!export_task.is_finished(), "export overlapped a render");
+        drop(render_two);
+        let export_permit = tokio::time::timeout(Duration::from_secs(1), &mut export_task)
+            .await
+            .expect("export unblocked")
+            .expect("export task");
+        drop(export_task);
+        let mut pending_render_task = tokio::spawn({
+            let execution = renders.execution.clone();
+            async move { execution.acquire_owned().await.expect("render slot") }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !pending_render_task.is_finished(),
+            "render overlapped export"
+        );
+        drop(export_permit);
+        let permit = tokio::time::timeout(Duration::from_secs(1), &mut pending_render_task)
+            .await
+            .expect("render unblocked")
+            .expect("render task");
+        drop(pending_render_task);
+        drop(permit);
+        renders.stop_worker();
+    }
+
+    async fn stl_capacity_fixture() -> (
+        RenderQueue,
+        StlCoordinator,
+        crate::model::ModelRecord,
+        Vec<u8>,
+    ) {
+        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
+        let model = repository
+            .create_model("part", "Part", b"result = 1")
+            .await
+            .expect("model");
+        repository
+            .complete_render(
+                &model.id,
+                &model.desired_source_revision,
+                rendered_output(b"glb"),
+            )
+            .await
+            .expect("ready");
+        let mut stl_bytes = vec![0; 134];
+        stl_bytes[80..84].copy_from_slice(&1_u32.to_le_bytes());
+        repository
+            .cache_stl(
+                &model.id,
+                &model.desired_source_revision,
+                "primary",
+                Bytes::from(stl_bytes.clone()),
+            )
+            .await
+            .expect("cached STL");
+        let config = RenderConfig {
+            command: vec!["/bin/true".to_owned()],
+            queue_capacity: 1,
+            concurrency: 2,
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 1024,
+        };
+        let renders = RenderQueue::start(repository.clone(), config.clone()).expect("queue");
+        let stl = StlCoordinator::new(repository, config, &renders);
+        (renders, stl, model, stl_bytes)
+    }
+
     #[tokio::test]
     async fn materializes_root_project_export_and_dependency_manifest() {
         let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
@@ -1603,6 +2134,7 @@ mod tests {
                 model_id: edited.id.clone(),
                 revision: edited.desired_source_revision,
             },
+            &Arc::new(Semaphore::new(1)),
         )
         .await;
 

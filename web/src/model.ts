@@ -38,8 +38,32 @@ export function outputArtifactUrl(
   model: Pick<Model, "id" | "currentSuccessfulSourceRevision">,
   outputId: string,
 ) {
+  return outputGeometryUrl(model, outputId, "glb");
+}
+
+export function outputStlUrl(
+  model: Pick<Model, "id" | "currentSuccessfulSourceRevision">,
+  outputId: string,
+) {
+  return outputGeometryUrl(model, outputId, "stl");
+}
+
+function outputGeometryUrl(
+  model: Pick<Model, "id" | "currentSuccessfulSourceRevision">,
+  outputId: string,
+  extension: "glb" | "stl",
+) {
   if (!model.currentSuccessfulSourceRevision || !outputId) return undefined;
-  return `/artifacts/${encodeURIComponent(model.id)}/${encodeURIComponent(model.currentSuccessfulSourceRevision)}/outputs/${encodeURIComponent(outputId)}/model.glb`;
+  return `/artifacts/${encodeURIComponent(model.id)}/${encodeURIComponent(model.currentSuccessfulSourceRevision)}/outputs/${encodeURIComponent(outputId)}/model.${extension}`;
+}
+
+export function outputStlFilename(
+  model: Pick<Model, "id" | "currentSuccessfulSourceRevision">,
+  outputId: string,
+) {
+  const safe = (value: string, fallback: string) =>
+    value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || fallback;
+  return `${safe(model.id, "model")}-${safe(outputId, "output")}-${safe(model.currentSuccessfulSourceRevision, "revision")}.stl`;
 }
 
 export function previewUrl(model: Pick<Model, "id" | "currentSuccessfulSourceRevision">) {

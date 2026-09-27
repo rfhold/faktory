@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import resource
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -16,12 +18,16 @@ from faktory_design.v1 import Design, Output
 from renderer.worker import (
     MAX_BUNDLE_BYTES,
     MAX_GLB_BYTES,
+    MAX_STL_BYTES,
     PROJECTIONS,
     _bundle_within_limit,
     _regular_file_within_limit,
+    _stl_file_size_limit,
     _validate_facts,
     _validate_glb,
+    _validate_stl,
     _validate_svg,
+    export_stl,
     render,
 )
 
@@ -876,6 +882,205 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "renderer_error=invalid_arguments\n")
+
+    def test_stl_selected_part_and_placed_assembly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / "project"
+            dependencies = root / "dependencies"
+            project.mkdir()
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
+            (project / "main.py").write_text(
+                "import cadquery as cq\n"
+                "from faktory_design.v1 import Design, Output\n"
+                "assembly = cq.Assembly()\n"
+                "assembly.add(cq.Workplane('XY').box(2, 2, 2), loc=cq.Location((10, 0, 0)))\n"
+                "result = Design((\n"
+                "    Output('part', 'part', cq.Workplane('XY').box(1, 1, 1), primary=True),\n"
+                "    Output('placed', 'assembly', assembly),\n"
+                "    Output('not-selected', 'part', object()),\n"
+                "))\n",
+                encoding="utf-8",
+            )
+            part = root / "part.stl"
+            placed = root / "placed.stl"
+            self.assertIsNone(
+                export_stl(project, Path("main.py"), dependencies, part, "part")
+            )
+            self.assertIsNone(
+                export_stl(project, Path("main.py"), dependencies, placed, "placed")
+            )
+            for file in (part, placed):
+                self.assertTrue(_validate_stl(file))
+                self.assertGreater(struct.unpack_from("<I", file.read_bytes(), 80)[0], 0)
+            self.assertNotEqual(part.read_bytes(), placed.read_bytes())
+            records = placed.read_bytes()[84:]
+            xs = [
+                x
+                for record in range(0, len(records), 50)
+                for x in struct.unpack_from("<12f", records, record)[3::3]
+            ]
+            self.assertGreater(min(xs), 8)
+            self.assertLess(max(xs), 12)
+            self.assertEqual(
+                {path.name for path in root.iterdir()},
+                {"project", "dependencies", "part.stl", "placed.stl"},
+            )
+
+    def test_stl_rejections_leave_no_output_or_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / "project"
+            dependencies = root / "dependencies"
+            project.mkdir()
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
+            source = project / "main.py"
+            source.write_text(
+                "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 1, 1)\n",
+                encoding="utf-8",
+            )
+            output = root / "model.stl"
+            for invalid in ("../primary", "Primary", "has--gap", "a" * 65):
+                self.assertEqual(
+                    export_stl(project, Path("main.py"), dependencies, output, invalid),
+                    "invalid_output_id",
+                )
+            self.assertEqual(
+                export_stl(project, Path("main.py"), dependencies, output, "other"),
+                "missing_output",
+            )
+            with mock.patch("renderer.worker._validate_stl", return_value=False):
+                self.assertEqual(
+                    export_stl(project, Path("main.py"), dependencies, output, "primary"),
+                    "invalid_stl",
+                )
+            with mock.patch("renderer.worker.MAX_STL_BYTES", 133):
+                self.assertEqual(
+                    export_stl(project, Path("main.py"), dependencies, output, "primary"),
+                    "invalid_stl",
+                )
+            source.write_text("result = object()\n", encoding="utf-8")
+            self.assertEqual(
+                export_stl(project, Path("main.py"), dependencies, output, "primary"),
+                "unsupported_result",
+            )
+            source.write_text(
+                "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 1, 1)\n",
+                encoding="utf-8",
+            )
+            bundle = root / "bundle"
+            self.assertIsNone(render(project, Path("main.py"), dependencies, bundle))
+            original_glb = (bundle / "outputs" / "primary" / "model.glb").read_bytes()
+            with mock.patch("renderer.worker._validate_stl", return_value=False):
+                self.assertEqual(
+                    export_stl(project, Path("main.py"), dependencies, output, "primary"),
+                    "invalid_stl",
+                )
+            self.assertEqual(
+                (bundle / "outputs" / "primary" / "model.glb").read_bytes(), original_glb
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(
+                any(path.name.startswith(".model.stl.") for path in root.iterdir())
+            )
+            self.assertEqual(MAX_STL_BYTES, 64 * 1024 * 1024)
+
+    def test_stl_staging_rules_and_source_confidentiality(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / "project"
+            dependencies = root / "dependencies"
+            project.mkdir()
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
+            source = project / "main.py"
+            output = root / "model.stl"
+            source.write_text(
+                "print('private data')\nraise RuntimeError('secret details')\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable, "-m", "renderer", "export-stl", str(project),
+                "main.py", str(dependencies), str(output), "primary",
+            ]
+            failed = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(
+                (failed.returncode, failed.stdout, failed.stderr),
+                (1, "", "renderer_error=source_execution_failed\n"),
+            )
+            self.assertFalse(output.exists())
+
+            source.write_text(
+                "from faktory_models.m_undeclared import make\nresult = make()\n",
+                encoding="utf-8",
+            )
+            failed = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(failed.stderr, "renderer_error=invalid_project_source\n")
+            self.assertFalse(output.exists())
+
+            source.write_text(
+                "import cadquery as cq\nprint('private data')\n"
+                "result = cq.Workplane('XY').box(1, 1, 1)\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(
+                (completed.returncode, completed.stdout, completed.stderr), (0, "", "")
+            )
+            self.assertTrue(_validate_stl(output))
+
+    def test_stl_rejects_empty_geometry_and_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / "project"
+            dependencies = root / "dependencies"
+            project.mkdir()
+            dependencies.mkdir()
+            self.write_dependency_root(dependencies)
+            source = project / "main.py"
+            output = root / "model.stl"
+            source.write_text("import cadquery as cq\nresult = cq.Assembly()\n", encoding="utf-8")
+            self.assertEqual(
+                export_stl(project, Path("main.py"), dependencies, output, "primary"),
+                "invalid_geometry",
+            )
+            output.write_bytes(b"do not change")
+            self.assertEqual(
+                export_stl(project, Path("main.py"), dependencies, output, "primary"),
+                "invalid_output_path",
+            )
+            self.assertEqual(output.read_bytes(), b"do not change")
+
+    def test_stl_validator_rejects_malformed_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "file.stl"
+            record = struct.pack("<12fH", *([0.0] * 12), 0)
+            for content in (
+                b"solid fake",
+                b" " * 80 + struct.pack("<I", 0) + record,
+                b" " * 80 + struct.pack("<I", 2) + record,
+                b" " * 80 + struct.pack("<I", 1) + record + b"x",
+                b" " * 80 + struct.pack("<I", 1) + struct.pack("<f", float("nan")) + record[4:],
+            ):
+                output.write_bytes(content)
+                self.assertFalse(_validate_stl(output))
+
+    def test_stl_write_limit_rejects_adjacent_byte_and_restores_process(self) -> None:
+        original_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+        original_handler = signal.getsignal(signal.SIGXFSZ)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "bounded.stl"
+            with mock.patch("renderer.worker.MAX_STL_BYTES", 134):
+                with _stl_file_size_limit():
+                    with output.open("wb", buffering=0) as file:
+                        self.assertEqual(file.write(b"x" * 134), 134)
+                        with self.assertRaises(OSError):
+                            file.write(b"x")
+            self.assertEqual(output.stat().st_size, 134)
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_FSIZE), original_limit)
+        self.assertEqual(signal.getsignal(signal.SIGXFSZ), original_handler)
 
     def test_source_failures_have_stable_categories(self) -> None:
         cases = {

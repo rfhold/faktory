@@ -38,7 +38,7 @@ use crate::{
     mcp::FaktoryMcp,
     model::{Repository, RepositoryError},
     production::ProductionAuthRuntime,
-    render::{RenderConfig, RenderQueue},
+    render::{RenderConfig, RenderQueue, StlCoordinator, StlError},
     service::FaktoryGrpcService,
     storage::ObjectStore,
     visual::{HttpVisualRenderer, UnavailableVisualRenderer, VisualCoordinator, VisualRenderer},
@@ -75,6 +75,7 @@ impl std::fmt::Debug for VisualRendererConfig {
 #[derive(Clone, Debug)]
 struct AppState {
     repository: Repository,
+    stl: StlCoordinator,
     readiness: AuthReadiness,
 }
 
@@ -368,8 +369,10 @@ fn build_disabled_router(
     let grpc = ServiceBuilder::new()
         .layer(tonic_web::GrpcWebLayer::new())
         .service(grpc_routes.routes());
+    let stl = StlCoordinator::new(repository.clone(), config.render.clone(), &renders);
     let mcp = FaktoryMcp::new(repository.clone(), renders).router();
     let state = AppState {
+        stl,
         repository,
         readiness: AuthReadiness::Disabled,
     };
@@ -420,12 +423,14 @@ fn build_production_router(
         AuthConfig::Production(config) => config,
         AuthConfig::Disabled => unreachable!("production router mode"),
     };
+    let stl = StlCoordinator::new(repository.clone(), config.render.clone(), &renders);
     let mcp = FaktoryMcp::new(repository.clone(), renders).hosted_router(
         production_config.mcp_resource(),
         production_config.oauth_issuer(),
         production.oauth.clone(),
     )?;
     let state = AppState {
+        stl,
         repository,
         readiness: AuthReadiness::Production(production.clone()),
     };
@@ -466,6 +471,7 @@ fn artifact_router(state: AppState) -> Router {
     let output_artifact_state = state.clone();
     let preview_state = state.clone();
     let output_preview_state = state;
+    let stl_state = output_preview_state.clone();
     Router::new()
         .route(
             "/artifacts/{model_id}/{revision}/model.glb",
@@ -486,6 +492,10 @@ fn artifact_router(state: AppState) -> Router {
             get(move |path, headers| {
                 output_preview(State(output_preview_state.clone()), path, headers)
             }),
+        )
+        .route(
+            "/artifacts/{model_id}/{revision}/outputs/{output_id}/model.stl",
+            get(move |path, headers| output_stl(State(stl_state.clone()), path, headers)),
         )
 }
 
@@ -675,6 +685,60 @@ async fn output_geometry(
     headers: HeaderMap,
 ) -> Response {
     geometry_response(state, model_id, revision, output_id, headers).await
+}
+
+async fn output_stl(
+    State(state): State<AppState>,
+    Path((model_id, revision, output_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let bytes = match state
+        .stl
+        .get(model_id.clone(), revision.clone(), output_id.clone())
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(StlError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(StlError::InvalidGeometry) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        Err(StlError::Timeout) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
+        Err(StlError::Unavailable) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let etag = format!("\"stl-v1:{revision}:{output_id}\"");
+    let not_modified = if_none_match(&headers, &etag);
+    let length = if not_modified { 0 } else { bytes.len() };
+    let mut response = Response::new(if not_modified {
+        Body::empty()
+    } else {
+        Body::from(bytes)
+    });
+    *response.status_mut() = if not_modified {
+        StatusCode::NOT_MODIFIED
+    } else {
+        StatusCode::OK
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("model/stl"));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"{model_id}-{output_id}.stl\""
+        ))
+        .expect("validated model and output IDs"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("validated revision and output ID"),
+    );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn geometry_response(
@@ -1462,7 +1526,13 @@ mod tests {
     }
 
     async fn runtime_with_completed_model() -> (Runtime, crate::model::ModelRecord) {
-        let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), disabled_config())
+        runtime_with_completed_model_config(disabled_config()).await
+    }
+
+    async fn runtime_with_completed_model_config(
+        config: AppConfig,
+    ) -> (Runtime, crate::model::ModelRecord) {
+        let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), config)
             .await
             .expect("runtime");
         let model = runtime
@@ -1501,6 +1571,270 @@ mod tests {
             .await
             .expect("first render");
         (runtime, model)
+    }
+
+    fn stl_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 134];
+        bytes[80..84].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[84..88].copy_from_slice(&1_f32.to_le_bytes());
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stl_miss_hit_selected_outputs_and_current_revision() {
+        let directory = tempfile::tempdir().expect("fixture dir");
+        let fixture = directory.path().join("fixture.stl");
+        let count = directory.path().join("count");
+        tokio::fs::write(&fixture, stl_fixture())
+            .await
+            .expect("fixture");
+        let mut config = disabled_config();
+        config.render.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "cp '{}' \"$4\"; printf x >> '{}'",
+                fixture.display(),
+                count.display()
+            ),
+        ];
+        let (runtime, model) = runtime_with_completed_model_config(config).await;
+        let path = format!(
+            "/artifacts/{}/{}/outputs/fastener/model.stl",
+            model.id, model.desired_source_revision
+        );
+        let first = artifact_request(runtime.router(), path.clone()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "model/stl");
+        assert_eq!(
+            first.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"part-fastener.stl\""
+        );
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "private, no-cache");
+        assert_eq!(first.headers()[header::CONTENT_LENGTH], "134");
+        assert_eq!(
+            first.headers()[header::ETAG],
+            format!("\"stl-v1:{}:fastener\"", model.desired_source_revision)
+        );
+        assert_eq!(
+            to_bytes(first.into_body(), 1024).await.expect("STL"),
+            stl_fixture()
+        );
+        let cached = artifact_request_with_header(
+            runtime.router(),
+            path.clone(),
+            Some((
+                header::IF_NONE_MATCH,
+                HeaderValue::from_str(&format!(
+                    "\"stl-v1:{}:fastener\"",
+                    model.desired_source_revision
+                ))
+                .expect("etag"),
+            )),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(cached.headers()[header::CONTENT_LENGTH], "0");
+        assert_eq!(tokio::fs::read(&count).await.expect("count"), b"x");
+        assert_eq!(
+            artifact_request(runtime.router(), path.replace("fastener", "missing"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            artifact_request(
+                runtime.router(),
+                path.replace(&model.desired_source_revision, &"0".repeat(64))
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let primary = artifact_request(runtime.router(), path.replace("fastener", "primary")).await;
+        assert_eq!(primary.status(), StatusCode::OK);
+        assert_eq!(tokio::fs::read(&count).await.expect("count"), b"xx");
+        assert_stl_current_revision(&runtime, &model, path).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_stl_current_revision(
+        runtime: &Runtime,
+        model: &crate::model::ModelRecord,
+        path: String,
+    ) {
+        let replacement = runtime
+            .repository()
+            .edit_model(
+                &model.id,
+                &model.desired_source_revision,
+                None,
+                Some(&[crate::model::SourcePatch {
+                    old: "first".into(),
+                    new: "replacement".into(),
+                }]),
+            )
+            .await
+            .expect("edit")
+            .record;
+        runtime
+            .repository()
+            .fail_render(
+                &model.id,
+                &replacement.desired_source_revision,
+                "safe failure",
+            )
+            .await
+            .expect("fail");
+        assert_eq!(
+            artifact_request(runtime.router(), path.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            artifact_request(
+                runtime.router(),
+                format!(
+                    "/artifacts/{}/{}/outputs/primary/model.stl",
+                    model.id, replacement.desired_source_revision
+                )
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        runtime
+            .repository()
+            .retry_render(&model.id)
+            .await
+            .expect("retry");
+        runtime
+            .repository()
+            .complete_render(
+                &model.id,
+                &replacement.desired_source_revision,
+                rendered(b"glTF-new"),
+            )
+            .await
+            .expect("new success");
+        assert_eq!(
+            artifact_request(runtime.router(), path).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stl_concurrent_requests_deduplicate_and_failures_preserve_render_state() {
+        let directory = tempfile::tempdir().expect("fixture dir");
+        let fixture = directory.path().join("fixture.stl");
+        let count = directory.path().join("count");
+        tokio::fs::write(&fixture, stl_fixture())
+            .await
+            .expect("fixture");
+        let mut config = disabled_config();
+        config.render.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "sleep 0.1; cp '{}' \"$4\"; printf x >> '{}'",
+                fixture.display(),
+                count.display()
+            ),
+        ];
+        let (runtime, model) = runtime_with_completed_model_config(config).await;
+        let path = format!(
+            "/artifacts/{}/{}/outputs/primary/model.stl",
+            model.id, model.desired_source_revision
+        );
+        let (a, b) = tokio::join!(
+            artifact_request(runtime.router(), path.clone()),
+            artifact_request(runtime.router(), path)
+        );
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        assert_eq!(tokio::fs::read(&count).await.expect("count"), b"x");
+        assert_eq!(
+            runtime
+                .repository()
+                .get_model(&model.id)
+                .await
+                .expect("model")
+                .record
+                .render_state,
+            crate::model::StoredRenderState::Ready
+        );
+        let mut config = disabled_config();
+        config.render.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'renderer_error=invalid_geometry\\n' >&2; exit 1".into(),
+        ];
+        let (runtime, model) = runtime_with_completed_model_config(config).await;
+        let path = format!(
+            "/artifacts/{}/{}/outputs/primary/model.stl",
+            model.id, model.desired_source_revision
+        );
+        assert_eq!(
+            artifact_request(runtime.router(), path.clone())
+                .await
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            runtime
+                .repository()
+                .get_model(&model.id)
+                .await
+                .expect("model")
+                .record
+                .render_state,
+            crate::model::StoredRenderState::Ready
+        );
+        let mut config = disabled_config();
+        config.render.timeout = Duration::from_millis(50);
+        config.render.command = vec!["/bin/sh".into(), "-c".into(), "sleep 2".into()];
+        let (runtime, model) = runtime_with_completed_model_config(config).await;
+        let path = format!(
+            "/artifacts/{}/{}/outputs/primary/model.stl",
+            model.id, model.desired_source_revision
+        );
+        assert_eq!(
+            artifact_request(runtime.router(), path).await.status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stl_admission_is_bounded_without_blocking_render_queue() {
+        let mut config = disabled_config();
+        config.render.queue_capacity = 1;
+        config.render.timeout = Duration::from_secs(2);
+        config.render.command = vec!["/bin/sh".into(), "-c".into(), "sleep 0.3; exit 1".into()];
+        let (runtime, model) = runtime_with_completed_model_config(config).await;
+        let path = format!(
+            "/artifacts/{}/{}/outputs/primary/model.stl",
+            model.id, model.desired_source_revision
+        );
+        let first = tokio::spawn(artifact_request(runtime.router(), path.clone()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second = tokio::spawn(artifact_request(runtime.router(), path.clone()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            artifact_request(runtime.router(), path).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            first.await.expect("first").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            second.await.expect("second").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

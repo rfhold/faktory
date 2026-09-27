@@ -53,11 +53,13 @@ The canonical Python-worker bundle is capped at 192 MiB in aggregate before serv
 
 The Python worker sums only regular expected files with checked accumulation after the complete temporary bundle exists. It rejects and removes an over-limit temporary bundle before atomic publication. Rust independently sums the same exact expected files with checked accumulation after manifest validation and rejects an over-limit bundle before rasterization, shaded rendering, or complete in-memory output construction. Failures expose only safe generic renderer errors.
 
-The server uses a disk-backed 512 MiB `/tmp`. After the 192 MiB output allowance, the rest covers the 16 MiB canonical project, at most 64 MiB of deduplicated dependency package source, temporary metadata, filesystem overhead, and atomic worker publication. Default render concurrency remains one. The aggregate worker cap plus bounded technical and shaded images keeps the validated Rust result within the server's 2 GiB memory limit.
+The production server declares a disk-backed 512 MiB `/tmp`. After the 192 MiB output allowance, the rest covers the 16 MiB canonical project, at most 64 MiB of deduplicated dependency package source, temporary metadata, filesystem overhead, and atomic worker publication. Local Compose instead declares a memory-backed `/tmp` tmpfs with `size=512m`; this capacity limit does not guarantee available memory. Default render concurrency remains one. The aggregate worker cap plus bounded technical and shaded images keeps the validated Rust result within the server's 2 GiB memory limit.
 
 Each facts object contains total volume in cubic millimetres and source-coordinate axis-aligned x/y/z dimensions in millimetres. Assembly and compound volume retains the current component-sum behavior, so overlaps can count independently.
 
 Only the primary output receives seven canonical shaded projections. Named-view renders also use only the primary output. Non-primary outputs have no canonical shaded set and no named-view render cache in this milestone.
+
+The browser can request a binary STL for any current-successful output. STL is an optional on-demand export, not a required render artifact or a source of output identity. On a cache miss, the server runs `python -m renderer export-stl <project_root> <entrypoint> <dependency_root> <output_file> <output_id>` against the exact project and locked dependency closure. The renderer selects the requested output and tessellates its placed geometry with absolute 0.1 mm linear and 0.1 rad angular deflection. The export accepts valid positive-volume solids. The Python worker applies a 64 MiB `RLIMIT_FSIZE` during the STL write, then validates the binary file before publication; Rust validates the exported file and bytes again. Binary structure checks do not prove a watertight mesh, dimensional fitness, or printability. Export failure does not fail the revision or change its render state. See [`storage-rendering.md`](storage-rendering.md) for cache semantics and [`protocol.md`](protocol.md) for download behavior.
 
 The complete immutable manifest is `outputs.json` with this canonical logical shape:
 
@@ -85,4 +87,4 @@ Concrete hardware definitions belong in exact immutable model releases. A change
 
 ## Exclusions
 
-This milestone adds no structured persisted constraints, server-side constraint solver, optional output failure, partial success, manufacturing export, or per-output named views. It adds no new project identity input, source exposure, untrusted-code sandbox, or mutable artifact semantics.
+This milestone adds no structured persisted constraints, server-side constraint solver, optional output failure, partial success, 3MF export, printability validation, or per-output named views. It adds no new project identity input, source exposure, untrusted-code sandbox, or mutable artifact semantics.
