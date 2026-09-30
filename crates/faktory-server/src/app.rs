@@ -314,7 +314,9 @@ pub async fn build_runtime_with_visual_renderer(
         .map_err(startup_reconciliation_error)?;
 
     let router = match &config.auth {
-        AuthConfig::Disabled => build_disabled_router(&config, repository.clone(), renders.clone()),
+        AuthConfig::Disabled => {
+            build_disabled_router(&config, repository.clone(), renders.clone())?
+        }
         AuthConfig::Production(production_config) => {
             if production_config.public_base_url.trim_end_matches('/')
                 != config.public_base_url.trim_end_matches('/')
@@ -361,7 +363,7 @@ fn build_disabled_router(
     config: &AppConfig,
     repository: Repository,
     renders: RenderQueue,
-) -> Router {
+) -> Result<Router, String> {
     let mut grpc_routes = Routes::builder();
     grpc_routes.add_service(FaktoryServiceServer::new(FaktoryGrpcService::new(
         repository.clone(),
@@ -370,7 +372,7 @@ fn build_disabled_router(
         .layer(tonic_web::GrpcWebLayer::new())
         .service(grpc_routes.routes());
     let stl = StlCoordinator::new(repository.clone(), config.render.clone(), &renders);
-    let mcp = FaktoryMcp::new(repository.clone(), renders).router();
+    let mcp = FaktoryMcp::new(repository.clone(), renders)?.router();
     let state = AppState {
         stl,
         repository,
@@ -398,7 +400,7 @@ fn build_disabled_router(
                 .fallback_service(grpc.clone()),
             );
     }
-    with_http_telemetry(router.fallback_service(grpc))
+    Ok(with_http_telemetry(router.fallback_service(grpc)))
 }
 
 fn build_production_router(
@@ -424,7 +426,7 @@ fn build_production_router(
         AuthConfig::Disabled => unreachable!("production router mode"),
     };
     let stl = StlCoordinator::new(repository.clone(), config.render.clone(), &renders);
-    let mcp = FaktoryMcp::new(repository.clone(), renders).hosted_router(
+    let mcp = FaktoryMcp::new(repository.clone(), renders)?.hosted_router(
         production_config.mcp_resource(),
         production_config.oauth_issuer(),
         production.oauth.clone(),

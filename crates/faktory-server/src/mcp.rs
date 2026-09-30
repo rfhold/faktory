@@ -1,5 +1,6 @@
 //! MCP tools over the same repository and render queue.
 
+mod skills;
 mod workspace;
 
 use std::sync::Arc;
@@ -38,17 +39,20 @@ pub struct FaktoryMcp {
     repository: Repository,
     renders: RenderQueue,
     visual: VisualCoordinator,
+    catalog: Arc<mcp::skills::SkillCatalog>,
 }
 
 impl FaktoryMcp {
-    #[must_use]
-    pub fn new(repository: Repository, renders: RenderQueue) -> Self {
+    pub fn new(repository: Repository, renders: RenderQueue) -> Result<Self, String> {
+        let catalog =
+            skills::catalog().map_err(|_| "invalid embedded MCP skill catalog".to_owned())?;
         let visual = renders.visual();
-        Self {
+        Ok(Self {
             repository,
             renders,
             visual,
-        }
+            catalog: Arc::new(catalog),
+        })
     }
 
     pub fn router(self) -> axum::Router {
@@ -81,6 +85,7 @@ impl FaktoryMcp {
     name = "faktory",
     version = "0.1.0",
     description = "Faktory model and shared-view tools.",
+    skills = self.catalog,
     auth(
         scopes = ["faktory:use"],
         required_scopes = ["faktory:use"],
@@ -1994,7 +1999,9 @@ mod tests {
             },
         )
         .expect("render queue");
-        let router = FaktoryMcp::new(repository, renders).router();
+        let router = FaktoryMcp::new(repository, renders)
+            .expect("skill catalog")
+            .router();
         let request = Request::builder()
             .method("POST")
             .uri("/mcp")

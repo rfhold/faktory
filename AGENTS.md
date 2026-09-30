@@ -5,6 +5,7 @@
 | [crates/faktory-proto/](crates/faktory-proto/) | Committed Prost and Tonic types for the versioned Faktory API. |
 | [proto/](proto/) | Authoritative protobuf sources and generated browser bindings. |
 | [docs/](docs/) | Indexed MVP architecture, operations, and quality contracts. |
+| [skills/](skills/) | Compile-time public MCP workflow assets; distinct from generated project AGENTS.md. |
 | [compose.yaml](compose.yaml) | Deterministic local Faktory, Garage, and PostgreSQL integration topology. |
 | [Dockerfile](Dockerfile) | Multi-stage production image for the server, renderer, and SPA. |
 | [infra/pulumi/](infra/pulumi/) | Preview Kubernetes, PostgreSQL, Authentik, and networking declarations. |

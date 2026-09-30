@@ -56,6 +56,8 @@ The Compose lifecycle in [CONTRIBUTING.md](../../CONTRIBUTING.md) validates fres
 
 ## Required Protocol Coverage
 
+For [MCP Skills](../architecture/mcp-skills.md), run `cargo +1.96.0 test --locked -p faktory-server mcp`. Tests must assert the explicit 19-tool name inventory and deterministic complete input-schema digest, complete skill capabilities without directory reading, three skills and all six raw files, raw-byte size/digest and frontmatter agreement, exact get/read results, unknown/traversal URIs and invalid cursors, and bearer/invalid-token/insufficient-scope/Origin rejection. Preserve semantic image transport and existing domain tests. These tests use an in-memory repository and a deterministic transport authorizer; they do not prove deployed OAuth or external identity-provider behavior.
+
 Tests must cover unary methods, authentication failures, complete model fields, create/update view etag semantics, default-view clearing on deletion, validation of finite camera values and quaternions, and stable gRPC status mapping. Complete-model tests must include optional `current_successful_facts`, ordered `current_successful_outputs`, and `updated_at` in unary, snapshot, and change responses. They must prove that exactly one output summary is primary and that its facts equal `current_successful_facts`. Empty output summaries and absent primary facts must represent no successful geometry. Current local coverage does not constitute production authentication integration evidence.
 
 Watch tests must prove that the first event is exactly one authoritative snapshot, later events are complete typed `model_changed` upserts, reconnect replaces prior client state, and no event implies unsupported model deletion.

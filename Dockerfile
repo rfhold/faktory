@@ -48,6 +48,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+COPY skills skills
 RUN --mount=type=cache,id=faktory-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=faktory-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=faktory-${TARGETARCH}-cargo-target,target=/workspace/target \

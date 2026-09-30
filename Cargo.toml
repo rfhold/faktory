@@ -28,8 +28,8 @@ globset = "0.4.20"
 http = "1.5.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-kuri-server = { git = "https://git.holdenitdown.net/rfhold/kuri.git", rev = "99d0fe1883fd177e7b5eb1254a220cb3d0e86814", default-features = false }
-mcp = { git = "https://git.holdenitdown.net/rfhold/kuri.git", rev = "99d0fe1883fd177e7b5eb1254a220cb3d0e86814", default-features = false, features = ["macros", "oauth-authorization-server-postgres", "oauth-resource-owner-oidc-postgres", "progressive"] }
+kuri-server = { git = "https://git.holdenitdown.net/rfhold/kuri.git", rev = "8193f120e5581ae0c46eaf9e1ce69a10a7b0b875", default-features = false }
+mcp = { git = "https://git.holdenitdown.net/rfhold/kuri.git", rev = "8193f120e5581ae0c46eaf9e1ce69a10a7b0b875", default-features = false, features = ["macros", "oauth-authorization-server-postgres", "oauth-resource-owner-oidc-postgres", "progressive"] }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "metrics", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }

@@ -6,6 +6,7 @@ These documents define repository-implemented MVP behavior and identify implemen
 | --- | --- |
 | [Overview](overview.md) | Components, request flows, trust boundaries, and exclusions. |
 | [Protocol](protocol.md) | gRPC-web, MCP tools, internal visual RPC, view concurrency, and HTTP geometry. |
+| [MCP Skills](mcp-skills.md) | Embedded public workflows, complete raw-byte manifests, and unchanged transport/access boundaries. |
 | [Model projects and dependencies](model-projects-dependencies.md) | V2 bundles, model releases, exact dependency closure, MCP operations, and compatible rollout. |
 | [Multipart design bundles](design-bundles.md) | Versioned Python results, named outputs, primary selection, compatibility, and exclusions. |
 | [Storage and rendering](storage-rendering.md) | Garage keys, render recipes, project revision state, and render caches. |
