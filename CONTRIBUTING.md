@@ -56,17 +56,17 @@ docker compose config --quiet
 git diff --check
 ```
 
-Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Each Faktory image receives a matching native renderer check before manifest publication.
+Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Preview runs each Faktory image's matching native renderer check before manifest publication; release promotes the existing preview digests without rebuilding or repeating native functional checks.
 
-The pipelines exercise each native Faktory image with a small explicit multipart `Design`, validating the manifest, primary and secondary worker artifacts, GLB framing, and absence of server-owned shaded files. They build `faktory-visual-renderer` only for AMD64 from the `visual-renderer-runtime` target. A native AMD64 task starts the packaged service under the production hardening policy. It renders a colored GLB and validates all seven PNG responses. Deployment receives the worker image by immutable digest.
+The preview pipeline exercises each native Faktory image with a small explicit multipart `Design`, validating the manifest, primary and secondary worker artifacts, GLB framing, and absence of server-owned shaded files. It builds `faktory-visual-renderer` only for AMD64 from the `visual-renderer-runtime` target. A native AMD64 task starts the packaged service under the production hardening policy. It renders a colored GLB and validates all seven PNG responses. Both pipelines deploy the server and worker by immutable digest.
 
 ## Releases
 
-A release requires a committed remote `main` branch and an annotated, signed `vX.Y.Z` tag. The tag must point to a commit in `origin/main`. The version must equal both `[workspace.package].version` in `Cargo.toml` and `version` in `web/package.json`.
+A release requires a committed remote `main` branch, a successful preview run for the exact release commit, and an annotated, signed `vX.Y.Z` tag trusted by `faktory-release-trusted-signers`. The tag must point to a commit in `origin/main`. The version must equal both `[workspace.package].version` in `Cargo.toml` and `version` in `web/package.json`.
 
-The release pipeline accepts only an exact stable semantic-version tag. It verifies the webhook SHA, tag signature, trusted signer, and `origin/main` ancestry. It publishes the Faktory AMD64 and ARM64 images. It promotes the immutable Faktory manifest digest to `vX.Y.Z`.
+The release pipeline accepts only an exact stable semantic-version tag. It verifies the webhook SHA, tag signature, trusted signer, and `origin/main` ancestry. After Gitleaks passes, it resolves `faktory:preview-<full-commit-SHA>` and `faktory-visual-renderer:preview-<full-commit-SHA>-amd64`. It validates both server platforms and the AMD64 worker's Linux config, user `65532:65532`, and OCI revision. There is no release build, native functional check, new manifest, or rebuild fallback.
 
-The same release gate publishes the AMD64-only `faktory-visual-renderer` image. It promotes that image's immutable digest to `vX.Y.Z`. Pulumi receives both digests for the `prod` stack. The pipeline does not publish a floating alias.
+Before the first copy, both stable `vX.Y.Z` aliases must be explicitly absent or already match their respective source digests. Lookup authorization and network failures fail closed. Digest-based copies preserve the existing preview bytes, and both aliases must verify equal before Pulumi receives the original digests for `prod` through `image` and `visualRendererImage`. The pipeline does not publish a floating alias. Follow [Deployment and Releases](docs/operations/deployment-releases.md) for evidence, retry, and rollback boundaries.
 
 ## Renderer Environments
 

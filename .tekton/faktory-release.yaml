@@ -7,35 +7,10 @@ metadata:
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
   taskRunSpecs:
-    - pipelineTaskName: verify-amd64
+    - pipelineTaskName: promote-release
       podTemplate:
         nodeSelector:
           kubernetes.io/arch: amd64
-    - pipelineTaskName: verify-arm64
-      podTemplate:
-        nodeSelector:
-          kubernetes.io/arch: arm64
-        tolerations:
-          - key: workload-type
-            operator: Equal
-            value: gpu-inference
-            effect: NoSchedule
-    - pipelineTaskName: verify-visual-renderer-amd64
-      podTemplate:
-        nodeSelector:
-          kubernetes.io/arch: amd64
-        securityContext:
-          runAsNonRoot: true
-          runAsUser: 65532
-          runAsGroup: 65532
-          fsGroup: 65532
-          seccompProfile:
-            type: Unconfined
-        volumes:
-          - name: tmp
-            emptyDir:
-              medium: Memory
-              sizeLimit: 256Mi
     - pipelineTaskName: deploy-production
       podTemplate:
         nodeSelector:
@@ -170,395 +145,107 @@ spec:
         workspaces:
           - { name: source, workspace: source }
 
-      - name: build-amd64
-        runAfter: [validate-release, scan-private-material]
-        retries: 1
-        taskSpec:
-          params:
-            - { name: image, type: string }
-            - { name: revision, type: string }
-            - { name: buildkit-addr, type: string }
-          workspaces:
-            - name: source
-          volumes:
-            - name: git-auth
-              secret:
-                secretName: "{{ git_auth_secret }}"
-          steps:
-            - name: build
-              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
-              workingDir: $(workspaces.source.path)
-              volumeMounts:
-                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
-              script: |
-                #!/bin/sh
-                set -eu
-                buildctl --addr "tcp://$(params.buildkit-addr)" build \
-                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
-                  --opt filename=Dockerfile --opt target=runtime --opt platform=linux/amd64 \
-                  --opt "build-arg:REVISION=$(params.revision)" \
-                  --secret id=gitconfig,src=/etc/git-auth/.gitconfig \
-                  --secret id=git-credentials,src=/etc/git-auth/.git-credentials \
-                  --output "type=image,name=$(params.image),push=true"
-        params:
-          - { name: image, value: "$(params.base-image):sha-$(params.revision)-amd64" }
-          - { name: revision, value: $(params.revision) }
-          - { name: buildkit-addr, value: "{{ BUILDKIT_AMD64_ADDR }}" }
-        workspaces:
-          - { name: source, workspace: source }
-
-      - name: build-arm64
-        runAfter: [validate-release, scan-private-material]
-        retries: 1
-        taskSpec:
-          params:
-            - { name: image, type: string }
-            - { name: revision, type: string }
-            - { name: buildkit-addr, type: string }
-          workspaces:
-            - name: source
-          volumes:
-            - name: git-auth
-              secret:
-                secretName: "{{ git_auth_secret }}"
-          steps:
-            - name: build
-              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
-              workingDir: $(workspaces.source.path)
-              volumeMounts:
-                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
-              script: |
-                #!/bin/sh
-                set -eu
-                buildctl --addr "tcp://$(params.buildkit-addr)" build \
-                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
-                  --opt filename=Dockerfile --opt target=runtime --opt platform=linux/arm64 \
-                  --opt "build-arg:REVISION=$(params.revision)" \
-                  --secret id=gitconfig,src=/etc/git-auth/.gitconfig \
-                  --secret id=git-credentials,src=/etc/git-auth/.git-credentials \
-                  --output "type=image,name=$(params.image),push=true"
-        params:
-          - { name: image, value: "$(params.base-image):sha-$(params.revision)-arm64" }
-          - { name: revision, value: $(params.revision) }
-          - { name: buildkit-addr, value: "{{ BUILDKIT_ARM64_ADDR }}" }
-        workspaces:
-          - { name: source, workspace: source }
-
-      - name: build-visual-renderer-amd64
-        runAfter: [validate-release, scan-private-material]
-        retries: 1
-        taskSpec:
-          params:
-            - { name: image, type: string }
-            - { name: revision, type: string }
-            - { name: buildkit-addr, type: string }
-          workspaces:
-            - name: source
-          volumes:
-            - name: git-auth
-              secret:
-                secretName: "{{ git_auth_secret }}"
-          steps:
-            - name: build
-              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
-              workingDir: $(workspaces.source.path)
-              volumeMounts:
-                - { name: git-auth, mountPath: /etc/git-auth, readOnly: true }
-              script: |
-                #!/bin/sh
-                set -eu
-                buildctl --addr "tcp://$(params.buildkit-addr)" build \
-                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
-                  --opt filename=Dockerfile --opt target=visual-renderer-runtime --opt platform=linux/amd64 \
-                  --opt "build-arg:REVISION=$(params.revision)" \
-                  --secret id=gitconfig,src=/etc/git-auth/.gitconfig \
-                  --secret id=git-credentials,src=/etc/git-auth/.git-credentials \
-                  --output "type=image,name=$(params.image),push=true"
-        params:
-          - { name: image, value: "$(params.visual-renderer-base-image):sha-$(params.revision)-amd64" }
-          - { name: revision, value: $(params.revision) }
-          - { name: buildkit-addr, value: "{{ BUILDKIT_AMD64_ADDR }}" }
-        workspaces:
-          - { name: source, workspace: source }
-
-      - name: verify-amd64
-        runAfter: [build-amd64]
-        taskSpec:
-          params:
-            - { name: image, type: string }
-          steps:
-            - name: render
-              image: $(params.image)
-              imagePullPolicy: Always
-              script: |
-                #!/bin/sh
-                set -eu
-                output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
-                trap 'rm -rf "$output_dir"' EXIT
-                project_root="$output_dir/project"
-                dependency_root="$output_dir/dependencies"
-                package_root="$dependency_root/faktory_models/m_pipeline_smoke"
-                mkdir -p "$project_root" "$package_root"
-                : > "$dependency_root/faktory_models/__init__.py"
-                : > "$package_root/__init__.py"
-                printf '%s\n' '{"format":"faktory-model-dependencies-v1","root_model_id":"pipeline-smoke","nodes":[{"model_id":"pipeline-smoke","package":"faktory_models.m_pipeline_smoke","project_revision":"0000000000000000000000000000000000000000000000000000000000000000","dependencies":[]}]}' > "$dependency_root/dependencies.json"
-                cat > "$project_root/main.py" <<'PY'
-                import cadquery as cq
-                from faktory_design.v1 import Design, Output
-
-                result = Design((
-                    Output("primary", "assembly", cq.Assembly(cq.Workplane("XY").box(2, 2, 2)), primary=True),
-                    Output("secondary", "part", cq.Workplane("XY").cylinder(1, 2)),
-                ))
-                PY
-                /opt/faktory/env/bin/python -m renderer \
-                  "$project_root" \
-                  main.py \
-                  "$dependency_root" \
-                  "$output_dir/bundle"
-                /opt/faktory/env/bin/python -c '
-                import json
-                import struct
-                import sys
-                from pathlib import Path
-
-                bundle = Path(sys.argv[1])
-                manifest = json.loads((bundle / "outputs.json").read_text())
-                expected = [("primary", "assembly", True), ("secondary", "part", False)]
-                actual = [(item["output_id"], item["role"], item["primary"]) for item in manifest["outputs"]]
-                if manifest["format"] != "faktory-outputs-v1" or actual != expected:
-                    raise SystemExit("invalid multipart output manifest")
-                for output_id, _, _ in expected:
-                    root = bundle / "outputs" / output_id
-                    required = [root / "model.glb", root / "preview.svg", root / "facts.json"]
-                    required.extend(root / "projections" / f"{name}.svg" for name in ("isometric", "front", "back", "left", "right", "top", "bottom"))
-                    if not all(path.is_file() for path in required):
-                        raise SystemExit("multipart worker artifacts are incomplete")
-                    content = (root / "model.glb").read_bytes()
-                    if len(content) < 12:
-                        raise SystemExit("GLB header is truncated")
-                    magic, version, declared_size = struct.unpack("<4sII", content[:12])
-                    if magic != b"glTF" or version != 2 or declared_size != len(content):
-                        raise SystemExit("invalid GLB framing")
-                if list(bundle.rglob("*.png")) or any(path.name == "renders" for path in bundle.rglob("*")):
-                    raise SystemExit("Python worker produced server-owned shaded artifacts")
-                ' "$output_dir/bundle"
-        params:
-          - { name: image, value: "$(params.base-image):sha-$(params.revision)-amd64" }
-
-      - name: verify-arm64
-        runAfter: [build-arm64]
-        taskSpec:
-          params:
-            - { name: image, type: string }
-          steps:
-            - name: render
-              image: $(params.image)
-              imagePullPolicy: Always
-              script: |
-                #!/bin/sh
-                set -eu
-                output_dir="$(mktemp -d /tmp/faktory-render-XXXXXX)"
-                trap 'rm -rf "$output_dir"' EXIT
-                project_root="$output_dir/project"
-                dependency_root="$output_dir/dependencies"
-                package_root="$dependency_root/faktory_models/m_pipeline_smoke"
-                mkdir -p "$project_root" "$package_root"
-                : > "$dependency_root/faktory_models/__init__.py"
-                : > "$package_root/__init__.py"
-                printf '%s\n' '{"format":"faktory-model-dependencies-v1","root_model_id":"pipeline-smoke","nodes":[{"model_id":"pipeline-smoke","package":"faktory_models.m_pipeline_smoke","project_revision":"0000000000000000000000000000000000000000000000000000000000000000","dependencies":[]}]}' > "$dependency_root/dependencies.json"
-                cat > "$project_root/main.py" <<'PY'
-                import cadquery as cq
-                from faktory_design.v1 import Design, Output
-
-                result = Design((
-                    Output("primary", "assembly", cq.Assembly(cq.Workplane("XY").box(2, 2, 2)), primary=True),
-                    Output("secondary", "part", cq.Workplane("XY").cylinder(1, 2)),
-                ))
-                PY
-                /opt/faktory/env/bin/python -m renderer \
-                  "$project_root" \
-                  main.py \
-                  "$dependency_root" \
-                  "$output_dir/bundle"
-                /opt/faktory/env/bin/python -c '
-                import json
-                import struct
-                import sys
-                from pathlib import Path
-
-                bundle = Path(sys.argv[1])
-                manifest = json.loads((bundle / "outputs.json").read_text())
-                expected = [("primary", "assembly", True), ("secondary", "part", False)]
-                actual = [(item["output_id"], item["role"], item["primary"]) for item in manifest["outputs"]]
-                if manifest["format"] != "faktory-outputs-v1" or actual != expected:
-                    raise SystemExit("invalid multipart output manifest")
-                for output_id, _, _ in expected:
-                    root = bundle / "outputs" / output_id
-                    required = [root / "model.glb", root / "preview.svg", root / "facts.json"]
-                    required.extend(root / "projections" / f"{name}.svg" for name in ("isometric", "front", "back", "left", "right", "top", "bottom"))
-                    if not all(path.is_file() for path in required):
-                        raise SystemExit("multipart worker artifacts are incomplete")
-                    content = (root / "model.glb").read_bytes()
-                    if len(content) < 12:
-                        raise SystemExit("GLB header is truncated")
-                    magic, version, declared_size = struct.unpack("<4sII", content[:12])
-                    if magic != b"glTF" or version != 2 or declared_size != len(content):
-                        raise SystemExit("invalid GLB framing")
-                if list(bundle.rglob("*.png")) or any(path.name == "renders" for path in bundle.rglob("*")):
-                    raise SystemExit("Python worker produced server-owned shaded artifacts")
-                ' "$output_dir/bundle"
-        params:
-          - { name: image, value: "$(params.base-image):sha-$(params.revision)-arm64" }
-
-      - name: verify-visual-renderer-amd64
-        runAfter: [build-visual-renderer-amd64]
-        taskSpec:
-          params:
-            - { name: image, type: string }
-          workspaces:
-            - name: source
-          steps:
-            - name: render-seven-images
-              image: $(params.image)
-              imagePullPolicy: Always
-              workingDir: /opt/visual-renderer
-              env:
-                - { name: HOME, value: /tmp }
-                - { name: TMPDIR, value: /tmp }
-              securityContext:
-                runAsNonRoot: true
-                runAsUser: 65532
-                runAsGroup: 65532
-                allowPrivilegeEscalation: false
-                readOnlyRootFilesystem: true
-                capabilities: { drop: ["ALL"] }
-                seccompProfile: { type: Unconfined }
-              computeResources:
-                requests: { cpu: 250m, memory: 512Mi }
-                limits: { cpu: "1", memory: 1Gi }
-              volumeMounts:
-                - { name: tmp, mountPath: /tmp }
-              script: |
-                #!/bin/sh
-                set -eu
-                node /opt/visual-renderer/dist/index.js &
-                server_pid=$!
-                trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
-                node "$(workspaces.source.path)/.tekton/verify-visual-renderer.mjs"
-        params:
-          - { name: image, value: "$(params.visual-renderer-base-image):sha-$(params.revision)-amd64" }
-        workspaces:
-          - { name: source, workspace: source }
-
-      - name: publish-manifest
-        runAfter: [verify-amd64, verify-arm64]
-        retries: 1
-        taskSpec:
-          params:
-            - { name: base-image, type: string }
-            - { name: revision, type: string }
-          steps:
-            - name: publish-and-verify
-              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
-              script: |
-                #!/busybox/sh
-                set -eu
-                base="$(params.base-image):sha-$(params.revision)"
-                for arch in amd64 arm64; do
-                  image="${base}-${arch}"
-                  digest="$(crane digest "$image")"
-                  printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
-                  config="$(crane config "$(params.base-image)@$digest")"
-                  printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
-                  printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
-                done
-                crane index append \
-                  --manifest "${base}-amd64" \
-                  --manifest "${base}-arm64" \
-                  --tag "$base"
-                manifest="$(crane manifest "$base")"
-                printf '%s' "$manifest" | grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"amd64"'
-                printf '%s' "$manifest" | grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"arm64"'
-                digest="$(crane digest "$base")"
-                printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
-        params:
-          - { name: base-image, value: $(params.base-image) }
-          - { name: revision, value: $(params.revision) }
-
       - name: promote-release
-        runAfter: [publish-manifest]
+        runAfter: [validate-release, scan-private-material]
         retries: 1
         taskSpec:
           params:
             - { name: base-image, type: string }
-            - { name: source-tag, type: string }
+            - { name: visual-renderer-base-image, type: string }
+            - { name: revision, type: string }
             - { name: release-tag, type: string }
           results:
             - { name: image, type: string }
+            - { name: visual-renderer-image, type: string }
+          volumes:
+            - name: crane-tool
+              emptyDir: {}
           steps:
-            - name: promote-and-verify
+            - name: stage-crane
               image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
+              volumeMounts:
+                - { name: crane-tool, mountPath: /tools }
               script: |
                 #!/busybox/sh
                 set -eu
-                source="$(params.base-image):$(params.source-tag)"
-                digest="$(crane digest "$source")"
-                printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
-                immutable="$(params.base-image)@$digest"
-                release="$(params.base-image):$(params.release-tag)"
-                if existing="$(crane digest "$release" 2>/dev/null)"; then
-                  test "$existing" = "$digest"
-                else
-                  crane copy "$immutable" "$release"
-                fi
-                test "$(crane digest "$release")" = "$digest"
-                printf '%s' "$immutable" > "$(results.image.path)"
+                cp /ko-app/crane /tools/crane
+            - name: verify-and-promote
+              image: cr.holdenitdown.net/rfhold/general-ci@sha256:6943f91d774980357b24730a14ac4b026325d50962df4b2e15e24c3f43190e5b
+              volumeMounts:
+                - { name: crane-tool, mountPath: /tools, readOnly: true }
+              script: |
+                #!/bin/sh
+                set -eu
+                export PATH="/tools:$PATH"
+                crane version
+                app="$(params.base-image)"
+                worker="$(params.visual-renderer-base-image)"
+                app_digest="$(crane digest "$app:preview-$(params.revision)")"
+                worker_digest="$(crane digest "$worker:preview-$(params.revision)-amd64")"
+                for digest in "$app_digest" "$worker_digest"; do
+                  printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+                done
+                app_image="$app@$app_digest"
+                worker_image="$worker@$worker_digest"
+                manifest="$(crane manifest "$app_image")"
+                for arch in amd64 arm64; do
+                  printf '%s' "$manifest" | jq -e -s --arg arch "$arch" '
+                    length == 1 and (.[0] |
+                      (.manifests | type == "array") and
+                      any(.manifests[]; .platform.os == "linux" and .platform.architecture == $arch))
+                  ' > /dev/null
+                  config="$(crane config --platform "linux/$arch" "$app_image")"
+                  printf '%s' "$config" | jq -e -s --arg arch "$arch" --arg revision "$(params.revision)" '
+                    length == 1 and (.[0] |
+                      .os == "linux" and .architecture == $arch and
+                      .config.User == "65532:65532" and
+                      .config.Labels["org.opencontainers.image.revision"] == $revision)
+                  ' > /dev/null
+                done
+                config="$(crane config --platform linux/amd64 "$worker_image")"
+                printf '%s' "$config" | jq -e -s --arg revision "$(params.revision)" '
+                  length == 1 and (.[0] |
+                    .os == "linux" and .architecture == "amd64" and
+                    .config.User == "65532:65532" and
+                    .config.Labels["org.opencontainers.image.revision"] == $revision)
+                ' > /dev/null
+
+                check_release() {
+                  if existing="$(crane digest "$1" 2>&1)"; then
+                    test "$existing" = "$2"
+                    release_missing=false
+                  else
+                    case "$existing" in
+                      *MANIFEST_UNKNOWN*|*NAME_UNKNOWN*) release_missing=true ;;
+                      *) printf '%s\n' "$existing" >&2; return 1 ;;
+                    esac
+                  fi
+                }
+                app_release="$app:$(params.release-tag)"
+                worker_release="$worker:$(params.release-tag)"
+                check_release "$app_release" "$app_digest"
+                check_release "$worker_release" "$worker_digest"
+                promote() {
+                  check_release "$2" "$3"
+                  if [ "$release_missing" = true ]; then
+                    crane copy "$1" "$2"
+                  fi
+                  test "$(crane digest "$2")" = "$3"
+                }
+                promote "$app_image" "$app_release" "$app_digest"
+                promote "$worker_image" "$worker_release" "$worker_digest"
+                test "$(crane digest "$app_release")" = "$app_digest"
+                test "$(crane digest "$worker_release")" = "$worker_digest"
+                printf '%s' "$app_image" > "$(results.image.path)"
+                printf '%s' "$worker_image" > "$(results.visual-renderer-image.path)"
         params:
           - { name: base-image, value: $(params.base-image) }
-          - { name: source-tag, value: sha-$(params.revision) }
-          - { name: release-tag, value: $(tasks.validate-release.results.tag) }
-
-      - name: promote-visual-renderer-release
-        runAfter: [verify-visual-renderer-amd64]
-        retries: 1
-        taskSpec:
-          params:
-            - { name: base-image, type: string }
-            - { name: source-tag, type: string }
-            - { name: release-tag, type: string }
-            - { name: revision, type: string }
-          results:
-            - { name: image, type: string }
-          steps:
-            - name: promote-and-verify
-              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
-              script: |
-                #!/busybox/sh
-                set -eu
-                source="$(params.base-image):$(params.source-tag)"
-                digest="$(crane digest "$source")"
-                printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
-                immutable="$(params.base-image)@$digest"
-                config="$(crane config "$immutable")"
-                printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
-                printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
-                release="$(params.base-image):$(params.release-tag)"
-                if existing="$(crane digest "$release" 2>/dev/null)"; then
-                  test "$existing" = "$digest"
-                else
-                  crane copy "$immutable" "$release"
-                fi
-                test "$(crane digest "$release")" = "$digest"
-                printf '%s' "$immutable" > "$(results.image.path)"
-        params:
-          - { name: base-image, value: $(params.visual-renderer-base-image) }
-          - { name: source-tag, value: sha-$(params.revision)-amd64 }
-          - { name: release-tag, value: $(tasks.validate-release.results.tag) }
+          - { name: visual-renderer-base-image, value: $(params.visual-renderer-base-image) }
           - { name: revision, value: $(params.revision) }
+          - { name: release-tag, value: $(tasks.validate-release.results.tag) }
 
       - name: deploy-production
-        runAfter: [promote-release, promote-visual-renderer-release]
+        runAfter: [promote-release]
         retries: 1
         taskSpec:
           params:
@@ -592,7 +279,7 @@ spec:
                 pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)"
         params:
           - { name: image, value: $(tasks.promote-release.results.image) }
-          - { name: visual-renderer-image, value: $(tasks.promote-visual-renderer-release.results.image) }
+          - { name: visual-renderer-image, value: $(tasks.promote-release.results.visual-renderer-image) }
         workspaces:
           - { name: source, workspace: source }
   workspaces:
