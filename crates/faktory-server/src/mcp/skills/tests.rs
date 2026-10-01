@@ -183,7 +183,7 @@ async fn http_catalog_is_complete_and_every_raw_file_matches_manifest() {
 }
 
 #[tokio::test]
-async fn http_tools_preserve_exact_nineteen_names_and_schema_snapshot() {
+async fn http_tools_preserve_uniform_names_and_schema_snapshot() {
     let router = server().router();
     let response = rpc(&router, "tools/list", json!({})).await;
     let tools = response["result"]["tools"].as_array().unwrap();
@@ -192,30 +192,7 @@ async fn http_tools_preserve_exact_nineteen_names_and_schema_snapshot() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "model.apply_patch",
-            "model.create",
-            "model.edit",
-            "model.get",
-            "model.glob",
-            "model.grep",
-            "model.inspect",
-            "model.list",
-            "model.open",
-            "model.read",
-            "model.release.get",
-            "model.release.list",
-            "model.release.publish",
-            "model.render.retry",
-            "view.delete",
-            "view.inspect",
-            "view.list",
-            "view.put",
-            "view.set-default"
-        ]
-    );
+    assert_eq!(names, ["create", "destroy", "edit", "execute", "query"]);
     let mut schemas = tools
         .iter()
         .map(|tool| json!({"name":tool["name"],"inputSchema":tool["inputSchema"]}))
@@ -225,7 +202,7 @@ async fn http_tools_preserve_exact_nineteen_names_and_schema_snapshot() {
         crate::model::project::hex_digest(Sha256::digest(serde_json::to_vec(&schemas).unwrap()));
     assert_eq!(
         digest,
-        "2a69615de9c6e518e83a7ae4202acbdece913da44692d5293edfdbb787af33e9"
+        "fc5f93c3e913ca54a736c578f426ceea595b4295c8eb948347852be380f551d5"
     );
 }
 
@@ -260,17 +237,21 @@ async fn skill_http_preserves_bearer_scope_and_origin_gates() {
             .without_root_protected_resource_metadata()
             .with_authorization(auth),
     );
-    for method in ["skills/list", "skills/get", "resources/read"] {
+    for (method, uri) in [
+        ("skills/list", "skill://edit-model-projects/SKILL.md"),
+        ("skills/get", "skill://edit-model-projects/SKILL.md"),
+        ("resources/read", "skill://edit-model-projects/SKILL.md"),
+        ("resources/read", "faktory://models"),
+        ("resources/list", "faktory://models"),
+        ("resources/templates/list", "faktory://models"),
+    ] {
         for (token, status) in [
             (None, StatusCode::UNAUTHORIZED),
             (Some("bad"), StatusCode::UNAUTHORIZED),
             (Some("wrong-scope"), StatusCode::FORBIDDEN),
             (Some("valid"), StatusCode::OK),
         ] {
-            let mut req = request(
-                method,
-                json!({"uri":"skill://edit-model-projects/SKILL.md"}),
-            );
+            let mut req = request(method, json!({"uri":uri}));
             if let Some(token) = token {
                 req.headers_mut()
                     .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -278,10 +259,7 @@ async fn skill_http_preserves_bearer_scope_and_origin_gates() {
             let response = router.clone().oneshot(req).await.unwrap();
             assert_eq!(response.status(), status, "{method}: {token:?}");
         }
-        let mut req = request(
-            method,
-            json!({"uri":"skill://edit-model-projects/SKILL.md"}),
-        );
+        let mut req = request(method, json!({"uri":uri}));
         req.headers_mut()
             .insert("authorization", "Bearer valid".parse().unwrap());
         req.headers_mut()

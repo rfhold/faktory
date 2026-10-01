@@ -47,7 +47,7 @@ The production stack sets `protectData=true`, which applies Pulumi protection to
 
 [`model-projects-dependencies.md`](model-projects-dependencies.md) is authoritative for canonical files, managed `AGENTS.md`, model releases, exact dependency closure, and MCP file operations. Creation succeeds only when the model ID is absent; a current model conflicts. After Faktory materializes the root and exact dependency packages, it executes only the root entrypoint. Its top-level `result` must satisfy [`design-bundles.md`](design-bundles.md). Imports and other top-level Python statements remain allowed under the trusted-source MVP assumption. CQGI parameters are excluded.
 
-A name-only edit updates metadata without a project revision, render work, or render-state change. MCP project and model-release tools are the only source-bearing interfaces. MCP `model.list`, inspect results, protobuf responses, and browser responses remain source-free metadata or artifacts; the browser has no project route or editor.
+A name-only execution updates metadata without a project revision, render work, or render-state change. MCP project/file resources, bounded search results, and mutation inputs are the only source-bearing interfaces. MCP model metadata and image resources, protobuf responses, and browser responses remain source-free metadata or artifacts; the browser has no project route or editor.
 
 ## Replacement Rendering
 
@@ -91,7 +91,7 @@ The SPA uses the same recipe and defaults to Soft lights. Its optional Studio he
 
 ## Named-View Render Cache
 
-`view.inspect` first requires a current successful revision and an exact current named view. A cache miss loads that revision's primary GLB and requests one bounded worker render. The server deduplicates concurrent work by revision, primary output ID, view ID, and view etag. Named views never select a non-primary output. The server never executes source or launches Chromium in the application process.
+`query` action `view.render` first requires a current successful revision and an exact current named view. A cache miss loads that revision's primary GLB and requests one bounded worker render. The server deduplicates concurrent work by revision, primary output ID, view ID, and view etag. Named views never select a non-primary output. The server never executes source or launches Chromium in the application process.
 
 Before an immutable cache write, the repository rechecks the current successful revision and view etag under its mutation lock. It repeats the identity check before return. A changed revision or etag produces a conflict and prevents mismatched output. Obsolete immutable cache objects can remain unreachable; no request can select them through a current identity.
 

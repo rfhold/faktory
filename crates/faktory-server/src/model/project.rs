@@ -99,6 +99,10 @@ pub struct ProjectEdit {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum ProjectOperation {
+    #[serde(skip)]
+    FileTextSet { path: String, content: String },
+    #[serde(skip)]
+    HintsTextSet { content: String },
     #[serde(rename = "file.add")]
     FileAdd { path: String, content: String },
     #[serde(rename = "file.patch")]
@@ -176,6 +180,7 @@ impl ProjectBundle {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&self, edit: &ProjectEdit) -> Result<Self, RepositoryError> {
         let operations = edit.ordered_operations()?;
         let mut files = self.caller_files();
@@ -186,6 +191,15 @@ impl ProjectBundle {
 
         for operation in operations {
             match operation {
+                ProjectOperation::FileTextSet { path, content } => {
+                    let path = normalize_user_path(&path)?;
+                    let file = files
+                        .iter_mut()
+                        .find(|file| file.path == path)
+                        .ok_or(RepositoryError::Invalid)?;
+                    file.content = normalize_text(&content);
+                }
+                ProjectOperation::HintsTextSet { content } => hints = content,
                 ProjectOperation::FileAdd { path, content } => {
                     let path = normalize_user_path(&path)?;
                     if files.iter().any(|file| file.path == path) {
@@ -249,11 +263,20 @@ impl ProjectBundle {
         } else {
             &edit.dependency_guidance
         };
-        let next = Self::new(files, entrypoint, requirements, locks, guidance, &hints)?;
-        if &next == self {
+        let canonical_files = normalize_caller_files(files.clone())?;
+        let canonical_hints = normalize_hints(&hints)?;
+        requirements.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+        locks.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+        // Managed guidance can differ across versions without any caller-owned change.
+        if canonical_files == self.caller_files()
+            && canonical_hints == self.hints()?
+            && entrypoint == self.entrypoint
+            && requirements == self.requirements
+            && locks == self.locks
+        {
             return Err(RepositoryError::Invalid);
         }
-        Ok(next)
+        Self::new(files, entrypoint, requirements, locks, guidance, &hints)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RepositoryError> {
@@ -428,6 +451,7 @@ fn normalize_dependencies(
         &locks,
         dependency_guidance,
         &hints,
+        GuidanceVersion::Resources,
     )?;
     caller_files.push(ProjectFile {
         path: AGENTS_PATH.to_owned(),
@@ -568,12 +592,20 @@ fn normalize_hints(value: &str) -> Result<String, RepositoryError> {
     Ok(normalized)
 }
 
+#[derive(Clone, Copy)]
+enum GuidanceVersion {
+    LegacyTools,
+    Resources,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_agents(
     files: &[ProjectFile],
     entrypoint: &str,
     locks: &[ModelLock],
     guidance: &[DependencyGuidance],
     hints: &str,
+    version: GuidanceVersion,
 ) -> Result<String, RepositoryError> {
     if locks.len() != guidance.len() {
         return Err(RepositoryError::Invalid);
@@ -603,7 +635,14 @@ fn render_agents(
                         && item.release_sha256 == lock.release_sha256
                 })
                 .ok_or(RepositoryError::Invalid)?;
-            writeln!(output, "## {} {}\n\nModel: {}\nProject revision: {}\nRelease: {}\n\nInspect exact files with MCP model.release.get(model_id={}, version={}).\nRead one exact file with MCP model.read(model_id={}, revision={}, path=<path>).\n", package_namespace(&lock.model_id), lock.version, json_quote(&lock.model_id)?, lock.project_revision, lock.release_sha256, json_quote(&lock.model_id)?, json_quote(&lock.version.to_string())?, json_quote(&lock.model_id)?, json_quote(&lock.project_revision)?).map_err(|_| RepositoryError::Corrupt)?;
+            match version {
+                GuidanceVersion::LegacyTools => {
+                    writeln!(output, "## {} {}\n\nModel: {}\nProject revision: {}\nRelease: {}\n\nInspect exact files with MCP model.release.get(model_id={}, version={}).\nRead one exact file with MCP model.read(model_id={}, revision={}, path=<path>).\n", package_namespace(&lock.model_id), lock.version, json_quote(&lock.model_id)?, lock.project_revision, lock.release_sha256, json_quote(&lock.model_id)?, json_quote(&lock.version.to_string())?, json_quote(&lock.model_id)?, json_quote(&lock.project_revision)?).map_err(|_| RepositoryError::Corrupt)?;
+                }
+                GuidanceVersion::Resources => {
+                    writeln!(output, "## {} {}\n\nModel: {}\nProject revision: {}\nRelease: {}\n\nInspect exact files with MCP resources/read URI faktory://models/{}/releases/{}.\nRead one exact file with MCP resources/read URI faktory://models/{}/revisions/{}/files/<percent-encoded-path>.\n", package_namespace(&lock.model_id), lock.version, json_quote(&lock.model_id)?, lock.project_revision, lock.release_sha256, lock.model_id, lock.version, lock.model_id, lock.project_revision).map_err(|_| RepositoryError::Corrupt)?;
+                }
+            }
         }
         output.pop();
     }
@@ -803,7 +842,7 @@ impl Repository {
         }
         let hints = project.hints()?.to_owned();
         let guidance = self.dependency_guidance(&project.locks).await?;
-        let canonical = ProjectBundle::new(
+        let mut canonical = ProjectBundle::new(
             project.caller_files(),
             project.entrypoint.clone(),
             project.requirements.clone(),
@@ -811,6 +850,26 @@ impl Repository {
             &guidance,
             &hints,
         )?;
+        if &canonical == project {
+            return Ok(());
+        }
+        // Immutable v2 bundles predate resource instructions. Accept only that exact generator,
+        // after all current path, content, requirement, and authenticated lock checks succeed.
+        let normalized_hints = canonical.hints()?.to_owned();
+        let legacy_agents = render_agents(
+            &canonical.caller_files(),
+            &canonical.entrypoint,
+            &canonical.locks,
+            &guidance,
+            &normalized_hints,
+            GuidanceVersion::LegacyTools,
+        )?;
+        canonical
+            .files
+            .iter_mut()
+            .find(|file| file.path == AGENTS_PATH)
+            .ok_or(RepositoryError::Invalid)?
+            .content = legacy_agents;
         if &canonical != project {
             return Err(RepositoryError::Invalid);
         }
@@ -1177,6 +1236,70 @@ mod tests {
             }),
             Err(RepositoryError::Invalid)
         );
+    }
+
+    #[test]
+    fn canonical_noops_ignore_managed_guidance_version() {
+        let historical: ProjectBundle =
+            serde_json::from_slice(include_bytes!("../mcp/legacy-locked-project.json")).unwrap();
+        let guidance = historical
+            .locks
+            .iter()
+            .map(|lock| DependencyGuidance {
+                model_id: lock.model_id.clone(),
+                version: lock.version.clone(),
+                project_revision: lock.project_revision.clone(),
+                release_sha256: lock.release_sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        let current = ProjectBundle::new(
+            historical.caller_files(),
+            historical.entrypoint.clone(),
+            historical.requirements.clone(),
+            historical.locks.clone(),
+            &guidance,
+            historical.hints().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(historical, current);
+        for project in [historical, current] {
+            for operations in [
+                vec![ProjectOperation::HintsTextSet {
+                    content: "Legacy hints\n".to_owned(),
+                }],
+                vec![ProjectOperation::FileTextSet {
+                    path: "main.py".to_owned(),
+                    content: "\u{feff}result = 1".to_owned(),
+                }],
+                vec![ProjectOperation::EntrypointSet {
+                    path: "main.py".to_owned(),
+                }],
+                vec![ProjectOperation::DependenciesSet {
+                    requirements: project.requirements.clone(),
+                }],
+                vec![
+                    ProjectOperation::FileAdd {
+                        path: "temporary.py".to_owned(),
+                        content: "x".to_owned(),
+                    },
+                    ProjectOperation::FileDelete {
+                        path: "temporary.py".to_owned(),
+                    },
+                ],
+            ] {
+                let mut edit = ProjectEdit::new(operations).unwrap();
+                edit.dependency_guidance = guidance.clone();
+                assert_eq!(project.apply(&edit), Err(RepositoryError::Invalid));
+            }
+            let mut edit = ProjectEdit::new(vec![ProjectOperation::HintsTextSet {
+                content: "Changed hints".to_owned(),
+            }])
+            .unwrap();
+            edit.dependency_guidance = guidance.clone();
+            let next = project.apply(&edit).unwrap();
+            assert_eq!(next.hints().unwrap(), "Changed hints");
+            assert!(next.agents_md().unwrap().contains("MCP resources/read URI"));
+        }
     }
 
     #[test]

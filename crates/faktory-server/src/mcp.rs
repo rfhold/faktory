@@ -1,6 +1,7 @@
 //! MCP tools over the same repository and render queue.
 
 mod skills;
+mod uniform;
 mod workspace;
 
 use std::sync::Arc;
@@ -56,7 +57,7 @@ impl FaktoryMcp {
     }
 
     pub fn router(self) -> axum::Router {
-        self.streamable_http_router()
+        streamable_http_router_with_options(Arc::new(self), StreamableHttpOptions::default())
     }
 
     pub fn hosted_router(
@@ -81,270 +82,7 @@ impl FaktoryMcp {
     }
 }
 
-#[mcp::mcp_server(
-    name = "faktory",
-    version = "0.1.0",
-    description = "Faktory model and shared-view tools.",
-    skills = self.catalog,
-    auth(
-        scopes = ["faktory:use"],
-        required_scopes = ["faktory:use"],
-        realm = "faktory",
-        resource_name = "Faktory MCP"
-    )
-)]
-impl FaktoryMcp {
-    #[tool(name = "model.list", definition = model_list_definition())]
-    async fn model_list(&self, _: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        match self.repository.list_models().await {
-            Ok(models) => Ok(result(json!({ "models": models }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.get", definition = model_get_definition())]
-    async fn model_get(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: ModelIdInput = parse(call)?;
-        match get_model_with_project(&self.repository, &input.model_id).await {
-            Ok((model, project)) => Ok(result(json!({ "model": model, "project": project }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.open", definition = model_open_definition())]
-    async fn model_open(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: ModelIdInput = parse(call)?;
-        match workspace::model_open(&self.repository, &input.model_id).await {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.read", definition = model_read_definition())]
-    async fn model_read(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: ModelReadInput = parse(call)?;
-        match workspace::model_read(&self.repository, &input).await {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.glob", definition = model_glob_definition())]
-    async fn model_glob(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: ModelGlobInput = parse(call)?;
-        match workspace::model_glob(
-            &self.repository,
-            &input.model_id,
-            &input.pattern,
-            input.revision.as_deref(),
-        )
-        .await
-        {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.grep", definition = model_grep_definition())]
-    async fn model_grep(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: ModelGrepInput = parse(call)?;
-        match workspace::model_grep(&self.repository, &input).await {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.inspect", definition = model_inspect_definition())]
-    async fn model_inspect(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: InspectInput = parse(call)?;
-        match inspect_model(
-            &self.repository,
-            &input.model_id,
-            input.output_id.as_deref(),
-            input.projection,
-            input.render_style,
-        )
-        .await
-        {
-            Ok(result) => Ok(result),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "view.inspect", definition = view_inspect_definition())]
-    async fn view_inspect(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ViewIdInput = parse(call)?;
-        match inspect_view(
-            &self.repository,
-            &self.visual,
-            &input.model_id,
-            &input.view_id,
-        )
-        .await
-        {
-            Ok(result) => Ok(result),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.create", definition = model_create_definition())]
-    async fn model_create(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: CreateInput = parse(call)?;
-        match create_and_schedule(self.repository.clone(), self.renders.clone(), input).await {
-            Ok(model) => Ok(result(json!({ "model": model }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.edit", definition = model_edit_definition())]
-    async fn model_edit(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: EditInput = parse(call)?;
-        match edit_and_schedule(self.repository.clone(), self.renders.clone(), input).await {
-            Ok(model) => Ok(result(json!({ "model": model }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.apply_patch", definition = model_apply_patch_definition())]
-    async fn model_apply_patch(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ApplyPatchInput = parse(call)?;
-        match apply_patch_and_schedule(self.repository.clone(), self.renders.clone(), input).await {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.release.list", definition = model_release_list_definition())]
-    async fn model_release_list(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ModelIdInput = parse(call)?;
-        match self.repository.list_model_releases(&input.model_id).await {
-            Ok(releases) => Ok(result(
-                json!({ "model_id": input.model_id, "package": package_namespace(&input.model_id), "releases": releases.iter().map(model_release_value).collect::<Vec<_>>() }),
-            )),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.release.get", definition = model_release_get_definition())]
-    async fn model_release_get(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ModelReleaseGetInput = parse(call)?;
-        match model_release_get_value(&self.repository, &input).await {
-            Ok(value) => Ok(result(value)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.release.publish", definition = model_release_publish_definition())]
-    async fn model_release_publish(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ModelReleasePublishInput = parse(call)?;
-        match publish_and_rollout(self.repository.clone(), self.renders.clone(), input).await {
-            Ok(output) => Ok(result(output)),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "model.render.retry", definition = model_retry_definition())]
-    async fn model_retry(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ModelIdInput = parse(call)?;
-        match retry_and_schedule(self.repository.clone(), self.renders.clone(), input).await {
-            Ok(model) => Ok(result(json!({ "model": model }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "view.list", definition = view_list_definition())]
-    async fn view_list(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: ModelIdInput = parse(call)?;
-        match self.repository.list_views(&input.model_id).await {
-            Ok(views) => Ok(result(json!({ "views": views }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "view.put", definition = view_put_definition())]
-    async fn view_put(&self, call: McpToolCall, _: ServerContext) -> ServerResult<McpToolResult> {
-        let input: PutViewInput = parse(call)?;
-        match self
-            .repository
-            .put_view(
-                &input.model_id,
-                input.view.into_proto(),
-                input.expected_etag.as_deref(),
-            )
-            .await
-        {
-            Ok(view) => Ok(result(json!({ "view": view }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "view.delete", definition = view_delete_definition())]
-    async fn view_delete(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: DeleteViewInput = parse(call)?;
-        match self
-            .repository
-            .delete_view(&input.model_id, &input.view_id, &input.expected_etag)
-            .await
-        {
-            Ok(()) => Ok(result(json!({ "deleted": true }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-
-    #[tool(name = "view.set-default", definition = view_default_definition())]
-    async fn view_default(
-        &self,
-        call: McpToolCall,
-        _: ServerContext,
-    ) -> ServerResult<McpToolResult> {
-        let input: ViewIdInput = parse(call)?;
-        match self
-            .repository
-            .set_default_view(&input.model_id, &input.view_id)
-            .await
-        {
-            Ok(model) => Ok(result(json!({ "model": model }))),
-            Err(error) => Ok(tool_error(error)),
-        }
-    }
-}
-
+#[cfg(test)]
 async fn get_model_with_project(
     repository: &Repository,
     model_id: &str,
@@ -605,6 +343,7 @@ async fn edit_and_schedule(
     join_scheduled(&repository, task).await
 }
 
+#[cfg(test)]
 async fn apply_patch_and_schedule(
     repository: Repository,
     renders: RenderQueue,
@@ -774,6 +513,7 @@ struct ModelIdInput {
     model_id: String,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelReadInput {
@@ -805,22 +545,13 @@ struct ModelGrepInput {
     limit: usize,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApplyPatchInput {
     model_id: String,
     expected_revision: String,
     patch: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InspectInput {
-    model_id: String,
-    output_id: Option<String>,
-    projection: TechnicalProjection,
-    #[serde(default)]
-    render_style: RenderStyle,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -860,10 +591,12 @@ struct ModelReleaseGetInput {
     version: Version,
 }
 
+#[cfg(test)]
 const fn default_line_offset() -> usize {
     1
 }
 
+#[cfg(test)]
 const fn default_read_limit() -> usize {
     workspace::DEFAULT_READ_LIMIT
 }
@@ -991,49 +724,6 @@ fn definition(name: &str, description: &str, read_only: bool, schema: Value) -> 
     }
 }
 
-fn model_list_definition() -> McpToolDefinition {
-    definition(
-        "model.list",
-        "List model metadata.",
-        true,
-        json!({ "type": "object", "additionalProperties": false }),
-    )
-}
-fn model_get_definition() -> McpToolDefinition {
-    definition(
-        "model.get",
-        "Get model metadata and the complete canonical desired-revision project, including every file (including generated AGENTS.md), the entrypoint, direct dependency requirements, and exact server-controlled locks. This is the hard-cutover multi-file contract; no legacy source field is returned.",
-        true,
-        model_id_schema(),
-    )
-}
-fn model_open_definition() -> McpToolDefinition {
-    definition(
-        "model.open",
-        "Open the desired model project with model metadata, revision identity, entrypoint, requirements, locks, a content-hash file index, and the full generated AGENTS.md. Other file bodies are omitted.",
-        true,
-        model_id_schema(),
-    )
-}
-fn model_read_definition() -> McpToolDefinition {
-    definition(
-        "model.read",
-        "Read a bounded line range from one file in the desired or an exact immutable model revision. The response identifies the actual revision used.",
-        true,
-        json!({
-            "type": "object",
-            "properties": {
-                "model_id": model_id_property(),
-                "path": project_read_path_schema(),
-                "revision": revision_schema("Optional exact immutable revision; defaults to the current desired revision."),
-                "offset": line_offset_schema(),
-                "limit": read_limit_schema()
-            },
-            "required": ["model_id", "path"],
-            "additionalProperties": false
-        }),
-    )
-}
 fn model_glob_definition() -> McpToolDefinition {
     definition(
         "model.glob",
@@ -1083,55 +773,7 @@ fn model_grep_definition() -> McpToolDefinition {
         }),
     )
 }
-fn model_inspect_definition() -> McpToolDefinition {
-    definition(
-        "model.inspect",
-        "Return one bounded technical or shaded projection from the current successful render.",
-        true,
-        json!({
-            "type": "object",
-            "properties": {
-                "model_id": model_id_property(),
-                "output_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 64,
-                    "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
-                    "description": "Optional output ID; defaults to the primary output. Shaded inspection is primary-only."
-                },
-                "projection": {
-                    "type": "string",
-                    "enum": ["isometric", "front", "back", "left", "right", "top", "bottom"],
-                    "description": "Canonical technical projection."
-                },
-                "render_style": {
-                    "type": "string",
-                    "enum": ["technical", "shaded"],
-                    "default": "technical",
-                    "description": "Projection rendering style."
-                }
-            },
-            "required": ["model_id", "projection"],
-            "additionalProperties": false
-        }),
-    )
-}
-fn view_inspect_definition() -> McpToolDefinition {
-    definition(
-        "view.inspect",
-        "Render one exact saved named view from the current successful model revision.",
-        true,
-        json!({
-            "type": "object",
-            "properties": {
-                "model_id": model_id_property(),
-                "view_id": {"type": "string", "minLength": 1, "maxLength": 64}
-            },
-            "required": ["model_id", "view_id"],
-            "additionalProperties": false
-        }),
-    )
-}
+
 fn model_retry_definition() -> McpToolDefinition {
     definition(
         "model.render.retry",
@@ -1140,14 +782,7 @@ fn model_retry_definition() -> McpToolDefinition {
         model_id_schema(),
     )
 }
-fn view_list_definition() -> McpToolDefinition {
-    definition(
-        "view.list",
-        "List shared named views.",
-        true,
-        model_id_schema(),
-    )
-}
+
 fn model_create_definition() -> McpToolDefinition {
     definition(
         "model.create",
@@ -1193,90 +828,6 @@ fn model_create_definition() -> McpToolDefinition {
         }),
     )
 }
-fn model_edit_definition() -> McpToolDefinition {
-    definition(
-        "model.edit",
-        "Conditionally edit model metadata and/or one caller-ordered canonical project transaction. This hard cutover accepts no source, dependencies, or grouped project shape. Operations execute exactly in array order and may add, patch, delete, or rename caller files, set the entrypoint, replace direct requirements, or exactly patch only the AGENTS.md Hints body. Generated Index and Dependency Guidance and exact locks are protected and server-controlled.",
-        false,
-        json!({
-            "type": "object",
-            "properties": {
-                "model_id": model_id_property(),
-                "expected_revision": {
-                    "type": "string",
-                    "pattern": "^[0-9a-f]{64}$",
-                    "description": "Exact desired project revision to edit."
-                },
-                "name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Display name, limited to 200 UTF-8 bytes."
-                },
-                "operations": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 256,
-                    "description": "Caller-ordered project operations executed exactly from first to last.",
-                    "items": project_operation_schema()
-                }
-            },
-            "required": ["model_id", "expected_revision"],
-            "anyOf": [
-                {"required": ["name"]},
-                {"required": ["operations"]}
-            ],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn model_apply_patch_definition() -> McpToolDefinition {
-    definition(
-        "model.apply_patch",
-        "Conditionally and atomically apply one stripped file patch envelope to caller-owned project files. The complete envelope is parsed first; every hunk must match exactly once in one project transaction, and exactly one render is scheduled on success.",
-        false,
-        json!({
-            "type": "object",
-            "properties": {
-                "model_id": model_id_property(),
-                "expected_revision": revision_schema("Exact desired project revision guarding the whole transaction."),
-                "patch": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "UTF-8 stripped patch envelope, limited to 1,048,576 bytes, with Begin/End Patch and ordered Add, Update, optional Move, and Delete sections. AGENTS.md is protected."
-                }
-            },
-            "required": ["model_id", "expected_revision", "patch"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn model_release_list_definition() -> McpToolDefinition {
-    definition(
-        "model.release.list",
-        "List immutable releases for one model.",
-        true,
-        json!({"type":"object","properties":{"model_id":model_id_property()},"required":["model_id"],"additionalProperties":false}),
-    )
-}
-
-fn model_release_get_definition() -> McpToolDefinition {
-    definition(
-        "model.release.get",
-        "Get immutable model-release metadata, namespace, closure identities, and file hashes without source bodies.",
-        true,
-        json!({
-            "type": "object",
-            "properties": {
-                "model_id": model_id_property(),
-                "version": stable_version_schema()
-            },
-            "required": ["model_id", "version"],
-            "additionalProperties": false
-        }),
-    )
-}
 
 fn model_release_publish_definition() -> McpToolDefinition {
     definition(
@@ -1296,95 +847,8 @@ fn model_release_publish_definition() -> McpToolDefinition {
     )
 }
 
-fn project_operation_schema() -> Value {
-    json!({
-        "oneOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "file.add"},
-                    "path": project_path_schema(),
-                    "content": {"type": "string"}
-                },
-                "required": ["operation", "path", "content"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "file.patch"},
-                    "path": project_path_schema(),
-                    "patches": exact_patches_schema()
-                },
-                "required": ["operation", "path", "patches"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "file.delete"},
-                    "path": project_path_schema()
-                },
-                "required": ["operation", "path"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "file.rename"},
-                    "from": project_path_schema(),
-                    "to": project_path_schema()
-                },
-                "required": ["operation", "from", "to"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "entrypoint.set"},
-                    "path": project_path_schema()
-                },
-                "required": ["operation", "path"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "dependencies.set"},
-                    "requirements": {
-                        "type": "array",
-                        "maxItems": 64,
-                        "description": "Complete direct-requirement replacement; empty removes all requirements.",
-                        "items": dependency_schema()
-                    }
-                },
-                "required": ["operation", "requirements"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "operation": {"const": "hints.patch"},
-                    "patches": exact_patches_schema()
-                },
-                "required": ["operation", "patches"],
-                "additionalProperties": false
-            }
-        ]
-    })
-}
-
 fn project_path_schema() -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": 1024})
-}
-
-fn project_read_path_schema() -> Value {
-    json!({
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 1024,
-        "description": "Strict relative ASCII POSIX file path."
-    })
 }
 
 fn revision_schema(description: &str) -> Value {
@@ -1392,42 +856,6 @@ fn revision_schema(description: &str) -> Value {
         "type": "string",
         "pattern": "^[0-9a-f]{64}$",
         "description": description
-    })
-}
-
-fn line_offset_schema() -> Value {
-    json!({
-        "type": "integer",
-        "minimum": 1,
-        "default": 1,
-        "description": "One-based starting line."
-    })
-}
-
-fn read_limit_schema() -> Value {
-    json!({
-        "type": "integer",
-        "minimum": 1,
-        "maximum": workspace::MAX_READ_LIMIT,
-        "default": workspace::DEFAULT_READ_LIMIT,
-        "description": "Maximum lines returned."
-    })
-}
-
-fn exact_patches_schema() -> Value {
-    json!({
-        "type": "array",
-        "minItems": 1,
-        "maxItems": 256,
-        "items": {
-            "type": "object",
-            "properties": {
-                "old": {"type": "string", "minLength": 1},
-                "new": {"type": "string"}
-            },
-            "required": ["old", "new"],
-            "additionalProperties": false
-        }
     })
 }
 
@@ -1466,30 +894,7 @@ fn stable_version_schema() -> Value {
         "description": "Exact stable SemVer MAJOR.MINOR.PATCH with no prerelease, build suffix, or leading zero."
     })
 }
-fn view_put_definition() -> McpToolDefinition {
-    definition(
-        "view.put",
-        "Create or conditionally update a shared view.",
-        false,
-        json!({ "type":"object", "properties": { "model_id":{"type":"string"}, "view":{"type":"object"}, "expected_etag":{"type":"string"} }, "required":["model_id","view"], "additionalProperties":false }),
-    )
-}
-fn view_delete_definition() -> McpToolDefinition {
-    definition(
-        "view.delete",
-        "Conditionally delete a shared view.",
-        false,
-        json!({ "type":"object", "properties": { "model_id":{"type":"string"}, "view_id":{"type":"string"}, "expected_etag":{"type":"string"} }, "required":["model_id","view_id","expected_etag"], "additionalProperties":false }),
-    )
-}
-fn view_default_definition() -> McpToolDefinition {
-    definition(
-        "view.set-default",
-        "Select a model's default shared view.",
-        false,
-        json!({ "type":"object", "properties": { "model_id":{"type":"string"}, "view_id":{"type":"string"} }, "required":["model_id","view_id"], "additionalProperties":false }),
-    )
-}
+
 fn model_id_schema() -> Value {
     json!({ "type":"object", "properties": { "model_id": model_id_property() }, "required":["model_id"], "additionalProperties":false })
 }
@@ -1513,13 +918,8 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Request, StatusCode},
-    };
     use bytes::Bytes;
     use tokio::sync::Semaphore;
-    use tower::ServiceExt as _;
 
     use super::*;
     use crate::{
@@ -1648,7 +1048,7 @@ mod tests {
         }
     }
 
-    fn valid_projection_png() -> Bytes {
+    pub(super) fn valid_projection_png() -> Bytes {
         let mut pixmap = resvg::tiny_skia::Pixmap::new(PROJECTION_WIDTH, PROJECTION_HEIGHT)
             .expect("projection pixmap");
         pixmap.fill(resvg::tiny_skia::Color::WHITE);
@@ -1662,7 +1062,7 @@ mod tests {
         Bytes::from(bytes)
     }
 
-    fn rendered_output(image: Bytes) -> RenderedOutput {
+    pub(super) fn rendered_output(image: Bytes) -> RenderedOutput {
         let summary = ModelOutputSummaryRecord {
             output_id: "primary".to_owned(),
             role: OutputRoleRecord::Assembly,
@@ -1693,7 +1093,7 @@ mod tests {
         }
     }
 
-    fn named_view(id: String, projection: Projection) -> NamedView {
+    pub(super) fn named_view(id: String, projection: Projection) -> NamedView {
         NamedView {
             id,
             name: "Saved camera".to_owned(),
@@ -1949,170 +1349,6 @@ mod tests {
                 .to_string()
                 .contains(output["content"][1]["data"].as_str().unwrap())
         );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn streamable_http_tools_call_preserves_semantic_image_block() {
-        let repository = Repository::new(Arc::new(InMemoryObjectStore::default()), 1);
-        let model = repository
-            .create_model("part", "Part", b"source")
-            .await
-            .expect("create model");
-        repository
-            .complete_render(
-                &model.id,
-                &model.desired_source_revision,
-                rendered_output(valid_projection_png()),
-            )
-            .await
-            .expect("complete render");
-        let view = repository
-            .put_view(
-                "part",
-                named_view(String::new(), Projection::Perspective),
-                None,
-            )
-            .await
-            .expect("create saved view");
-        repository
-            .complete_view_render(
-                "part",
-                &ViewRenderIdentity {
-                    revision: model.desired_source_revision.clone(),
-                    output_id: "primary".to_owned(),
-                    view_id: view.id.clone(),
-                    view_etag: view.etag.clone(),
-                },
-                valid_projection_png(),
-            )
-            .await
-            .expect("cache saved view");
-        let renders = RenderQueue::start(
-            repository.clone(),
-            RenderConfig {
-                command: vec!["unused".to_owned()],
-                queue_capacity: 1,
-                concurrency: 1,
-                timeout: Duration::from_secs(1),
-                max_output_bytes: 1024,
-            },
-        )
-        .expect("render queue");
-        let router = FaktoryMcp::new(repository, renders)
-            .expect("skill catalog")
-            .router();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("accept", "application/json, text/event-stream")
-            .header("content-type", "application/json")
-            .header("mcp-protocol-version", "2026-07-28")
-            .header("mcp-method", "tools/call")
-            .header("mcp-name", "model.inspect")
-            .body(Body::from(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "model.inspect",
-                        "arguments": {"model_id": "part", "projection": "right"},
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                            "io.modelcontextprotocol/clientInfo": {
-                                "name": "faktory-test",
-                                "version": "1.0.0"
-                            }
-                        }
-                    }
-                })
-                .to_string(),
-            ))
-            .expect("MCP request");
-
-        let response = router.clone().oneshot(request).await.expect("MCP response");
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("response body");
-        assert_eq!(status, StatusCode::OK, "MCP response: {body:?}");
-        let body = std::str::from_utf8(&body).expect("UTF-8 response");
-        let payload = body
-            .strip_prefix("data: ")
-            .and_then(|body| body.strip_suffix("\n\n"))
-            .unwrap_or(body);
-        let response: Value = serde_json::from_str(payload).expect("JSON-RPC response");
-        let content = response["result"]["content"]
-            .as_array()
-            .expect("semantic content");
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[1]["type"], "image");
-        assert_eq!(content[1]["mimeType"], "image/png");
-        let image = BASE64
-            .decode(content[1]["data"].as_str().expect("image data"))
-            .expect("base64 image");
-        validate_projection_png(&image).expect("transported projection PNG");
-
-        let discovery = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("accept", "application/json, text/event-stream")
-            .header("content-type", "application/json")
-            .header("mcp-protocol-version", "2026-07-28")
-            .header("mcp-method", "tools/list")
-            .body(Body::from(
-                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{
-                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities":{},
-                    "io.modelcontextprotocol/clientInfo":{"name":"faktory-test","version":"1.0.0"}
-                }}})
-                .to_string(),
-            ))
-            .expect("discovery request");
-        let discovery = router
-            .clone()
-            .oneshot(discovery)
-            .await
-            .expect("discovery response");
-        let body = to_bytes(discovery.into_body(), 1024 * 1024)
-            .await
-            .expect("discovery body");
-        assert!(
-            std::str::from_utf8(&body)
-                .expect("UTF-8 discovery")
-                .contains("view.inspect"),
-            "discovery response: {body:?}"
-        );
-
-        let view_call = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("accept", "application/json, text/event-stream")
-            .header("content-type", "application/json")
-            .header("mcp-protocol-version", "2026-07-28")
-            .header("mcp-method", "tools/call")
-            .header("mcp-name", "view.inspect")
-            .body(Body::from(
-                json!({
-                    "jsonrpc":"2.0", "id":3, "method":"tools/call",
-                    "params":{"name":"view.inspect","arguments":{"model_id":"part","view_id":view.id},"_meta":{
-                        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                        "io.modelcontextprotocol/clientCapabilities":{},
-                        "io.modelcontextprotocol/clientInfo":{"name":"faktory-test","version":"1.0.0"}
-                    }}
-                })
-                .to_string(),
-            ))
-            .expect("view call request");
-        let response = router.oneshot(view_call).await.expect("view call response");
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("view call body");
-        let body = std::str::from_utf8(&body).expect("UTF-8 view response");
-        assert!(body.contains("\"style\":\"shaded\""));
-        assert!(body.contains("\"type\":\"image\""));
     }
 
     #[tokio::test]
@@ -2822,166 +2058,6 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn create_and_edit_schemas_describe_slug_and_exact_patch_contracts() {
-        let create = model_create_definition();
-        assert_eq!(create.name, "model.create");
-        assert_eq!(
-            create.input_schema["properties"]["model_id"]["pattern"],
-            "^[a-z0-9]+(-[a-z0-9]+)*$"
-        );
-        assert_eq!(
-            create.input_schema["required"],
-            json!(["model_id", "name", "files", "entrypoint"])
-        );
-
-        let edit = model_edit_definition();
-        assert_eq!(edit.name, "model.edit");
-        assert!(create.input_schema["properties"].get("source").is_none());
-        assert_eq!(create.input_schema["properties"]["files"]["minItems"], 1);
-        assert!(
-            create.input_schema["properties"]
-                .get("dependencies")
-                .is_none()
-        );
-        assert_eq!(
-            create.input_schema["properties"]["requirements"]["default"],
-            json!([])
-        );
-        assert_eq!(create.input_schema["properties"]["hints"]["default"], "");
-        assert_eq!(
-            create.input_schema["properties"]["files"]["items"]["additionalProperties"],
-            false
-        );
-        assert_eq!(edit.input_schema["properties"]["operations"]["minItems"], 1);
-        assert_eq!(
-            edit.input_schema["properties"]["operations"]["maxItems"],
-            256
-        );
-        let variants = edit.input_schema["properties"]["operations"]["items"]["oneOf"]
-            .as_array()
-            .expect("operation variants");
-        assert_eq!(variants.len(), 7);
-        assert_eq!(
-            variants
-                .iter()
-                .map(|variant| variant["properties"]["operation"]["const"]
-                    .as_str()
-                    .expect("operation discriminator"))
-                .collect::<Vec<_>>(),
-            vec![
-                "file.add",
-                "file.patch",
-                "file.delete",
-                "file.rename",
-                "entrypoint.set",
-                "dependencies.set",
-                "hints.patch"
-            ]
-        );
-        assert!(
-            variants
-                .iter()
-                .all(|variant| variant["additionalProperties"] == false)
-        );
-        assert_eq!(
-            variants[1]["properties"]["patches"]["items"]["properties"]["old"]["minLength"],
-            1
-        );
-        assert_eq!(
-            edit.input_schema["properties"]["expected_revision"]["pattern"],
-            "^[0-9a-f]{64}$"
-        );
-        assert_eq!(edit.input_schema["anyOf"].as_array().map(Vec::len), Some(2));
-
-        let inspect = model_inspect_definition();
-        assert_eq!(inspect.name, "model.inspect");
-        assert_eq!(
-            inspect.input_schema["properties"]["projection"]["enum"],
-            json!([
-                "isometric",
-                "front",
-                "back",
-                "left",
-                "right",
-                "top",
-                "bottom"
-            ])
-        );
-        assert_eq!(
-            inspect.input_schema["required"],
-            json!(["model_id", "projection"])
-        );
-        assert_eq!(
-            inspect.input_schema["properties"]["output_id"]["pattern"],
-            "^[a-z0-9]+(-[a-z0-9]+)*$"
-        );
-        assert_eq!(inspect.input_schema["additionalProperties"], false);
-
-        for definition in [
-            model_open_definition(),
-            model_read_definition(),
-            model_glob_definition(),
-            model_grep_definition(),
-            model_release_list_definition(),
-            model_release_get_definition(),
-        ] {
-            assert_eq!(definition.input_schema["additionalProperties"], false);
-            assert_eq!(
-                definition.annotations.as_ref().unwrap()["readOnlyHint"],
-                true
-            );
-        }
-        let read = model_read_definition();
-        assert_eq!(read.input_schema["properties"]["offset"]["default"], 1);
-        assert_eq!(
-            read.input_schema["properties"]["limit"]["maximum"],
-            workspace::MAX_READ_LIMIT
-        );
-        let grep = model_grep_definition();
-        assert_eq!(
-            grep.input_schema["properties"]["limit"]["maximum"],
-            workspace::MAX_GREP_LIMIT
-        );
-        assert_eq!(grep.input_schema["properties"]["pattern"]["minLength"], 1);
-        assert!(
-            grep.input_schema["properties"]["pattern"]
-                .get("maxLength")
-                .is_none()
-        );
-        assert_eq!(
-            model_glob_definition().input_schema["properties"]["pattern"]["maxLength"],
-            workspace::MAX_PATTERN_BYTES
-        );
-        let patch = model_apply_patch_definition();
-        assert_eq!(patch.input_schema["additionalProperties"], false);
-        assert_eq!(patch.annotations.as_ref().unwrap()["readOnlyHint"], false);
-        assert_eq!(patch.input_schema["properties"]["patch"]["minLength"], 1);
-        assert!(
-            patch.input_schema["properties"]["patch"]
-                .get("maxLength")
-                .is_none()
-        );
-
-        for definition in [
-            model_release_list_definition(),
-            model_release_get_definition(),
-            model_release_publish_definition(),
-        ] {
-            assert_eq!(definition.input_schema["additionalProperties"], false);
-        }
-        let publish = model_release_publish_definition();
-        assert_eq!(
-            publish.input_schema["properties"]["version"]["pattern"],
-            "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
-        );
-        assert_eq!(
-            publish.input_schema["properties"]["expected_revision"]["pattern"],
-            "^[0-9a-f]{64}$"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
     fn project_and_release_inputs_reject_unknown_nested_fields() {
         assert!(
             serde_json::from_value::<ModelReadInput>(json!({
@@ -3414,6 +2490,101 @@ mod tests {
 
         assert_eq!(edited.name, "Renamed");
         assert_eq!(edited.render_state, StoredRenderState::Pending);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_edit_rechecks_revision_after_concurrent_project_read() {
+        let store = Arc::new(BlockingFirstProjectGet::new());
+        let repository = Repository::new(store.clone(), 1);
+        let created = repository
+            .create_model("part", "Part", b"alpha")
+            .await
+            .unwrap();
+        let queue = RenderQueue::start(
+            repository.clone(),
+            RenderConfig {
+                command: vec!["unused".to_owned()],
+                queue_capacity: 2,
+                concurrency: 1,
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 12,
+            },
+        )
+        .unwrap();
+        let server = FaktoryMcp::new(repository.clone(), queue).unwrap();
+        let input = |text: &str| {
+            serde_json::from_value::<uniform::TextEditInput>(json!({
+            "uri":"faktory://models/part/files/source.py", "expected_revision":created.desired_source_revision,
+            "edits":[{"operation":"replace","old_text":"alpha","new_text":text}]
+        })).unwrap()
+        };
+        store.block_project_get.store(true, Ordering::SeqCst);
+        let first_server = server.clone();
+        let first_input = input("first");
+        let first = tokio::spawn(async move { first_server.edit_text(first_input).await });
+        store.project_get_started.acquire().await.unwrap().forget();
+        let second = server.edit_text(input("second")).await.unwrap();
+        store.release_project_get.add_permits(1);
+        assert_eq!(first.await.unwrap().unwrap_err(), RepositoryError::Conflict);
+        let project = repository
+            .get_project("part", &second.desired_source_revision)
+            .await
+            .unwrap();
+        assert_eq!(project.caller_files()[0].content, "second");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_edit_cancellation_after_commit_schedules_exactly_one_render() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let marker = directory.path().join("renders");
+        let script = format!("printf rendered >> '{}'; exit 1", marker.display());
+        let store = Arc::new(BlockingCommittedPut::new());
+        store.block_model_put.store(false, Ordering::SeqCst);
+        let repository = Repository::new(store.clone(), 1);
+        let created = repository
+            .create_model("part", "Part", b"alpha")
+            .await
+            .unwrap();
+        let queue = RenderQueue::start(
+            repository.clone(),
+            RenderConfig {
+                command: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+                queue_capacity: 1,
+                concurrency: 1,
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 12,
+            },
+        )
+        .unwrap();
+        let server = FaktoryMcp::new(repository.clone(), queue).unwrap();
+        let input: uniform::TextEditInput = serde_json::from_value(json!({
+            "uri":"faktory://models/part/files/source.py", "expected_revision":created.desired_source_revision,
+            "edits":[{"operation":"replace","old_text":"alpha","new_text":"beta"},
+                     {"operation":"insert","text":" gamma","placement":"end"}]
+        })).unwrap();
+        store.block_model_put.store(true, Ordering::SeqCst);
+        let caller = tokio::spawn(async move { server.edit_text(input).await });
+        store.committed.acquire().await.unwrap().forget();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        store.release.add_permits(1);
+        for _ in 0..100 {
+            let model = repository.get_model("part").await.unwrap().record;
+            if model.render_state == StoredRenderState::Failed {
+                assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"rendered");
+                let project = repository
+                    .get_project("part", &model.desired_source_revision)
+                    .await
+                    .unwrap();
+                assert_eq!(project.caller_files()[0].content, "beta gamma");
+                repository.ready().await.unwrap();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("text edit cancellation prevented render submission");
     }
 
     #[cfg(unix)]

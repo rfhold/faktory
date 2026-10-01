@@ -26,11 +26,11 @@ Missing desired project bundles, missing or corrupt exact releases, invalid depe
 - Process restart may interrupt rendering; startup reconciliation retries only interrupted pending work.
 - Garage unavailability prevents authoritative mutation and artifact retrieval. The server advances success only after every required artifact write.
 - Visual-renderer unavailability, timeout, crash, malformed output, or saturation fails the desired project render. Restart alone does not retry a `FAILED` revision.
-- An operator can call `model.render.retry` for a failed desired revision after worker recovery. A project edit can also create new work.
-- `model.render.retry` reuses the exact desired project and model-release lock closure. It never resolves a newly published release.
+- An operator can call `execute` action `model.render.retry` for a failed desired revision after worker recovery. A project edit can also create new work.
+- `execute` action `model.render.retry` reuses the exact desired project and model-release lock closure. It never resolves a newly published release.
 - Compatible model-release rollout resumes from its durable record after interruption. It re-evaluates concurrently edited models and never overwrites a newer desired project.
 - A visual-renderer crash can leave only worker-local temporary data. The read-only root and memory-backed `/tmp` make that data disposable.
-- A failed primary named-view render leaves no selectable cache entry. Retry the same `view.inspect` after worker recovery.
+- A failed primary named-view render leaves no selectable cache entry. Retry the same `query` action `view.render` after worker recovery.
 - A view or revision race can leave an unreachable immutable cache object. Current identity checks prevent its return; no cache cleanup operation exists.
 - A release closure failure leaves the affected desired revision unavailable for execution and preserves current-successful outputs.
 - Watch disconnection is recovered by reconnecting and accepting a new authoritative snapshot.

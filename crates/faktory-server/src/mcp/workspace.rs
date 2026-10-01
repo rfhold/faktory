@@ -7,22 +7,28 @@ use sha2::{Digest as _, Sha256};
 
 use crate::model::{
     ModelRecord, Repository, RepositoryError,
-    project::{
-        AGENTS_PATH, ExactPatch, ProjectBundle, ProjectOperation, hex_digest, normalize_user_path,
-    },
+    project::{ProjectBundle, hex_digest},
 };
 
-use super::{ModelGrepInput, ModelReadInput};
+use super::ModelGrepInput;
+#[cfg(test)]
+use super::ModelReadInput;
+#[cfg(test)]
+use crate::model::project::{AGENTS_PATH, ExactPatch, ProjectOperation, normalize_user_path};
 
+#[cfg(test)]
 pub(super) const DEFAULT_READ_LIMIT: usize = 200;
+#[cfg(test)]
 pub(super) const MAX_READ_LIMIT: usize = 2_000;
 pub(super) const MAX_GLOB_RESULTS: usize = 1_000;
 pub(super) const DEFAULT_GREP_LIMIT: usize = 100;
 pub(super) const MAX_GREP_LIMIT: usize = 1_000;
 pub(super) const MAX_PATTERN_BYTES: usize = 1_024;
 pub(super) const MAX_MATCH_TEXT_BYTES: usize = 2_000;
+#[cfg(test)]
 pub(super) const MAX_PATCH_BYTES: usize = 1_048_576;
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct ParsedPatch {
     pub operations: Vec<ProjectOperation>,
@@ -46,6 +52,7 @@ pub(super) async fn model_open(
     }))
 }
 
+#[cfg(test)]
 pub(super) async fn model_read(
     repository: &Repository,
     input: &ModelReadInput,
@@ -133,6 +140,7 @@ pub(super) async fn model_grep(
     Ok(json!({"revision": actual_revision, "matches": matches, "truncated": truncated}))
 }
 
+#[cfg(test)]
 pub(super) fn parse_patch(patch: &str) -> Result<ParsedPatch, RepositoryError> {
     if patch.is_empty() || patch.len() > MAX_PATCH_BYTES || patch.contains(['\r', '\0']) {
         return Err(RepositoryError::Invalid);
@@ -169,6 +177,7 @@ pub(super) fn parse_patch(patch: &str) -> Result<ParsedPatch, RepositoryError> {
     })
 }
 
+#[cfg(test)]
 struct PatchParser<'a> {
     lines: &'a [&'a str],
     index: usize,
@@ -176,6 +185,7 @@ struct PatchParser<'a> {
     changed_paths: Vec<String>,
 }
 
+#[cfg(test)]
 impl PatchParser<'_> {
     fn parse_add(&mut self, path: &str) -> Result<(), RepositoryError> {
         let path = validate_patch_path(path)?;
@@ -285,6 +295,7 @@ impl PatchParser<'_> {
     }
 }
 
+#[cfg(test)]
 fn valid_hunk_header(header: &str) -> bool {
     header == "@@"
         || header
@@ -292,10 +303,12 @@ fn valid_hunk_header(header: &str) -> bool {
             .is_some_and(|label| label.chars().any(|character| !character.is_whitespace()))
 }
 
+#[cfg(test)]
 fn validate_patch_path(path: &str) -> Result<String, RepositoryError> {
     normalize_user_path(path)
 }
 
+#[cfg(test)]
 fn validate_project_read_path(path: &str) -> Result<String, RepositoryError> {
     if path == AGENTS_PATH {
         Ok(path.to_owned())
@@ -345,6 +358,7 @@ fn compile_glob(pattern: &str) -> Result<globset::GlobMatcher, RepositoryError> 
         .map(|glob| glob.compile_matcher())
 }
 
+#[cfg(test)]
 const fn validate_read_bounds(offset: usize, limit: usize) -> Result<(), RepositoryError> {
     if offset == 0 || limit == 0 || limit > MAX_READ_LIMIT {
         return Err(RepositoryError::Invalid);
@@ -352,12 +366,14 @@ const fn validate_read_bounds(offset: usize, limit: usize) -> Result<(), Reposit
     Ok(())
 }
 
+#[cfg(test)]
 struct LineRead {
     content: String,
     total_lines: usize,
     truncated: bool,
 }
 
+#[cfg(test)]
 fn read_lines(content: &str, offset: usize, limit: usize) -> Result<LineRead, RepositoryError> {
     let lines = logical_lines(content).collect::<Vec<_>>();
     if offset > lines.len().saturating_add(1) {
