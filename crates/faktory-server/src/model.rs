@@ -1789,6 +1789,81 @@ mod tests {
         assert!(serde_json::from_slice::<OutputManifest>(summary).is_err());
     }
 
+    fn assert_python_cad_manifest_roundtrip(
+        bytes: &'static [u8],
+        facts_bytes: &[u8],
+        expected: [f64; 4],
+    ) {
+        let manifest: OutputManifest = serde_json::from_slice(bytes).expect("Python manifest");
+        let facts = manifest.outputs[0].facts;
+        for (actual, expected) in [
+            facts.volume_cubic_millimeters,
+            facts.size_millimeters.x,
+            facts.size_millimeters.y,
+            facts.size_millimeters.z,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        let worker_facts: GeometryFactsRecord =
+            serde_json::from_slice(facts_bytes).expect("Python facts");
+        assert_eq!(worker_facts, facts);
+        validate_output_summaries(&manifest.outputs).expect("valid Python summaries");
+        let canonical = manifest.canonical_bytes().expect("canonical manifest");
+        assert_eq!(canonical.as_ref(), bytes);
+        assert_eq!(canonical.last(), Some(&b'\n'));
+        let reparsed: OutputManifest =
+            serde_json::from_slice(&canonical).expect("reparsed manifest");
+        assert_eq!(reparsed, manifest);
+        assert_eq!(
+            reparsed.canonical_bytes().expect("recanonicalized"),
+            canonical
+        );
+
+        let mut output = rendered(b"geometry");
+        output.manifest = canonical;
+        output.outputs[0].summary = manifest.outputs[0].clone();
+        assert_eq!(
+            validate_rendered_output(&output).expect("admitted Python manifest"),
+            manifest.outputs
+        );
+    }
+
+    #[test]
+    fn python_cad_deflector_manifest_roundtrips_exactly() {
+        let manifest = concat!(
+            r#"{"format":"faktory-outputs-v1","outputs":[{"output_id":"primary","role":"part","primary":true,"facts":{"volume_cubic_millimeters":160932.54998422693,"size_millimeters":{"x":203.20000019999998,"y":247.43453372739452,"z":49.2672879381576}}}]}"#,
+            "\n"
+        );
+        let facts = br#"{"volume_cubic_millimeters":160932.54998422693,"size_millimeters":{"x":203.20000019999998,"y":247.43453372739452,"z":49.2672879381576}}"#;
+        assert_python_cad_manifest_roundtrip(
+            manifest.as_bytes(),
+            facts,
+            [
+                160_932.549_984_226_93,
+                203.200_000_199_999_98,
+                247.434_533_727_394_52,
+                49.267_287_938_157_6,
+            ],
+        );
+    }
+
+    #[test]
+    fn python_cad_cylinder_manifest_roundtrips_exactly() {
+        let manifest = concat!(
+            r#"{"format":"faktory-outputs-v1","outputs":[{"output_id":"primary","role":"part","primary":true,"facts":{"volume_cubic_millimeters":127234.50247038661,"size_millimeters":{"x":90.0,"y":90.0,"z":20.0}}}]}"#,
+            "\n"
+        );
+        let facts = br#"{"volume_cubic_millimeters":127234.50247038661,"size_millimeters":{"x":90.0,"y":90.0,"z":20.0}}"#;
+        assert_python_cad_manifest_roundtrip(
+            manifest.as_bytes(),
+            facts,
+            [127_234.502_470_386_61, 90.0, 90.0, 20.0],
+        );
+    }
+
     fn view(id: String) -> NamedView {
         NamedView {
             id,
