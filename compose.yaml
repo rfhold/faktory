@@ -84,6 +84,27 @@ services:
           memory: 1G
     restart: unless-stopped
 
+  companion-host:
+    build:
+      context: .
+      target: companion-runtime
+    environment:
+      PORT: "8082"
+      COMPANION_PARENT_ORIGINS: http://172.16.1.40:8080
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8082/ready').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    ports:
+      - "0.0.0.0:8082:8082"
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   faktory:
     build:
       context: .
@@ -92,6 +113,7 @@ services:
       FAKTORY_AUTH_MODE: disabled
       FAKTORY_DEPLOYMENT_ENVIRONMENT: local
       FAKTORY_PUBLIC_BASE_URL: http://172.16.1.40:8080
+      FAKTORY_COMPANION_ORIGIN: http://172.16.1.40:8082
       FAKTORY_S3_ENDPOINT: http://garage:3900
       FAKTORY_S3_REGION: garage
       FAKTORY_S3_BUCKET: faktory
@@ -106,6 +128,8 @@ services:
       postgres:
         condition: service_healthy
       visual-renderer:
+        condition: service_healthy
+      companion-host:
         condition: service_healthy
     ports:
       - "0.0.0.0:8080:8080"

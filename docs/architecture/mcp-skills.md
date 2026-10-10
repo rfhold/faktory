@@ -9,3 +9,8 @@ Streamable HTTP advertises the `io.modelcontextprotocol/skills` extension and Re
 These are workflow instructions, not permissions. All methods remain behind the existing hosted bearer validation, broad `faktory:use` scope, and default-deny Origin policy. Exact disabled-auth mode still uses the same uncredentialed local transport. The resource-first MCP interface does not change OAuth, browser, protobuf, or artifact access.
 
 The five uniform tools are `create`, `edit`, `destroy`, `execute`, and `query`; ordinary reads use `faktory://` resources. Generated project `AGENTS.md` remains canonical revision-, path-, and exact-lock-specific resource data; it is never a static skill. Protected Index and Dependency Guidance, user Hints, bundle hashes, exact release locks, render/retry without resolution, READY publication, explicit major adoption, last-good image metadata, primary-only shaded views, binary image resources, semantic query images, and view etags retain their contracts in [Model Projects and Dependencies](model-projects-dependencies.md) and [Protocol](protocol.md).
+
+`edit-model-projects` also routes companion HTML, CSS, SVG, and JSON author requests through ordinary revision-guarded file operations.
+Its curated tools reference includes generic and cut-layout examples without a fourth skill or extra manifest file.
+[Model Companions](companion.md) provides the canonical author contract.
+Generated project `AGENTS.md` indexes companion paths through the normal canonical file index; it does not replace the public author guidance.

@@ -758,6 +758,27 @@ impl Repository {
             .await
     }
 
+    pub async fn companion(
+        &self,
+        model_id: &str,
+        revision: &str,
+    ) -> Result<
+        Result<Option<crate::companion::Companion>, crate::companion::CompileError>,
+        RepositoryError,
+    > {
+        self.current_model(model_id, revision).await?;
+        let project = self.get_project(model_id, revision).await?;
+        let compiled_revision = revision.to_owned();
+        let compiled = tokio::task::spawn_blocking(move || {
+            crate::companion::compile(&project.files, &compiled_revision)
+        })
+        .await
+        .map_err(|_| RepositoryError::Corrupt)?;
+        // Recheck after compilation so a render advancement cannot disclose a historical page.
+        self.current_model(model_id, revision).await?;
+        Ok(compiled)
+    }
+
     pub async fn geometry_output(
         &self,
         model_id: &str,

@@ -24,3 +24,14 @@ export function validateSegment(value: string, name: string): string {
   if (!segment.test(value)) throw new Error(`${name} is invalid`);
   return value;
 }
+
+export function companionConfiguration(hostname: string | undefined, image: string | undefined, appHostname: string) {
+  if (hostname === undefined) return undefined;
+  const host = validateHostname(hostname);
+  host.split(".").forEach((label) => validateSegment(label, "companionHostname label"));
+  if (host === appHostname || host.endsWith(`.${appHostname}`) || appHostname.endsWith(`.${host}`)) {
+    throw new Error("companionHostname must be separate from the app hostname and its cookie domain");
+  }
+  if (!image) throw new Error("companionImage is required when companionHostname is set");
+  return { hostname: host, origin: `https://${host}`, image: requireImmutableImage(image) };
+}

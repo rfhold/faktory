@@ -1,0 +1,23 @@
+{
+  "name": "@rfhold/faktory-companion-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "browser": "node tests/browser.mjs",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@rfhold/faktory-companion-kit": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "esbuild": "0.25.12",
+    "playwright-core": "1.63.0",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  }
+}

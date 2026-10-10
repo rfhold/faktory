@@ -24,7 +24,7 @@ When CIMD is enabled, Faktory can retrieve a client metadata document from an HT
 
 Pulumi creates one 256-bit OAuth wrapping key for each configured version. The keyring names one active version and retains older versions for encrypted database records. Version identifiers use unique DNS labels. The configuration accepts from 1 through 32 versions. Pulumi stores key material as secret state and projects it only through the `faktory-oauth-wrapping-keys` Secret. A secret-derived checksum rolls the server pod after a keyring change. The runtime rejects a keyring that cannot decrypt required OAuth signing state.
 
-Any authenticated MCP principal can create, discover, read, and edit model projects under the `faktory:use` scope. The same principal can read and publish immutable model releases. The principal can read one selected output's technical projection per resource call. Shaded projection and saved-view inspection remain primary-only. The MVP defines no narrower source-author or publisher role. Project source, dependency source, generated guidance, requirements, locks, and project docs remain MCP-only. MCP resources and tools expose canonical objects, not server filesystem paths or a second storage model. They expose no arbitrary object keys, Python execution arguments, renderer commands, storage credentials, GLB or STL bytes, or storage-internal metadata. PNG bytes appear only in authorized binary resources or semantic query results. Browser artifact URLs and browser sessions do not apply to MCP. [`protocol.md`](protocol.md) defines resource/tool results and errors. [`model-projects-dependencies.md`](model-projects-dependencies.md) defines project, dependency, and release semantics.
+Any authenticated MCP principal can create, discover, read, and edit model projects under the `faktory:use` scope. The same principal can read and publish immutable model releases. The principal can read one selected output's technical projection per resource call. Shaded projection and saved-view inspection remain primary-only. The MVP defines no narrower source-author or publisher role. Project source, dependency source, generated guidance, requirements, locks, and project docs remain MCP-only except selected sanitized companion presentation. MCP resources and tools expose canonical objects, not server filesystem paths or a second storage model. They expose no arbitrary object keys, Python execution arguments, renderer commands, storage credentials, GLB or STL bytes, or storage-internal metadata. PNG bytes appear only in authorized binary resources or semantic query results. Browser artifact URLs and browser sessions do not apply to MCP. [`protocol.md`](protocol.md) defines resource/tool results and errors. [`model-projects-dependencies.md`](model-projects-dependencies.md) defines project, dependency, and release semantics.
 
 ## Visual Renderer Boundary
 
@@ -38,6 +38,23 @@ The worker runs as non-root UID and GID 65532. Its pod disables service-account 
 
 ## Data Safety
 
-Credentials, project or dependency source, AGENTS content, requirements, locks, project docs, GLB, STL, SVG, PNG bytes, session identifiers, authorization codes, tokens, object-store internals, and raw renderer output must not enter logs, traces, metrics, protobuf errors, or browser diagnostics. Authorized browser artifact routes intentionally deliver GLB, SVG, and STL bytes, but no source text. Only authorized MCP resources and search tools intentionally return source text. The model `/open` resource and model-release metadata results omit indexed file bodies. File resources and bounded search tools return only requested content. Authorized binary image resources and semantic `query` image results provide the only intentional PNG responses. Render, export, rollout, and migration failures expose only safe bounded summaries.
+### Companion Exception
+
+The authenticated browser also retrieves selected sanitized companion presentation for the current-successful revision.
+[The companion specification](spec/companion.md) defines the exact namespace and six-field payload.
+All other source, guidance, requirements, locks, and project documentation retain the MCP-only boundary.
+The browser fetches the payload from Faktory, not the separate static host.
+The host serves trusted static bytes without credentials, private HTTP content, persistence, or telemetry.
+The opaque iframe receives content through a nonce- and revision-bound `MessageChannel`.
+[Companion host operation](../operations/companion-host.md) defines separate cookie-domain and local-port precautions.
+
+Credentials, project or dependency source, AGENTS content, requirements, locks, project docs, companion content, and artifact bytes never enter server signals or browser diagnostics.
+Session identifiers, authorization codes, tokens, object-store internals, and raw renderer output follow the same restriction.
+Authorized browser artifact routes intentionally deliver GLB, SVG, STL, and selected sanitized companion presentation.
+Only authorized MCP resources and search tools return other project source text.
+The model `/open` resource and model-release metadata results omit indexed file bodies.
+File resources and bounded search tools return only requested content.
+Authorized binary image resources and semantic `query` image results provide the only intentional PNG responses.
+Render, export, companion, rollout, and migration failures expose only safe bounded summaries.
 
 Browser Faro telemetry is the explicit exception to this strict server-signal contract. Its accepted collection and privacy boundary are defined in [`observability.md`](observability.md); the server exclusions above must not be used to imply that standard Faro collection is globally sanitized.

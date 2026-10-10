@@ -4,7 +4,9 @@
 
 This document defines the implemented model-dependency hard cutover. Repository state does not prove a preview or production deployment.
 
-The MCP API remains the only source-bearing interface. Protobuf and browser APIs expose only model metadata and current-successful artifacts. Existing protobuf fields such as `desired_source_revision` retain their names, but their values identify project revisions.
+MCP owns project source reads and mutations. Browser APIs expose metadata and current-successful artifacts, including selected sanitized companion presentation.
+This narrow exception follows [the companion specification](spec/companion.md); it adds no generic source interface.
+Existing protobuf fields such as `desired_source_revision` retain their names, but their values identify project revisions.
 
 [`design-bundles.md`](design-bundles.md) owns the Python result contract. [`storage-rendering.md`](storage-rendering.md) owns object keys and render advancement. [`../operations/object-store-migrations.md`](../operations/object-store-migrations.md) owns the destructive cutover.
 
@@ -171,7 +173,8 @@ Publication verifies the complete exact dependency closure before it writes the 
 
 Model authors own semantic compatibility. Minor and patch releases must preserve compatibility with every earlier release in that major. Any breaking Python API change requires a new major version. Any change to physical geometry, fit, clearance, mating interfaces, or other physical behavior requires a new major version. Faktory cannot infer these compatibility properties from source.
 
-MCP reads releases through the `/releases` collection and exact `/releases/{version}` resource. `execute` action `model.release.publish` publishes an exact READY revision and preserves byte-identical republication semantics. Publication is not a text edit or a create/upsert operation. Exact source and documentation use linked `/revisions/{project_revision}/files/{path}` resources. There is no mutable release default. Protobuf, browser, and artifact HTTP APIs remain dependency-blind and source-free.
+MCP reads releases through the `/releases` collection and exact `/releases/{version}` resource. `execute` action `model.release.publish` publishes an exact READY revision and preserves byte-identical republication semantics. Publication is not a text edit or a create/upsert operation. Exact source and documentation use linked `/revisions/{project_revision}/files/{path}` resources. There is no mutable release default. Protobuf, browser, and artifact HTTP APIs remain dependency-blind.
+Only selected sanitized root companion presentation uses the browser exception in [the companion specification](spec/companion.md).
 
 ## Compatible Release Rollout
 
@@ -185,6 +188,9 @@ A later compatible release remains eligible after an earlier consumer render fai
 
 ## Confidentiality and Exclusions
 
-Project files, dependency source, generated guidance, requirements, and locks remain MCP-only. Model metadata and image resources, protobuf records, browser APIs, HTTP artifacts, logs, telemetry, and safe errors never contain that content.
+Project files, dependency source, generated guidance, requirements, and locks remain MCP-only except selected sanitized companion presentation.
+[The companion specification](spec/companion.md) limits that browser exception to the root companion namespace and current-successful revision.
+No generic file route, Python, dependency source, guidance, requirements, or locks enter browser APIs or artifacts.
+Model metadata, image resources, protobuf records, logs, telemetry, and safe errors never contain project or companion content.
 
 Project tools and release tools operate over canonical objects. They do not expose server filesystem paths or arbitrary object keys. The contract adds no external dependency manager, release mutation, deletion, yank, prerelease version, hostile-code sandbox, or multi-replica coordination.

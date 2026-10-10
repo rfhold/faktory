@@ -48,6 +48,7 @@ use crate::{
 pub struct AppConfig {
     pub auth: AuthConfig,
     pub public_base_url: String,
+    pub companion_origin: Option<String>,
     pub static_directory: Option<PathBuf>,
     pub render: RenderConfig,
     pub visual: VisualRendererConfig,
@@ -287,6 +288,11 @@ pub async fn build_runtime_with_visual_renderer(
     visual_renderer: Arc<dyn VisualRenderer>,
     visual_timeout: Duration,
 ) -> Result<Runtime, String> {
+    validate_companion_origin(
+        config.companion_origin.as_deref(),
+        &config.public_base_url,
+        matches!(config.auth, AuthConfig::Disabled),
+    )?;
     crate::migrations::run(store.clone())
         .await
         .map_err(startup_migration_error)?;
@@ -379,7 +385,10 @@ fn build_disabled_router(
         readiness: AuthReadiness::Disabled,
     };
     let artifact_routes = artifact_router(state.clone());
-    let router = base_router(state).merge(artifact_routes).merge(mcp);
+    let router = base_router(state)
+        .merge(artifact_routes)
+        .merge(runtime_config_router(config))
+        .merge(mcp);
     let mut router = router;
     if let Some(directory) = &config.static_directory {
         router = router
@@ -439,6 +448,7 @@ fn build_production_router(
     let artifact_routes = artifact_router(state.clone()).layer(browser_auth.clone());
     let router = base_router(state)
         .merge(artifact_routes)
+        .merge(runtime_config_router(config).layer(browser_auth.clone()))
         .merge(access_auth_router(production.browser.clone()))
         .merge(production.oauth.router())
         .merge(production.oidc_owner.router())
@@ -468,13 +478,83 @@ fn build_production_router(
     Ok(with_http_telemetry(router.fallback_service(grpc)))
 }
 
+fn validate_companion_origin(
+    origin: Option<&str>,
+    public_base_url: &str,
+    auth_disabled: bool,
+) -> Result<(), String> {
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    let invalid = || "invalid companion origin configuration".to_owned();
+    let url = url::Url::parse(origin).map_err(|_| invalid())?;
+    let public = url::Url::parse(public_base_url).map_err(|_| invalid())?;
+    let local = match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback() || (auth_disabled && (ip.is_private() || ip.is_link_local()))
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || (auth_disabled && (ip.is_unique_local() || ip.is_unicast_link_local()))
+        }
+        _ => false,
+    };
+    if !matches!(url.scheme(), "https" | "http")
+        || (url.scheme() == "http" && !local)
+        || url.origin().ascii_serialization() != origin
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(public.scheme(), "https" | "http")
+        || !public.username().is_empty()
+        || public.password().is_some()
+        || public.path() != "/"
+        || public.query().is_some()
+        || public.fragment().is_some()
+        || public.origin() == url.origin()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn runtime_config_router(config: &AppConfig) -> Router {
+    let origin = config.companion_origin.clone();
+    Router::new().route(
+        "/runtime-config",
+        get(move || {
+            let origin = origin.clone();
+            async move {
+                let mut response =
+                    axum::Json(serde_json::json!({"companion_origin": origin})).into_response();
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, no-store"),
+                );
+                response.headers_mut().insert(
+                    header::X_CONTENT_TYPE_OPTIONS,
+                    HeaderValue::from_static("nosniff"),
+                );
+                response
+            }
+        }),
+    )
+}
+
 fn artifact_router(state: AppState) -> Router {
     let artifact_state = state.clone();
     let output_artifact_state = state.clone();
     let preview_state = state.clone();
     let output_preview_state = state;
     let stl_state = output_preview_state.clone();
+    let companion_state = stl_state.clone();
     Router::new()
+        .route(
+            "/artifacts/{model_id}/{revision}/companion",
+            get(move |path| companion(State(companion_state.clone()), path)),
+        )
         .route(
             "/artifacts/{model_id}/{revision}/model.glb",
             get(move |path, headers| geometry(State(artifact_state.clone()), path, headers)),
@@ -679,6 +759,41 @@ async fn geometry(
         Err(response) => return response,
     };
     geometry_response(state, model_id, revision, output_id, headers).await
+}
+
+async fn companion(
+    State(state): State<AppState>,
+    Path((model_id, revision)): Path<(String, String)>,
+) -> Response {
+    let mut response = match state.repository.companion(&model_id, &revision).await {
+        Ok(Ok(Some(payload))) => axum::Json(payload).into_response(),
+        Ok(Ok(None)) | Err(RepositoryError::Invalid | RepositoryError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "companion not found"})),
+        )
+            .into_response(),
+        Ok(Err(_)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(
+                serde_json::json!({"error": "companion contains unsupported or invalid content"}),
+            ),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "companion unavailable"})),
+        )
+            .into_response(),
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn output_geometry(
@@ -1484,6 +1599,7 @@ mod tests {
         AppConfig {
             auth: AuthConfig::Disabled,
             public_base_url: "http://127.0.0.1:3000".to_owned(),
+            companion_origin: None,
             static_directory: None,
             render: RenderConfig {
                 command: vec!["/usr/bin/false".to_owned()],
@@ -1495,6 +1611,129 @@ mod tests {
             visual: VisualRendererConfig::Disabled,
             watch_capacity: 4,
         }
+    }
+
+    #[test]
+    fn companion_origin_requires_exact_separate_secure_origin() {
+        let public = "https://app.example.test/";
+        assert!(validate_companion_origin(None, public, false).is_ok());
+        for origin in [
+            "https://companion.example.test",
+            "http://localhost:4100",
+            "http://127.0.0.1:4100",
+            "http://[::1]:4100",
+        ] {
+            assert!(
+                validate_companion_origin(Some(origin), public, false).is_ok(),
+                "rejected {origin}"
+            );
+        }
+        for origin in [
+            "",
+            "https://app.example.test",
+            "https://app.example.test:443",
+            "https://companion.example.test/",
+            "https://companion.example.test/path",
+            "https://user:secret@companion.example.test",
+            "https://companion.example.test?x",
+            "https://companion.example.test#x",
+            "http://companion.example.test",
+            "http://localhost.evil.test:4100",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "https://COMPANION.example.test",
+            " https://companion.example.test",
+        ] {
+            assert_eq!(
+                validate_companion_origin(Some(origin), public, false).unwrap_err(),
+                "invalid companion origin configuration",
+                "accepted {origin}"
+            );
+        }
+        for public in [
+            "https://app.example.test/path",
+            "https://secret@app.example.test",
+            "https://app.example.test?x",
+            "https://app.example.test#x",
+            "data:text/html,x",
+        ] {
+            assert!(
+                validate_companion_origin(Some("https://companion.example.test"), public, false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn companion_private_http_is_only_allowed_with_explicit_disabled_auth() {
+        let public = "http://172.16.1.40:8080";
+        for origin in [
+            "http://172.16.1.40:8082",
+            "http://10.0.0.2:8082",
+            "http://192.168.1.2:8082",
+            "http://169.254.1.2:8082",
+            "http://[fd00::2]:8082",
+        ] {
+            assert!(validate_companion_origin(Some(origin), public, true).is_ok());
+            assert!(validate_companion_origin(Some(origin), public, false).is_err());
+        }
+        for origin in [
+            public,
+            "http://8.8.8.8:8082",
+            "http://companion.example.test:8082",
+            "http://172.16.1.40:8082/path",
+            "http://172.16.1.40:8082/",
+        ] {
+            assert!(validate_companion_origin(Some(origin), public, true).is_err());
+        }
+        let mut config = disabled_config();
+        config.public_base_url = public.into();
+        config.companion_origin = Some("http://172.16.1.40:8082".into());
+        let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), config)
+            .await
+            .unwrap();
+        let response = artifact_request(runtime.router(), "/runtime-config".into()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"companion_origin": "http://172.16.1.40:8082"})
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_config_disabled_mode_returns_only_public_origin_without_caching() {
+        for origin in [None, Some("https://companion.example.test".to_owned())] {
+            let mut config = disabled_config();
+            config.companion_origin = origin.clone();
+            let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), config)
+                .await
+                .unwrap();
+            let response = artifact_request(runtime.router(), "/runtime-config".into()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"companion_origin": origin})
+            );
+        }
+        let mut invalid = disabled_config();
+        invalid.companion_origin = Some(invalid.public_base_url.clone());
+        assert_eq!(
+            build_runtime(Arc::new(InMemoryObjectStore::default()), invalid)
+                .await
+                .unwrap_err(),
+            "invalid companion origin configuration"
+        );
     }
 
     #[test]
@@ -1510,6 +1749,435 @@ mod tests {
 
     async fn artifact_request(router: Router, path: String) -> Response {
         artifact_request_with_header(router, path, None).await
+    }
+
+    async fn completed_companion_model(
+        runtime: &Runtime,
+        id: &str,
+        html: &str,
+    ) -> crate::model::ModelRecord {
+        use crate::model::project::ProjectFile;
+        let model = runtime
+            .repository()
+            .create_project_from_files(
+                id,
+                "Companion",
+                vec![
+                    ProjectFile {
+                        path: "main.py".into(),
+                        content: "first # private-python-sentinel".into(),
+                    },
+                    ProjectFile {
+                        path: "companion/index.html".into(),
+                        content: html.into(),
+                    },
+                    ProjectFile {
+                        path: "private.json".into(),
+                        content: "private-project-sentinel".into(),
+                    },
+                ],
+                "main.py".into(),
+                vec![],
+                "private-guidance-sentinel",
+            )
+            .await
+            .expect("project");
+        runtime
+            .repository()
+            .complete_render(
+                &model.id,
+                &model.desired_source_revision,
+                rendered(b"glTF-companion"),
+            )
+            .await
+            .expect("render");
+        model
+    }
+
+    async fn companion_auth_fixture() -> (
+        kuri_server::access_auth::AccessAuthenticator,
+        kuri_server::access_auth::AccessAuthStore,
+        tempfile::TempDir,
+        String,
+    ) {
+        use kuri_server::{
+            access_auth::{
+                AccessAuthConfig, AccessAuthHttpClient, AccessAuthStore, AccessAuthenticator,
+                OidcConfig,
+            },
+            persistence::{DatabaseConfig, Persistence},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "token_endpoint_auth_methods_supported": ["none"]
+        });
+        let provider = Router::new()
+            .route("/.well-known/openid-configuration", get(move || { let metadata = metadata.clone(); async move { axum::Json(metadata) } }))
+            .route("/jwks", get(|| async { axum::Json(serde_json::json!({"keys": [{"kty": "RSA", "kid": "fixture", "alg": "RS256", "use": "sig", "n": "AQAB", "e": "AQAB"}]})) }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = Persistence::initialize(
+            DatabaseConfig::from_sqlite_paths(
+                directory.path().join("auth.sqlite"),
+                directory.path().join("mcp.sqlite"),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let config = OidcConfig::new(
+            issuer.clone(),
+            "companion-browser",
+            None,
+            "http://127.0.0.1/oidc/callback",
+            "companion-api",
+            vec!["openid".into()],
+            Duration::from_hours(1),
+            true,
+            true,
+        )
+        .unwrap();
+        let auth = AccessAuthenticator::initialize(
+            AccessAuthConfig::oidc(config),
+            &persistence,
+            AccessAuthHttpClient::build(reqwest::Client::builder()).unwrap(),
+        )
+        .await
+        .unwrap();
+        task.abort();
+        (auth, AccessAuthStore::new(&persistence), directory, issuer)
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "browser-session lifecycle for both protected companion endpoints"
+    )]
+    async fn companion_requires_browser_cookie_and_never_accepts_bearer_or_invalid_sessions() {
+        use kuri_server::access_auth::{BrowserSession, BrowserSessionTokenDigest};
+        let (auth, store, _directory, issuer) = companion_auth_fixture().await;
+        let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), disabled_config())
+            .await
+            .unwrap();
+        let model = completed_companion_model(&runtime, "page", "<p>Authenticated page</p>").await;
+        // Production wraps this same artifact router with this exact middleware.
+        let router = runtime.router().layer(middleware::from_fn_with_state(
+            auth,
+            require_browser_session,
+        ));
+        let path = format!(
+            "/artifacts/{}/{}/companion",
+            model.id, model.desired_source_revision
+        );
+        for header in [
+            None,
+            Some((
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer private-bearer"),
+            )),
+            Some((
+                header::COOKIE,
+                HeaderValue::from_static("kuri-session-local=invalid"),
+            )),
+        ] {
+            let config_response = artifact_request_with_header(
+                router.clone(),
+                "/runtime-config".into(),
+                header.clone(),
+            )
+            .await;
+            assert_eq!(config_response.status(), StatusCode::SEE_OTHER);
+            assert!(
+                to_bytes(config_response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let response = artifact_request_with_header(router.clone(), path.clone(), header).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert!(
+                response.headers()[header::LOCATION]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("/oidc/login?return_to=")
+            );
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let now = std::time::SystemTime::now();
+        let digest = BrowserSessionTokenDigest::from_token("fixture-session");
+        store
+            .insert_browser_session(&BrowserSession {
+                token_digest: digest.clone(),
+                issuer,
+                client_id: "companion-browser".into(),
+                subject: "owner".into(),
+                created_at: now,
+                expires_at: now + Duration::from_mins(1),
+                last_seen_at: now,
+            })
+            .await
+            .unwrap();
+        let cookie = Some((
+            header::COOKIE,
+            HeaderValue::from_static("kuri-session-local=fixture-session"),
+        ));
+        assert_eq!(
+            artifact_request_with_header(router.clone(), path.clone(), cookie.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let config_response =
+            artifact_request_with_header(router.clone(), "/runtime-config".into(), cookie.clone())
+                .await;
+        assert_eq!(config_response.status(), StatusCode::OK);
+        assert_eq!(
+            config_response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            config_response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        store
+            .revoke_browser_session(&digest, std::time::SystemTime::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_request_with_header(router.clone(), "/runtime-config".into(), cookie.clone())
+                .await
+                .status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            artifact_request_with_header(router, path, cookie)
+                .await
+                .status(),
+            StatusCode::SEE_OTHER
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn companion_json_confidentiality_absence_and_independent_errors() {
+        let (runtime, absent) = runtime_with_completed_model().await;
+        let absent_response = artifact_request(
+            runtime.router(),
+            format!(
+                "/artifacts/{}/{}/companion",
+                absent.id, absent.desired_source_revision
+            ),
+        )
+        .await;
+        assert_eq!(absent_response.status(), StatusCode::NOT_FOUND);
+        let valid =
+            completed_companion_model(&runtime, "page", "<main><h1>Dimensions</h1></main>").await;
+        let response = artifact_request(
+            runtime.router(),
+            format!(
+                "/artifacts/{}/{}/companion",
+                valid.id, valid.desired_source_revision
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["format"], "faktory-companion-v1");
+        assert_eq!(payload["revision"], valid.desired_source_revision);
+        assert_eq!(payload["kit_version"], "1");
+        assert_eq!(payload["html"], "<main><h1>Dimensions</h1></main>");
+        assert_eq!(payload.as_object().unwrap().len(), 6);
+        for secret in [
+            "private-python-sentinel",
+            "private-project-sentinel",
+            "private-guidance-sentinel",
+            "AGENTS.md",
+            "main.py",
+            "private.json",
+        ] {
+            assert!(!String::from_utf8_lossy(&body).contains(secret));
+        }
+        for suffix in [
+            "companion/main.py",
+            "companion/assets/../private.json",
+            "private.json",
+            "companion/index.html",
+        ] {
+            assert_ne!(
+                artifact_request(
+                    runtime.router(),
+                    format!(
+                        "/artifacts/{}/{}/{suffix}",
+                        valid.id, valid.desired_source_revision
+                    )
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        let invalid = completed_companion_model(
+            &runtime,
+            "unsafe-page",
+            "<script>private-authored-script</script>",
+        )
+        .await;
+        let response = artifact_request(
+            runtime.router(),
+            format!(
+                "/artifacts/{}/{}/companion",
+                invalid.id, invalid.desired_source_revision
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "companion contains unsupported or invalid content"
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("private-authored-script"));
+        assert_eq!(
+            artifact_request(
+                runtime.router(),
+                format!(
+                    "/artifacts/{}/{}/model.glb",
+                    invalid.id, invalid.desired_source_revision
+                )
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let record = runtime
+            .repository()
+            .get_model(&invalid.id)
+            .await
+            .unwrap()
+            .record;
+        assert_eq!(record.render_state, crate::model::StoredRenderState::Ready);
+        assert!(record.render_error.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn companion_exact_current_successful_revision_preserves_last_good_page() {
+        let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), disabled_config())
+            .await
+            .unwrap();
+        let first = completed_companion_model(&runtime, "page", "<p>Page</p>").await;
+        let path = format!(
+            "/artifacts/{}/{}/companion",
+            first.id, first.desired_source_revision
+        );
+        let replacement = runtime
+            .repository()
+            .edit_project(
+                &first.id,
+                &first.desired_source_revision,
+                None,
+                Some(
+                    &crate::model::project::ProjectEdit::new(vec![
+                        crate::model::project::ProjectOperation::FilePatch {
+                            path: "companion/index.html".into(),
+                            patches: vec![crate::model::project::ExactPatch {
+                                old: "Page".into(),
+                                new: "New page".into(),
+                            }],
+                        },
+                    ])
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .record;
+        let new_path = format!(
+            "/artifacts/{}/{}/companion",
+            first.id, replacement.desired_source_revision
+        );
+        assert_eq!(
+            artifact_request(runtime.router(), new_path.clone())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        runtime
+            .repository()
+            .fail_render(
+                &first.id,
+                &replacement.desired_source_revision,
+                "safe failure",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_request(runtime.router(), path.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            artifact_request(runtime.router(), new_path.clone())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        runtime.repository().retry_render(&first.id).await.unwrap();
+        runtime
+            .repository()
+            .complete_render(
+                &first.id,
+                &replacement.desired_source_revision,
+                rendered(b"glTF-new"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_request(runtime.router(), path).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            artifact_request(runtime.router(), new_path).await.status(),
+            StatusCode::OK
+        );
+        for revision in ["invalid".to_owned(), "0".repeat(64)] {
+            assert_eq!(
+                artifact_request(
+                    runtime.router(),
+                    format!("/artifacts/{}/{revision}/companion", first.id)
+                )
+                .await
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 
     async fn artifact_request_with_header(

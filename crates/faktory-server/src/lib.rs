@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod companion;
 pub mod mcp;
 pub mod migrations;
 pub mod model;

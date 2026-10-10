@@ -6,6 +6,8 @@
 | [proto/](proto/) | Authoritative protobuf sources and generated browser bindings. |
 | [docs/](docs/) | Indexed MVP architecture, operations, and quality contracts. |
 | [skills/](skills/) | Compile-time public MCP workflow assets; distinct from generated project AGENTS.md. |
+| [packages/companion-kit/](packages/companion-kit/) | Trusted general-purpose companion components and bounded cut-layout helpers. |
+| [apps/companion-host/](apps/companion-host/) | Separate static host for opaque sandboxed companion frames. |
 | [compose.yaml](compose.yaml) | Deterministic local Faktory, Garage, and PostgreSQL integration topology. |
 | [Dockerfile](Dockerfile) | Multi-stage production image for the server, renderer, and SPA. |
 | [infra/pulumi/](infra/pulumi/) | Preview Kubernetes, PostgreSQL, Authentik, and networking declarations. |
@@ -21,7 +23,8 @@
 - Read [docs/README.md](docs/README.md) before changing behavior or contracts.
 - The local MVP implementation, image, Compose environment, and preview declarations exist. No Faktory service is deployed and no external system is configured or mutated.
 - Keep geometry transfer out of protobuf; authenticated HTTP owns GLB delivery.
-- Treat `proto/faktory/v1/faktory.proto` as the browser wire authority; keep model projects and dependency source MCP-only.
+- Treat `proto/faktory/v1/faktory.proto` as the browser wire authority; keep project and dependency source MCP-only except selected sanitized companion presentation.
+- Follow [the companion contract](docs/architecture/spec/companion.md) for presentation selection, compiler limits, runtime configuration, and isolated frames.
 - Follow [the model-project contract](docs/architecture/model-projects-dependencies.md) for v2 projects, model releases, and MCP tools. Follow [the object-store migration contract](docs/operations/object-store-migrations.md) for the destructive cutover.
 - Preserve Rust 1.96, edition 2024, Buf v2 `STANDARD` lint, and `FILE` breaking policy.
 - Keep uv authoritative for native renderer development and tests; image builds consume the committed conda explicit lock matching BuildKit `TARGETARCH`.

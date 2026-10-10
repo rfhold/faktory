@@ -41,6 +41,10 @@ vi.mock("../viewer/ModelViewer", () => ({
   ModelViewer: (props: { url: string }) => <div data-testid="viewer" data-url={props.url}>Model viewer</div>,
 }));
 
+vi.mock("../companion/CompanionPanel", () => ({
+  CompanionPanel: (props: { revision: string; stale: boolean }) => <div data-testid="companion" data-revision={props.revision} data-stale={String(props.stale)}>Model companion</div>,
+}));
+
 import { ModelPage } from "./ModelPage";
 
 const disposers: Array<() => void> = [];
@@ -63,6 +67,17 @@ function output(outputId: string, role: OutputRole, primary: boolean, volume: nu
 }
 
 describe("ModelPage outputs", () => {
+  it("passes last-good guide revision and stale state independently of geometry", () => {
+    const [model, setModel] = createSignal(create(ModelSchema, { id: "model/a", desiredSourceRevision: "new", currentSuccessfulSourceRevision: "last-good" }));
+    mocks.model = model;
+    const host = document.createElement("div");document.body.append(host);
+    disposers.push(render(() => <ModelPage />, host));
+    expect(host.querySelector('[data-testid="viewer"]')).toBeNull();
+    expect(host.querySelector('[data-testid="companion"]')?.getAttribute("data-revision")).toBe("last-good");
+    expect(host.querySelector('[data-testid="companion"]')?.getAttribute("data-stale")).toBe("true");
+    setModel(create(ModelSchema, { id: "model/a", desiredSourceRevision: "new", currentSuccessfulSourceRevision: "new" }));
+    expect(host.querySelector('[data-testid="companion"]')?.getAttribute("data-stale")).toBe("false");
+  });
   it("selects outputs in declared order and resets to primary for a replacement revision", () => {
     const [model, setModel] = createSignal(create(ModelSchema, {
       id: "model/a",

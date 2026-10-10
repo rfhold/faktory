@@ -6,6 +6,10 @@ The implemented hard cutover is defined by [Model Projects and Dependencies](doc
 
 The implemented multipart result contract is defined by [Multipart Design Bundles](docs/architecture/design-bundles.md), with storage and protocol details in the linked architecture documents. Preserve project revision identity, exact locks, source confidentiality, current-only artifact gates, retained-last-good behavior, and all-output atomicity. Direct CadQuery result types remain valid. Migration `0002` deletes all pre-cutover revisions instead of preserving storage compatibility.
 
+[Model Companions](docs/architecture/companion.md) defines optional caller presentation files and general-purpose author examples.
+[The companion specification](docs/architecture/spec/companion.md) limits the browser source exception to selected sanitized root companion presentation.
+Preserve authenticated retrieval, current-successful selection, geometry independence, opaque frames, and content-free telemetry.
+
 ## Toolchains
 
 - Rust `1.96.0` with edition 2024.
@@ -44,9 +48,13 @@ pnpm run web:test
 pnpm run visual-renderer:typecheck
 pnpm run visual-renderer:build
 pnpm run visual-renderer:test
+pnpm run companion:typecheck
+pnpm run companion:build
+pnpm run companion:test
+pnpm run companion:browser
 uv sync --frozen
 uv run python -m unittest discover
-python -m unittest discover .tekton -p '*_test.py'
+python3 -m unittest discover .tekton -p '*_test.py'
 cd infra/pulumi
 bun install --frozen-lockfile
 bun run build
@@ -56,17 +64,37 @@ docker compose config --quiet
 git diff --check
 ```
 
-Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Preview runs each Faktory image's matching native renderer check before manifest publication; release promotes the existing preview digests without rebuilding or repeating native functional checks.
+Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Preview runs each Faktory image's matching native renderer check before manifest publication.
+Release promotes selected preview digests without image builds or repeated CadQuery and visual-renderer checks.
+It performs a fresh packaged companion-host smoke check on its selected digest.
 
-The preview pipeline exercises each native Faktory image with a small explicit multipart `Design`, validating the manifest, primary and secondary worker artifacts, GLB framing, and absence of server-owned shaded files. It builds `faktory-visual-renderer` only for AMD64 from the `visual-renderer-runtime` target. A native AMD64 task starts the packaged service under the production hardening policy. It renders a colored GLB and validates all seven PNG responses. Both pipelines deploy the server and worker by immutable digest.
+The preview pipeline exercises each native Faktory image with an explicit multipart `Design` and validates its complete worker artifacts.
+It builds `faktory-visual-renderer` for AMD64 from `visual-renderer-runtime` and validates seven colored PNG responses under the production hardening policy.
+It also builds the AMD64 `faktory-companion-host` image from `companion-runtime` and exercises the packaged static host.
+BuildKit metadata supplies the companion digest; smoke verification, runtime-user/revision checks, and preview deployment use that exact reference.
+Both pipelines supply all three images by immutable digest.
+An optional `companionHostname` controls companion resource creation.
+Production declares `companion-faktory.holdenitdown.net`; preview declares `preview-companion-faktory.holdenitdown.net`.
+Internal ExternalDNS reconciles the HTTPRoute hostnames; public DNS remains separate.
 
 ## Releases
 
 A release requires a committed remote `main` branch, a successful preview run for the exact release commit, and an annotated, signed `vX.Y.Z` tag trusted by `faktory-release-trusted-signers`. The tag must point to a commit in `origin/main`. The version must equal both `[workspace.package].version` in `Cargo.toml` and `version` in `web/package.json`.
 
-The release pipeline accepts only an exact stable semantic-version tag. It verifies the webhook SHA, tag signature, trusted signer, and `origin/main` ancestry. After Gitleaks passes, it resolves `faktory:preview-<full-commit-SHA>` and `faktory-visual-renderer:preview-<full-commit-SHA>-amd64`. It validates both server platforms and the AMD64 worker's Linux config, user `65532:65532`, and OCI revision. There is no release build, native functional check, new manifest, or rebuild fallback.
+The release pipeline accepts only an exact stable semantic-version tag.
+It verifies the webhook SHA, tag signature, trusted signer, and `origin/main` ancestry.
+After Gitleaks passes, it resolves the exact commit's main, visual-renderer, and companion-host preview aliases.
+It selects the companion alias once and smoke-checks the selected immutable digest before promotion.
+It validates both server platforms and both AMD64 service configs, user `65532:65532`, and OCI revision.
+There is no release build, repeated renderer check, new manifest, or rebuild fallback.
 
-Before the first copy, both stable `vX.Y.Z` aliases must be explicitly absent or already match their respective source digests. Lookup authorization and network failures fail closed. Digest-based copies preserve the existing preview bytes, and both aliases must verify equal before Pulumi receives the original digests for `prod` through `image` and `visualRendererImage`. The pipeline does not publish a floating alias. Follow [Deployment and Releases](docs/operations/deployment-releases.md) for evidence, retry, and rollback boundaries.
+Before the first copy, all three stable `vX.Y.Z` aliases must be explicitly absent or equal their source digests.
+Lookup authorization and network failures fail closed.
+Digest-based copies preserve the preview bytes.
+Pulumi receives the selected digests through `image`, `visualRendererImage`, and `companionImage` only after all stable aliases verify equal.
+The companion digest equals the release smoke-tested digest, not an inferred prior preview-run digest.
+The pipeline publishes no floating alias.
+Follow [Deployment and Releases](docs/operations/deployment-releases.md) for evidence, retry, and rollback boundaries.
 
 ## Renderer Environments
 
@@ -130,6 +158,11 @@ Compose initializes Garage and Faktory PostgreSQL from named volumes. It also st
 
 Faktory uses `FAKTORY_VISUAL_RENDERER_URL=http://visual-renderer:8081` and `FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS=30`. Faktory waits for the worker readiness check before startup.
 
+Compose also publishes the static companion host on `http://172.16.1.40:8082`.
+Faktory supplies that origin through runtime configuration; the host permits parent `http://172.16.1.40:8080`.
+Different local ports separate origins, not cookie domains.
+Restrict TCP `8082` as well as `8080` to the trusted private network.
+
 Faktory runs with exact `FAKTORY_AUTH_MODE=disabled`. The SPA, gRPC-web, artifact, and MCP routes require no cookie or bearer token. The Faktory image build selects the native Linux AMD64 or ARM64 renderer lock automatically.
 
 All fixed Compose credentials are local-development-only. Compose publishes Faktory on every host interface at `0.0.0.0:8080`, with canonical public base URL `http://172.16.1.40:8080`. Use this unauthenticated service only on a trusted private network, and restrict TCP 8080 with the host firewall. Garage remains bound to loopback, and the visual renderer has no host port. Exact `FAKTORY_AUTH_MODE=disabled` bypasses OAuth and redirect validation; generated absolute, callback, authorization, and resource URLs still use the configured public base. No sign-in or MCP OAuth flow runs locally:
@@ -139,10 +172,14 @@ docker compose build
 docker compose up --wait --wait-timeout 180
 curl --fail http://172.16.1.40:8080/health
 curl --fail http://172.16.1.40:8080/ready
+curl --fail http://172.16.1.40:8080/runtime-config
+curl --fail http://172.16.1.40:8082/health
+curl --fail http://172.16.1.40:8082/ready
 docker compose down --volumes --remove-orphans
 ```
 
-Use `docker compose logs faktory visual-renderer garage garage-init postgres` to inspect startup failures. The cleanup command removes all local application and storage state.
+Use `docker compose logs faktory visual-renderer companion-host garage garage-init postgres` to inspect startup failures.
+The cleanup command removes all local application and storage state.
 
 Tests and checks prove local source and declaration consistency. Compose exercises only explicit disabled authentication mode; it does not exercise or prove production Authentik, hosted MCP OAuth, Ceph, ingress, TLS, or deployed behavior. When `FAKTORY_AUTH_MODE` is absent, the server defaults to production authentication and fails closed if its required production configuration is missing or invalid.
 

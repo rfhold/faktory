@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import * as pulumi from "@pulumi/pulumi";
-import { requireImmutableImage, validateHttpsOrigin } from "./policy";
+import { companionConfiguration, requireImmutableImage, validateHttpsOrigin } from "./policy";
 
 interface ResourceRecord { type: string; name: string; inputs: Record<string, any>; rawInputs: Record<string, any>; }
 const resources: ResourceRecord[] = [];
@@ -73,6 +73,19 @@ after(() => {
 });
 
 describe("configuration policy", () => {
+  test("companion defaults off and requires a separate hostname and immutable digest", () => {
+    assert.equal(companionConfiguration(undefined, undefined, "app.example.test"), undefined);
+    assert.equal(resources.some(({ name }) => name.startsWith("faktory-companion-host")), false);
+    assert.equal(resource("kubernetes:core/v1:Secret", "faktory-app").inputs.stringData.FAKTORY_COMPANION_ORIGIN, undefined);
+    for (const hostname of ["app.example.test", "child.app.example.test", "example.test", "https://host.test", "*.host.test"]) {
+      assert.throws(() => companionConfiguration(hostname, `registry.test/companion@sha256:${"c".repeat(64)}`, "app.example.test"));
+    }
+    assert.throws(() => companionConfiguration("isolated.example.test", undefined, "app.example.test"));
+    assert.throws(() => companionConfiguration("isolated.example.test", "registry.test/companion:latest", "app.example.test"));
+    assert.deepEqual(companionConfiguration("isolated.example.test", `registry.test/companion@sha256:${"c".repeat(64)}`, "app.example.test"), {
+      hostname: "isolated.example.test", origin: "https://isolated.example.test", image: `registry.test/companion@sha256:${"c".repeat(64)}`,
+    });
+  });
   test("requires immutable images and credential-free HTTPS origins", () => {
     assert.equal(requireImmutableImage(`registry.test/faktory@sha256:${"b".repeat(64)}`).includes("@sha256:"), true);
     assert.throws(() => requireImmutableImage("registry.test/faktory:main"));

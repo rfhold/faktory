@@ -9,6 +9,8 @@ These documents define repository-implemented MVP behavior and identify implemen
 | [MCP Skills](mcp-skills.md) | Embedded public workflows, complete raw-byte manifests, and unchanged transport/access boundaries. |
 | [Model projects and dependencies](model-projects-dependencies.md) | V2 bundles, model releases, exact dependency closure, MCP operations, and compatible rollout. |
 | [Multipart design bundles](design-bundles.md) | Versioned Python results, named outputs, primary selection, compatibility, and exclusions. |
+| [Model companions](companion.md) | Passive author files, generic components, revision workflow, and optional cut examples. |
+| [Companion specification](spec/companion.md) | Six-field browser payload, bounds, source exception, isolated frame, and explicit cut data. |
 | [Storage and rendering](storage-rendering.md) | Garage keys, render recipes, project revision state, and render caches. |
 | [Access and authentication](access-authentication.md) | Browser and MCP authentication, visual-worker isolation, and data boundaries. |
 | [Observability and browser telemetry](observability.md) | Server logs, OTLP traces and metrics, Pyroscope profiling, and Faro collection. |

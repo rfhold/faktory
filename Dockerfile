@@ -4,18 +4,31 @@ ARG RUST_VERSION=1.96.0
 ARG NODE_VERSION=24.8.0
 ARG REVISION=unknown
 
-FROM node:${NODE_VERSION}-bookworm-slim AS web-build
+FROM node:${NODE_VERSION}-bookworm-slim AS web-dependencies
 
 ENV COREPACK_HOME=/corepack
 WORKDIR /workspace
 RUN corepack enable && corepack prepare pnpm@10.34.3 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY web/package.json web/package.json
+COPY packages/companion-kit/package.json packages/companion-kit/package.json
+COPY apps/companion-host/package.json apps/companion-host/package.json
+COPY apps/visual-renderer/package.json apps/visual-renderer/package.json
 RUN --mount=type=cache,id=faktory-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && pnpm install --frozen-lockfile
+
+FROM web-dependencies AS web-build
 COPY proto/gen/ts proto/gen/ts
 COPY web web
-RUN pnpm run web:build
+COPY packages/companion-kit packages/companion-kit
+ARG VITE_COMPANION_ORIGIN=
+ENV VITE_COMPANION_ORIGIN=${VITE_COMPANION_ORIGIN}
+RUN pnpm --dir packages/companion-kit build && pnpm run web:build
+
+FROM web-dependencies AS companion-build
+COPY packages/companion-kit packages/companion-kit
+COPY apps/companion-host apps/companion-host
+RUN pnpm --dir packages/companion-kit build && pnpm --dir apps/companion-host build
 
 FROM node:${NODE_VERSION}-bookworm-slim AS visual-renderer-build
 
@@ -28,6 +41,8 @@ RUN case "${TARGETARCH}" in amd64) ;; *) echo "visual renderer supports only TAR
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY web/package.json web/package.json
 COPY apps/visual-renderer/package.json apps/visual-renderer/package.json
+COPY packages/companion-kit/package.json packages/companion-kit/package.json
+COPY apps/companion-host/package.json apps/companion-host/package.json
 RUN --mount=type=cache,id=faktory-visual-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && pnpm install --frozen-lockfile
 COPY proto/gen/ts proto/gen/ts
@@ -131,3 +146,15 @@ COPY --from=visual-renderer-build /ms-playwright /ms-playwright
 EXPOSE 8081
 USER 65532:65532
 ENTRYPOINT ["node", "/opt/visual-renderer/dist/index.js"]
+
+FROM node:${NODE_VERSION}-bookworm-slim AS companion-runtime
+ARG REVISION
+LABEL org.opencontainers.image.source="https://git.holdenitdown.net/rfhold/faktory" \
+      org.opencontainers.image.revision="${REVISION}"
+ENV NODE_ENV=production PORT=8082
+WORKDIR /opt/companion-host
+COPY --from=companion-build /workspace/apps/companion-host/dist /opt/companion-host/dist
+COPY --from=companion-build /workspace/apps/companion-host/package.json /opt/companion-host/package.json
+USER 65532:65532
+EXPOSE 8082
+ENTRYPOINT ["node", "/opt/companion-host/dist/server.js"]

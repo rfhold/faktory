@@ -17,8 +17,13 @@ pnpm run web:test
 pnpm run visual-renderer:build
 pnpm run visual-renderer:typecheck
 pnpm run visual-renderer:test
+pnpm run companion:typecheck
+pnpm run companion:build
+pnpm run companion:test
+pnpm run companion:browser
 uv sync --frozen
 uv run python -m unittest discover
+python3 -m unittest discover .tekton -p '*_test.py'
 (cd infra/pulumi && bun install --frozen-lockfile && bun run build && bun run test)
 docker compose config --quiet
 git diff --check
@@ -122,9 +127,59 @@ Artifact route tests must also cover browser-only STL access, no MCP STL transpo
 
 Catalog tests must prove one row per model and lazy primary-preview fetches. They must verify semantic labels for primary volume and x/y/z dimensions. Models without successful geometry must show unavailable facts. Model-page tests must cover selected-output STL links, revision-specific browser filenames, last-good links during replacement failure, and unavailable download states. Accessibility tests must cover useful preview alternatives, keyboard access, and status announcements. Responsive tests must cover narrow and wide viewports without clipped facts or controls.
 
-Negative tests must prove that credentials, tokens, project or dependency source, AGENTS content, requirements, locks, project docs, GLB, STL, SVG, PNG bytes, object-store internals, and raw renderer output do not leak through logs, signals, errors, protobuf, or browser diagnostics. Authorized browser artifact responses intentionally deliver GLB, SVG, and STL bytes, never source. Exact source-bearing content appears only in authorized MCP model results. Open and release-metadata results must omit indexed bodies. Bounded tools must not exceed their content and result caps. PNGs appear only in authorized binary resources or semantic on-demand query results. Worker, export, rollout, and migration logs and errors must follow the same boundary. Browser tests enforce the Faro boundary in [`../architecture/observability.md`](../architecture/observability.md).
+Negative tests must prove that private source, companion content, credentials, artifact bytes, and storage internals never enter server signals or browser diagnostics.
+Authorized browser artifacts intentionally deliver GLB, SVG, STL, and selected sanitized companion presentation, not generic source.
+All other exact project source appears only in authorized MCP results.
+Open and release-metadata results must omit indexed bodies.
+Bounded tools must preserve their content and result caps.
+PNG responses remain limited to authorized binary resources or semantic query results.
+Worker, export, companion, rollout, and migration errors must preserve the same confidentiality boundary.
+Browser tests enforce the Faro boundary in [`../architecture/observability.md`](../architecture/observability.md).
 
 Docker hardening tests must inspect both runtime images. Visual-worker checks must prove that the image excludes the SPA, Rust server, and CadQuery environment. Chromium launch tests must prove `chromiumSandbox: true` and absence of `--no-sandbox`. Security declaration tests must retain the narrow worker-only seccomp exception and all compensating controls.
+
+## Companion Checks
+
+Run from the repository root:
+
+```bash
+cargo +1.96.0 test --locked -p faktory-server companion
+pnpm run companion:typecheck
+pnpm run companion:build
+pnpm run companion:test
+pnpm run companion:browser
+pnpm run web:test
+python3 -m unittest discover .tekton -p '*_test.py'
+```
+
+`companion:browser` builds the kit and host, starts disposable local test servers, and exercises Chromium.
+It uses `CHROMIUM_EXECUTABLE_PATH`, Playwright Chromium, or the local macOS Google Chrome fallback.
+If no executable exists, the browser check fails rather than skips.
+It does not contact preview or production.
+Keep unit, browser, packaged image, declaration, pipeline, and live evidence distinct.
+
+Required companion coverage includes these contracts:
+
+- Generic and bench fixtures, passive HTML, inline SVG, asset references, native layout, and all optional kit elements.
+- CSS parser attacks, SVG external references, scripts, events, forms, frames, navigation, meta/base, resource escapes, and runtime defenses.
+- Iterative SVG preflight before recursive parsing, exact node/depth boundaries, malformed structure, DTD/entity rejection, and passive `@page` acceptance.
+- Exact six-field payload, kit version, compiler byte/asset/node/depth bounds, constant `422`, absent/obsolete `404`, and authentication.
+- Current-successful selection, last-good retention, stale notices, ordinary CAD work after companion edits, and independent geometry success.
+- Authenticated no-store runtime configuration, no per-environment SPA bytes, distinct origins, and no generic file route.
+- Opaque sandbox, no same-origin permission, credentialless/no-referrer, exact parent allowlist, fresh nonce/revision, channel disposal, and blob revocation.
+- Generic responsive layout, keyboard access, useful diagram alternatives, trusted explicit print, and no companion content in telemetry.
+- Explicit mm board/sheet data, grain, rotation, kerf, quantities, placement bounds, non-overlap, stock limits, metrics, and deterministic heuristics.
+- Required string IDs and boolean part rotation, 16-widget/128-reference caps, aggregate node/byte budgets, cache clones, and SVG blob reuse.
+
+Pulumi tests must cover absent resources when `companionHostname` is omitted and the explicit preview and production companion hostnames.
+They must cover distinct hostname validation, immutable image requirements, exact runtime origins, and no-egress hardening.
+Pipeline tests must cover all-three-image preflight, packaged companion verification, exact-byte promotion, digest propagation, and no deployment after partial failure.
+Preview tests must bind BuildKit metadata, packaged smoke verification, config checks, and deployment to the same companion digest.
+Release tests must bind one alias selection, a fresh packaged smoke check, promotion, and deployment to the same companion digest.
+Do not describe release smoke evidence as proof of equality with an earlier preview run's digest.
+The companion host image must exclude the SPA, Rust server, CadQuery runtime, private model data, and authentication credentials.
+Compose tests must include host probes and runtime configuration at ports `8082` and `8080`.
+Different local ports do not prove cookie isolation or production browser-session behavior.
 
 ## Evidence Boundary
 

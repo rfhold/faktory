@@ -1,0 +1,19 @@
+{
+  "format": "faktory-companion-v1",
+  "revision": "fixture-1",
+  "kit_version": "1",
+  "html": "<article><h1>Bench assembly</h1><fk-callout>Lengths in mm between outside points. Verify actual material before cutting.</fk-callout><fk-tabs><section data-tab='Assembly'><fk-steps><section><h2>Prepare parts</h2><p>Check the explicit part table, not bounding boxes.</p></section><section><h2>Dry fit</h2><p>Check square before joining.</p></section></fk-steps></section><section data-tab='Parts'><table><caption>Explicit cut list</caption><thead><tr><th>Part</th><th>Length mm</th><th>Count</th></tr></thead><tbody><tr><td>Leg</td><td>700</td><td>4</td></tr></tbody></table><img data-companion-asset='assets/bench.svg' alt='Bench profile'><fk-cut-layout data-companion-asset='assets/cuts.json'></fk-cut-layout></section></fk-tabs></article>",
+  "css": "h1{color:#315d50}",
+  "assets": [
+    {
+      "id": "assets/bench.svg",
+      "mime_type": "image/svg+xml",
+      "content": "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 300 100'><rect x='20' y='20' width='260' height='15' fill='#42695c'/><rect x='40' y='35' width='15' height='60' fill='#42695c'/><rect x='245' y='35' width='15' height='60' fill='#42695c'/></svg>"
+    },
+    {
+      "id": "assets/cuts.json",
+      "mime_type": "application/json",
+      "content": "{\"kind\":\"board\",\"input\":{\"units\":\"mm\",\"kerf\":3,\"stock\":[{\"id\":\"board\",\"length\":2400,\"count\":2}],\"parts\":[{\"id\":\"leg\",\"length\":700,\"count\":4}]}}"
+    }
+  ]
+}

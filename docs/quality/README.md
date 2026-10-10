@@ -4,4 +4,4 @@ This domain defines focused and full local implementation, integration, privacy,
 
 | Document | Covers |
 | --- | --- |
-| [Testing](testing.md) | Protocol, v2 projects, model releases, dependencies, migrations, rendering, isolation, storage, and evidence contracts. |
+| [Testing](testing.md) | Protocol, projects, dependencies, migrations, rendering, companions, isolation, storage, and evidence contracts. |

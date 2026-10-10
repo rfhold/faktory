@@ -11,7 +11,11 @@
     "web:test": "pnpm --filter @rfhold/faktory-web test",
     "visual-renderer:build": "pnpm --filter @rfhold/faktory-visual-renderer build",
     "visual-renderer:typecheck": "pnpm --filter @rfhold/faktory-visual-renderer typecheck",
-    "visual-renderer:test": "pnpm --filter @rfhold/faktory-visual-renderer test"
+    "visual-renderer:test": "pnpm --filter @rfhold/faktory-visual-renderer test",
+    "companion:build": "pnpm --filter @rfhold/faktory-companion-kit build && pnpm --filter @rfhold/faktory-companion-host build",
+    "companion:typecheck": "pnpm --filter @rfhold/faktory-companion-kit typecheck && pnpm --filter @rfhold/faktory-companion-host typecheck",
+    "companion:test": "pnpm --filter @rfhold/faktory-companion-kit test && pnpm --filter @rfhold/faktory-companion-host test",
+    "companion:browser": "pnpm companion:build && pnpm --filter @rfhold/faktory-companion-host browser"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.15.0",

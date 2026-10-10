@@ -165,3 +165,6 @@ button { border: 0; cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   * { scroll-behavior: auto !important; transition: none !important; }
 }
+.companion-panel { margin: 20px 0; padding: 20px; }
+.companion-frame { display: block; width: 100%; min-height: 520px; border: 1px solid var(--border, #c9d2cf); margin-top: 16px; background: #f8f7f2; }
+@media (max-width: 640px) { .companion-panel { padding: 12px; } .companion-frame { min-height: 420px; } }

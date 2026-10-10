@@ -13,6 +13,7 @@ The repository implements the model-dependency hard cutover and multipart design
 | Garage | Persist model metadata, immutable v2 projects, model releases, revision artifacts, rollout and migration state, recipe-versioned shaded images, and named-view JSON objects. |
 | CadQuery renderer | Materialize one trusted project and its exact model dependency closure, execute the root entrypoint, and produce each declared output. |
 | Visual renderer | Render primary-only canonical and named-view shaded PNGs through isolated Node, Playwright, Chromium, and the shared Three.js recipe. |
+| Companion host | Serve trusted static bytes for opaque frames; private presentation reaches the frame only through a parent message channel. |
 | Authentik | Authenticate production browser users for server-owned sessions. |
 | Hosted MCP OAuth | Authenticate and authorize production MCP clients independently of browser sessions. |
 | Telemetry integrations | Emit bounded server logs, traces, metrics, optional CPU profiles, and production-build browser telemetry. |
@@ -33,6 +34,10 @@ The MVP runs one server replica and one AMD64 visual-renderer replica. This avoi
 The browser offers a per-output STL download only when a current-successful revision and selected output exist. The first request exports from the exact project and dependency closure; later requests use the immutable recipe-versioned cache. STL failure leaves the successful render intact. [`design-bundles.md`](design-bundles.md) defines the format and printability limits.
 
 The catalog displays one model per row. Existing browser fields and artifact URLs remain primary-output aliases. Models without successful geometry display unavailable facts.
+
+Optional [model companions](companion.md) present selected sanitized root-project HTML, CSS, SVG, and JSON beside current-successful geometry.
+The browser fetches presentation through Faktory's authenticated artifact boundary and uses a separate static host for the opaque frame.
+Companion validation failure does not invalidate geometry; ordinary companion edits still schedule CAD renders.
 
 ## Exclusions
 

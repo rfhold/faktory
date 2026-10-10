@@ -8,6 +8,7 @@ import {
 import { faktoryClient } from "../api/client";
 import { modelKeys, setViewsDefault, upsertModel } from "../api/queries";
 import { StatusBadge } from "../components/StatusBadge";
+import { CompanionPanel } from "../companion/CompanionPanel";
 import {
   formatFactsDimensions,
   formatFactsVolume,
@@ -293,6 +294,8 @@ export function ModelPage() {
                   </dl>
                 </section>
               </Show>
+
+              <CompanionPanel modelId={record().id} revision={record().currentSuccessfulSourceRevision} stale={record().desiredSourceRevision !== record().currentSuccessfulSourceRevision} />
 
               <div class="detail-grid">
                 <section class="viewer-panel panel" aria-label="Model geometry">

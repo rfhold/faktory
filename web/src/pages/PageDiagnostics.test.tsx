@@ -37,6 +37,10 @@ vi.mock("../viewer/ModelViewer", () => ({
   ModelViewer: () => <div>Model viewer</div>,
 }));
 
+vi.mock("../companion/CompanionPanel", () => ({
+  CompanionPanel: () => <div>Model companion</div>,
+}));
+
 import { CatalogPage } from "./CatalogPage";
 import { ModelPage } from "./ModelPage";
 

@@ -5,7 +5,8 @@ import * as pulumi from "@pulumi/pulumi";
 import * as random from "@pulumi/random";
 import * as tls from "@pulumi/tls";
 import { BrowserApplication } from "./authentik";
-import { requireImmutableImage, validateHostname, validateHttpsOrigin, validateSegment } from "./policy";
+import { companionConfiguration, requireImmutableImage, validateHostname, validateHttpsOrigin, validateSegment } from "./policy";
+import { declareCompanionHost } from "./companion";
 
 const config = new pulumi.Config();
 const namespaceName = validateSegment(config.require("namespace"), "namespace");
@@ -14,6 +15,7 @@ const displayName = config.require("displayName");
 const slug = validateSegment(config.require("slug"), "slug");
 const image = requireImmutableImage(config.require("image"));
 const visualRendererImage = requireImmutableImage(config.require("visualRendererImage"));
+const companion = companionConfiguration(config.get("companionHostname"), config.get("companionImage"), hostname);
 const authentikBaseUrl = validateHttpsOrigin(config.require("authentikBaseUrl"), "authentikBaseUrl");
 const s3Endpoint = validateHttpsOrigin(config.require("s3Endpoint"), "s3Endpoint");
 const backupEndpoint = validateHttpsOrigin(config.require("backupEndpoint"), "backupEndpoint");
@@ -39,6 +41,7 @@ const visualRendererLabels = { ...labels, "app.kubernetes.io/component": "visual
 const namespace = new k8s.core.v1.Namespace("faktory-namespace", {
   metadata: { name: namespaceName, labels },
 });
+if (companion) declareCompanionHost(companion, namespace.metadata.name, labels, publicUrl);
 
 const artifactsBucket = new k8s.apiextensions.CustomResource("faktory-artifacts-bucket", {
   apiVersion: "objectbucket.io/v1alpha1",
@@ -238,6 +241,7 @@ const appSecret = new k8s.core.v1.Secret("faktory-app", {
     FAKTORY_AUTH_MODE: "production",
     FAKTORY_DATABASE_URL: databaseUrl,
     FAKTORY_PUBLIC_BASE_URL: publicUrl,
+    ...(companion ? { FAKTORY_COMPANION_ORIGIN: companion.origin } : {}),
     FAKTORY_OIDC_ISSUER: browserApp.issuer,
     FAKTORY_OIDC_CLIENT_ID: browserApp.clientId,
     FAKTORY_OIDC_CLIENT_SECRET: browserApp.clientSecret,

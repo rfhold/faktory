@@ -1,7 +1,7 @@
 {
   "name": "@rfhold/faktory-web",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@rfhold/faktory-companion-kit": "workspace:*",
     "@bufbuild/protobuf": "2.15.0",
     "@connectrpc/connect": "2.2.0",
     "@connectrpc/connect-web": "2.2.0",

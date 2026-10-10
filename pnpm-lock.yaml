@@ -25,6 +25,28 @@ importers:
         specifier: 5.9.2
         version: 5.9.2
 
+  apps/companion-host:
+    dependencies:
+      '@rfhold/faktory-companion-kit':
+        specifier: workspace:*
+        version: link:../../packages/companion-kit
+    devDependencies:
+      '@types/node':
+        specifier: 20.19.43
+        version: 20.19.43
+      esbuild:
+        specifier: 0.25.12
+        version: 0.25.12
+      playwright-core:
+        specifier: 1.63.0
+        version: 1.63.0
+      typescript:
+        specifier: 5.9.2
+        version: 5.9.2
+      vitest:
+        specifier: 3.2.4
+        version: 3.2.4(@types/node@20.19.43)(happy-dom@18.0.1)
+
   apps/visual-renderer:
     dependencies:
       playwright-core:
@@ -56,6 +78,15 @@ importers:
         specifier: 3.2.4
         version: 3.2.4(@types/node@20.19.43)(happy-dom@18.0.1)
 
+  packages/companion-kit:
+    devDependencies:
+      typescript:
+        specifier: 5.9.2
+        version: 5.9.2
+      vitest:
+        specifier: 3.2.4
+        version: 3.2.4(@types/node@24.3.1)(happy-dom@18.0.1)
+
   web:
     dependencies:
       '@bufbuild/protobuf':
@@ -73,6 +104,9 @@ importers:
       '@grafana/faro-web-tracing':
         specifier: 2.11.0
         version: 2.11.0
+      '@rfhold/faktory-companion-kit':
+        specifier: workspace:*
+        version: link:../packages/companion-kit
       '@solidjs/router':
         specifier: 0.15.3
         version: 0.15.3(solid-js@1.9.15)

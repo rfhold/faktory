@@ -2,6 +2,7 @@ config:
   kubernetes:context: pantheon
   faktory:namespace: faktory-preview
   faktory:hostname: preview-faktory.holdenitdown.net
+  faktory:companionHostname: preview-companion-faktory.holdenitdown.net
   faktory:displayName: Faktory Preview
   faktory:slug: faktory-preview
   faktory:authentikBaseUrl: https://auth.holdenitdown.net

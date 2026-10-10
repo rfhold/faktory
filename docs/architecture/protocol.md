@@ -10,7 +10,7 @@ The repository implements the multipart protobuf, route, and model-dependency pr
 
 `faktory.v1.FaktoryService` provides unary `ListModels`, `GetModel`, `ListViews`, `PutView`, `DeleteView`, and `SetDefaultView`, plus server-streaming `WatchModels`. Production requires an authenticated browser session at the gRPC-web boundary. Explicit disabled mode admits the same calls without credentials. Compose exposes that mode at `http://172.16.1.40:8080` on a trusted private network; its public-base-derived absolute URLs use the same origin.
 
-MCP remains outside the protobuf service contract. The resource-first interface in [`model-projects-dependencies.md`](model-projects-dependencies.md) registers `create`, text-only `edit`, `destroy`, `execute`, and exceptional `query`. Model, project, open, file, release, view, and stored-image reads use `faktory://` resources and templates. Source files remain MCP-only. All input objects reject unknown fields; singular `source` fields remain absent.
+MCP remains outside the protobuf service contract. The resource-first interface in [`model-projects-dependencies.md`](model-projects-dependencies.md) registers `create`, text-only `edit`, `destroy`, `execute`, and exceptional `query`. Model, project, open, file, release, view, and stored-image reads use `faktory://` resources and templates. Source files remain MCP-only except selected sanitized companion presentation. All input objects reject unknown fields; singular `source` fields remain absent.
 
 Stored canonical projections use `/images/{output_id}/{style}/{projection}` resources. Projection is isometric, front, back, left, right, top, or bottom; style is technical or shaded. Technical reads accept every current-successful output. Shaded reads accept only the primary. Missing outputs or images return not found. Resource reads return one bounded 640x480 `image/png` blob and separate JSON metadata without image bytes. Metadata includes selected output identity, dimensions, desired/rendered revisions, render state, MIME type, and `stale`; shaded metadata includes recipe `three-v2`. Pending or failed desired revisions retain the last-good image.
 
@@ -42,7 +42,15 @@ For orthographic views, `orthographic_scale` means the effective visible vertica
 
 ## Artifact HTTP
 
-Project files, dependency source, generated guidance, requirements, locks, geometry, preview, and projection bytes never travel in protobuf messages. Source text travels only through authorized MCP resources and bounded search results. Output summaries, facts, and `updated_at` travel in complete `Model` records. Projection PNGs travel only in MCP binary resources or semantic query image results, never through browser artifact URLs.
+Project files, dependency source, generated guidance, requirements, locks, geometry, preview, projection, and companion content never travel in protobuf messages.
+Source reads use authorized MCP resources and bounded search results, except selected sanitized companion presentation through authenticated HTTP.
+Output summaries, facts, and `updated_at` travel in complete `Model` records.
+Projection PNGs travel only in MCP binary resources or semantic query image results, never through browser artifact URLs.
+
+`GET /artifacts/{model_id}/{revision}/companion` returns the six-field `faktory-companion-v1` JSON payload for the current-successful revision.
+It returns `404` for absence or obsolete revisions and `422` for invalid presentation with a constant safe error.
+Authenticated no-store `GET /runtime-config` returns `{"companion_origin":string|null}` from runtime environment configuration.
+[The companion specification](spec/companion.md) owns exact fields, limits, render independence, and frame transport.
 
 The server exposes `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/model.glb`, `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/preview.svg`, and `GET /artifacts/{model_id}/{revision}/outputs/{output_id}/model.stl`. These browser routes serve any declared current-successful output. The current routes, `GET /artifacts/{model_id}/{revision}/model.glb` and `GET /artifacts/{model_id}/{revision}/preview.svg`, remain stable aliases for the primary output. No primary STL alias, 3MF route, or MCP binary STL result exists.
 

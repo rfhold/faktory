@@ -7,6 +7,10 @@ metadata:
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
   taskRunSpecs:
+    - pipelineTaskName: verify-companion-release
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: amd64
     - pipelineTaskName: promote-release
       podTemplate:
         nodeSelector:
@@ -28,6 +32,8 @@ spec:
       value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/faktory"
     - name: visual-renderer-base-image
       value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/faktory-visual-renderer"
+    - name: companion-base-image
+      value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/faktory-companion-host"
   pipelineSpec:
     params:
       - { name: repo-url, type: string }
@@ -35,6 +41,7 @@ spec:
       - { name: source-branch, type: string }
       - { name: base-image, type: string }
       - { name: visual-renderer-base-image, type: string }
+      - { name: companion-base-image, type: string }
     workspaces:
       - name: source
     tasks:
@@ -145,18 +152,74 @@ spec:
         workspaces:
           - { name: source, workspace: source }
 
-      - name: promote-release
+      - name: select-companion-release
         runAfter: [validate-release, scan-private-material]
+        taskSpec:
+          params:
+            - { name: base-image, type: string }
+            - { name: revision, type: string }
+          results:
+            - { name: image, type: string }
+          steps:
+            - name: select
+              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
+              script: |
+                #!/busybox/sh
+                set -eu
+                digest="$(crane digest "$(params.base-image):preview-$(params.revision)-amd64")"
+                printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+                printf '%s@%s' "$(params.base-image)" "$digest" > "$(results.image.path)"
+        params:
+          - { name: base-image, value: $(params.companion-base-image) }
+          - { name: revision, value: $(params.revision) }
+
+      - name: verify-companion-release
+        runAfter: [select-companion-release]
+        taskSpec:
+          params:
+            - { name: image, type: string }
+          workspaces:
+            - name: source
+          steps:
+            - name: verify-static-host
+              image: $(params.image)
+              imagePullPolicy: Always
+              env:
+                - { name: COMPANION_PARENT_ORIGINS, value: "https://app.example.test" }
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 65532
+                runAsGroup: 65532
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              script: |
+                #!/bin/sh
+                set -eu
+                node /opt/companion-host/dist/server.js &
+                server_pid=$!
+                trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+                node "$(workspaces.source.path)/.tekton/verify-companion.mjs"
+        params:
+          - { name: image, value: $(tasks.select-companion-release.results.image) }
+        workspaces:
+          - { name: source, workspace: source }
+
+      - name: promote-release
+        runAfter: [validate-release, scan-private-material, verify-companion-release]
         retries: 1
         taskSpec:
           params:
             - { name: base-image, type: string }
             - { name: visual-renderer-base-image, type: string }
+            - { name: companion-base-image, type: string }
+            - { name: tested-companion-image, type: string }
             - { name: revision, type: string }
             - { name: release-tag, type: string }
           results:
             - { name: image, type: string }
             - { name: visual-renderer-image, type: string }
+            - { name: companion-image, type: string }
           volumes:
             - name: crane-tool
               emptyDir: {}
@@ -180,9 +243,13 @@ spec:
                 crane version
                 app="$(params.base-image)"
                 worker="$(params.visual-renderer-base-image)"
+                companion="$(params.companion-base-image)"
                 app_digest="$(crane digest "$app:preview-$(params.revision)")"
                 worker_digest="$(crane digest "$worker:preview-$(params.revision)-amd64")"
-                for digest in "$app_digest" "$worker_digest"; do
+                companion_image="$(params.tested-companion-image)"
+                companion_digest="${companion_image##*@}"
+                test "$companion_image" = "$companion@$companion_digest"
+                for digest in "$app_digest" "$worker_digest" "$companion_digest"; do
                   printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
                 done
                 app_image="$app@$app_digest"
@@ -202,14 +269,15 @@ spec:
                       .config.Labels["org.opencontainers.image.revision"] == $revision)
                   ' > /dev/null
                 done
-                config="$(crane config --platform linux/amd64 "$worker_image")"
-                printf '%s' "$config" | jq -e -s --arg revision "$(params.revision)" '
-                  length == 1 and (.[0] |
-                    .os == "linux" and .architecture == "amd64" and
-                    .config.User == "65532:65532" and
-                    .config.Labels["org.opencontainers.image.revision"] == $revision)
-                ' > /dev/null
-
+                for sidecar_image in "$worker_image" "$companion_image"; do
+                  config="$(crane config --platform linux/amd64 "$sidecar_image")"
+                  printf '%s' "$config" | jq -e -s --arg revision "$(params.revision)" '
+                    length == 1 and (.[0] |
+                      .os == "linux" and .architecture == "amd64" and
+                      .config.User == "65532:65532" and
+                      .config.Labels["org.opencontainers.image.revision"] == $revision)
+                  ' > /dev/null
+                done
                 check_release() {
                   if existing="$(crane digest "$1" 2>&1)"; then
                     test "$existing" = "$2"
@@ -223,8 +291,10 @@ spec:
                 }
                 app_release="$app:$(params.release-tag)"
                 worker_release="$worker:$(params.release-tag)"
+                companion_release="$companion:$(params.release-tag)"
                 check_release "$app_release" "$app_digest"
                 check_release "$worker_release" "$worker_digest"
+                check_release "$companion_release" "$companion_digest"
                 promote() {
                   check_release "$2" "$3"
                   if [ "$release_missing" = true ]; then
@@ -234,13 +304,18 @@ spec:
                 }
                 promote "$app_image" "$app_release" "$app_digest"
                 promote "$worker_image" "$worker_release" "$worker_digest"
+                promote "$companion_image" "$companion_release" "$companion_digest"
                 test "$(crane digest "$app_release")" = "$app_digest"
                 test "$(crane digest "$worker_release")" = "$worker_digest"
+                test "$(crane digest "$companion_release")" = "$companion_digest"
                 printf '%s' "$app_image" > "$(results.image.path)"
                 printf '%s' "$worker_image" > "$(results.visual-renderer-image.path)"
+                printf '%s' "$companion_image" > "$(results.companion-image.path)"
         params:
           - { name: base-image, value: $(params.base-image) }
           - { name: visual-renderer-base-image, value: $(params.visual-renderer-base-image) }
+          - { name: companion-base-image, value: $(params.companion-base-image) }
+          - { name: tested-companion-image, value: $(tasks.select-companion-release.results.image) }
           - { name: revision, value: $(params.revision) }
           - { name: release-tag, value: $(tasks.validate-release.results.tag) }
 
@@ -251,6 +326,7 @@ spec:
           params:
             - { name: image, type: string }
             - { name: visual-renderer-image, type: string }
+            - { name: companion-image, type: string }
           workspaces:
             - name: source
           volumes:
@@ -275,11 +351,12 @@ spec:
                 test "`bun --version`" = "1.3.5"
                 test "`pulumi version`" = "v3.253.0"
                 bun install --frozen-lockfile
-                pulumi preview --stack prod --diff --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)"
-                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)"
+                pulumi preview --stack prod --diff --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)" --config "companionImage=$(params.companion-image)"
+                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)" --config "visualRendererImage=$(params.visual-renderer-image)" --config "companionImage=$(params.companion-image)"
         params:
           - { name: image, value: $(tasks.promote-release.results.image) }
           - { name: visual-renderer-image, value: $(tasks.promote-release.results.visual-renderer-image) }
+          - { name: companion-image, value: $(tasks.promote-release.results.companion-image) }
         workspaces:
           - { name: source, workspace: source }
   workspaces:

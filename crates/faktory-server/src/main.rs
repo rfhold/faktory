@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         AppConfig {
             auth,
             public_base_url: required("FAKTORY_PUBLIC_BASE_URL")?,
+            companion_origin: optional_companion_origin(env::var("FAKTORY_COMPANION_ORIGIN"))?,
             static_directory: env::var_os("FAKTORY_STATIC_DIR").map(PathBuf::from),
             render: RenderConfig {
                 command,
@@ -142,6 +143,16 @@ fn normalized_base_url(mut value: String) -> String {
     value
 }
 
+fn optional_companion_origin(
+    value: Result<String, env::VarError>,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err("FAKTORY_COMPANION_ORIGIN must contain valid UTF-8".into()),
+    }
+}
+
 fn parse_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error + Send + Sync>> {
     parse_bool_value(name, env::var(name), default)
 }
@@ -193,6 +204,27 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_companion_origin_env_preserves_value_or_absence() {
+        assert!(
+            optional_companion_origin(Err(env::VarError::NotPresent))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            optional_companion_origin(Ok("https://companion.example.test".into()))
+                .unwrap()
+                .as_deref(),
+            Some("https://companion.example.test")
+        );
+        assert!(
+            optional_companion_origin(Err(env::VarError::NotUnicode(std::ffi::OsString::from(
+                "invalid"
+            ))))
+            .is_err()
+        );
+    }
 
     #[test]
     fn disabled_mode_is_explicit_and_exact() {

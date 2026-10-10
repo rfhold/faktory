@@ -47,7 +47,13 @@ The production stack sets `protectData=true`, which applies Pulumi protection to
 
 [`model-projects-dependencies.md`](model-projects-dependencies.md) is authoritative for canonical files, managed `AGENTS.md`, model releases, exact dependency closure, and MCP file operations. Creation succeeds only when the model ID is absent; a current model conflicts. After Faktory materializes the root and exact dependency packages, it executes only the root entrypoint. Its top-level `result` must satisfy [`design-bundles.md`](design-bundles.md). Imports and other top-level Python statements remain allowed under the trusted-source MVP assumption. CQGI parameters are excluded.
 
-A name-only execution updates metadata without a project revision, render work, or render-state change. MCP project/file resources, bounded search results, and mutation inputs are the only source-bearing interfaces. MCP model metadata and image resources, protobuf responses, and browser responses remain source-free metadata or artifacts; the browser has no project route or editor.
+A name-only execution updates metadata without a project revision, render work, or render-state change.
+MCP owns project/file source reads, bounded search results, and mutation inputs.
+The browser has no generic project route or editor.
+[Companion presentation](spec/companion.md) provides the only selected sanitized browser source exception.
+Companion files remain part of `project.json`; the server compiles them on artifact retrieval without a new object-key layout.
+Companion edits schedule ordinary CAD renders and follow current-successful selection.
+Invalid companion content leaves successful geometry and its atomic advancement intact.
 
 ## Replacement Rendering
 
