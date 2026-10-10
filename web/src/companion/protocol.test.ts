@@ -1,7 +1,45 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { companionOrigin, fetchCompanion, fetchCompanionOrigin } from "./protocol";
+import { MessageChannel as NativeMessageChannel } from "node:worker_threads";
+import { createStore } from "solid-js/store";
+import { companionOrigin, fetchCompanion, fetchCompanionOrigin, mountCompanion } from "./protocol";
 afterEach(() => vi.unstubAllGlobals());
 describe("companion parent boundary", () => {
+  it("sends a plain snapshot of nested Solid store data through a real MessagePort", async () => {
+    vi.stubGlobal("MessageChannel", NativeMessageChannel);
+    const [companion, setCompanion] = createStore({
+      format: "faktory-companion-v1" as const, kit_version: "1" as const, revision: "rev-1",
+      html: "<p>Guide</p>", css: "",
+      assets: [{ id: "assets/data.json", mime_type: "application/json" as const, content: '{"value":1}' }],
+    });
+    const expected = JSON.parse(JSON.stringify(companion));
+    const probe = new NativeMessageChannel();
+    try {
+      expect(() => probe.port1.postMessage(companion)).toThrow();
+    } finally {
+      probe.port1.close(); probe.port2.close();
+    }
+    let child: import("node:worker_threads").MessagePort | undefined;
+    const messages: unknown[] = [];
+    const frame = { contentWindow: { postMessage: vi.fn((init, target, ports) => {
+      expect(target).toBe("*");
+      child = ports[0];
+      child!.on("message", data => messages.push(data));
+      child!.postMessage({ ...init, type: "companion:ready" });
+    }) } } as unknown as HTMLIFrameElement;
+    const state = vi.fn();
+    const connection = mountCompanion(frame, companion, state);
+    try {
+      setCompanion("assets", 0, "content", '{"value":2}');
+      await vi.waitFor(() => expect(messages).toHaveLength(1));
+      const message = messages[0] as { type: string; nonce: string; revision: string; companion: unknown };
+      expect(message.type).toBe("companion:content");
+      expect(message.companion).toEqual(expected);
+      child!.postMessage({ type: "companion:rendered", nonce: message.nonce, revision: message.revision });
+      await vi.waitFor(() => expect(state).toHaveBeenCalledWith("ready"));
+    } finally {
+      connection.destroy(); child?.close();
+    }
+  });
   it("uses bounded authenticated runtime config with no build fallback", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ companion_origin: "https://guide.test" }), { headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetcher);

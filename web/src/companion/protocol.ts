@@ -76,6 +76,8 @@ export function mountCompanion(frame: HTMLIFrameElement, companion: Companion, o
   print: () => void;
   destroy: () => void;
 } {
+  // Solid query data can contain nested proxies, which MessagePort cannot clone.
+  const content = validateCompanion(JSON.parse(JSON.stringify(companion)), companion.revision);
   const channel = new MessageChannel();
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, "0")).join("");
   const revision = companion.revision;
@@ -90,7 +92,7 @@ export function mountCompanion(frame: HTMLIFrameElement, companion: Companion, o
       return;
     if (m.type === "companion:ready" && !sent) {
       sent = true;
-      channel.port1.postMessage({ type: "companion:content", nonce, revision, companion });
+      channel.port1.postMessage({ type: "companion:content", nonce, revision, companion: content });
     }
     else if (m.type === "companion:rendered" && sent && !ready) {
       ready = true;
