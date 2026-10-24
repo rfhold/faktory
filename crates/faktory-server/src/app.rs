@@ -20,9 +20,6 @@ use axum::{
     routing::{get, get_service},
 };
 use faktory_proto::v1::faktory_service_server::FaktoryServiceServer;
-use kuri_server::access_auth::{
-    GrpcAccessAuthLayer, GrpcTransportLayer, access_auth_router, require_browser_session,
-};
 use opentelemetry::{KeyValue, global};
 use tonic::service::Routes;
 use tower::{Layer, Service, ServiceBuilder};
@@ -32,6 +29,9 @@ use tower_http::{
 };
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use waltr_server::access_auth::{
+    GrpcAccessAuthLayer, GrpcTransportLayer, access_auth_router, require_browser_session,
+};
 
 use crate::{
     auth::AuthConfig,
@@ -1795,12 +1795,12 @@ mod tests {
     }
 
     async fn companion_auth_fixture() -> (
-        kuri_server::access_auth::AccessAuthenticator,
-        kuri_server::access_auth::AccessAuthStore,
+        waltr_server::access_auth::AccessAuthenticator,
+        waltr_server::access_auth::AccessAuthStore,
         tempfile::TempDir,
         String,
     ) {
-        use kuri_server::{
+        use waltr_server::{
             access_auth::{
                 AccessAuthConfig, AccessAuthHttpClient, AccessAuthStore, AccessAuthenticator,
                 OidcConfig,
@@ -1865,7 +1865,7 @@ mod tests {
         reason = "browser-session lifecycle for both protected companion endpoints"
     )]
     async fn companion_requires_browser_cookie_and_never_accepts_bearer_or_invalid_sessions() {
-        use kuri_server::access_auth::{BrowserSession, BrowserSessionTokenDigest};
+        use waltr_server::access_auth::{BrowserSession, BrowserSessionTokenDigest};
         let (auth, store, _directory, issuer) = companion_auth_fixture().await;
         let runtime = build_runtime(Arc::new(InMemoryObjectStore::default()), disabled_config())
             .await
@@ -1888,7 +1888,7 @@ mod tests {
             )),
             Some((
                 header::COOKIE,
-                HeaderValue::from_static("kuri-session-local=invalid"),
+                HeaderValue::from_static("waltr-session-local=invalid"),
             )),
         ] {
             let config_response = artifact_request_with_header(
@@ -1935,7 +1935,7 @@ mod tests {
             .unwrap();
         let cookie = Some((
             header::COOKIE,
-            HeaderValue::from_static("kuri-session-local=fixture-session"),
+            HeaderValue::from_static("waltr-session-local=fixture-session"),
         ));
         assert_eq!(
             artifact_request_with_header(router.clone(), path.clone(), cookie.clone())

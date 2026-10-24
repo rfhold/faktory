@@ -5,7 +5,7 @@ import * as pulumi from "@pulumi/pulumi";
 import * as random from "@pulumi/random";
 import * as tls from "@pulumi/tls";
 import { BrowserApplication } from "./authentik";
-import { companionConfiguration, requireImmutableImage, validateHostname, validateHttpsOrigin, validateSegment } from "./policy";
+import { cimdTrustedPrivateOrigins, companionConfiguration, requireImmutableImage, validateHostname, validateHttpsOrigin, validateSegment } from "./policy";
 import { declareCompanionHost } from "./companion";
 
 const config = new pulumi.Config();
@@ -25,6 +25,7 @@ const backupStorageClass = config.require("backupStorageClass");
 const backupRetention = config.require("backupRetention");
 const databaseStorageSize = config.require("databaseStorageSize");
 const protectData = config.requireBoolean("protectData");
+const trustedPrivateOrigins = cimdTrustedPrivateOrigins(config.getObject<unknown>("mcpOAuthCimdTrustedPrivateOrigins"));
 const oauthWrappingKeyVersions = config.requireObject<unknown>("oauthWrappingKeyVersions");
 const oauthActiveWrappingKeyVersion = config.require("oauthActiveWrappingKeyVersion");
 validateOAuthWrappingKeyConfiguration(oauthWrappingKeyVersions, oauthActiveWrappingKeyVersion);
@@ -253,6 +254,7 @@ const appSecret = new k8s.core.v1.Secret("faktory-app", {
     FAKTORY_OAUTH_WRAPPING_KEYS_FILE: "/var/run/secrets/faktory/oauth/keyring.json",
     FAKTORY_OAUTH_ALLOW_DCR: "true",
     FAKTORY_OAUTH_ALLOW_CIMD: "true",
+    ...(trustedPrivateOrigins.length ? { FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS: trustedPrivateOrigins.join(",") } : {}),
     FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true",
     FAKTORY_DEPLOYMENT_ENVIRONMENT: deploymentEnvironment,
     FAKTORY_PYROSCOPE_URL: "https://telemetry.holdenitdown.net:4040",

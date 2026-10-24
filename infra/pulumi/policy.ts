@@ -15,6 +15,24 @@ export function validateHttpsOrigin(value: string, name: string): string {
   return url.origin;
 }
 
+export function cimdTrustedPrivateOrigins(value: unknown): string[] {
+  if (value === undefined) return [];
+  const invalid = () => new Error("CIMD requires at most 16 exact HTTPS origins within the runtime byte limits");
+  if (!Array.isArray(value) || value.length > 16) throw invalid();
+  const origins = value.map((entry: unknown) => {
+    if (typeof entry !== "string") throw invalid();
+    const origin = entry.trim();
+    if (Buffer.byteLength(origin) > 512 || !/^https:\/\/[^/?#\\@*,]+\/?$/.test(origin)) throw invalid();
+    let url: URL;
+    try { url = new URL(origin); } catch { throw invalid(); }
+    if (url.hostname.includes("*") || Buffer.byteLength(url.href) > 512) throw invalid();
+    return url.origin;
+  });
+  if (Buffer.byteLength(origins.join(",")) > 4096 ||
+      origins.reduce((bytes, origin) => bytes + Buffer.byteLength(`${origin}/`), 0) > 4096) throw invalid();
+  return [...new Set(origins)];
+}
+
 export function validateHostname(value: string): string {
   if (!dnsName.test(value) || value.includes("..")) throw new Error("hostname is invalid");
   return value;

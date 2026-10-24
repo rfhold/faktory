@@ -10,6 +10,17 @@ The implemented multipart result contract is defined by [Multipart Design Bundle
 [The companion specification](docs/architecture/spec/companion.md) limits the browser source exception to selected sanitized root companion presentation.
 Preserve authenticated retrieval, current-successful selection, geometry independence, opaque frames, and content-free telemetry.
 
+## Waltr dependency and browser-auth cutover
+
+Faktory uses `waltr-server` and `mcp` from `https://git.holdenitdown.net/rfhold/waltr.git`, tag `v0.3.1`, commit `8dd2a558be902d976d1d6ed34b389afd37fc2a08`.
+Both dependencies disable default features; MCP retains its explicit OAuth PostgreSQL and progressive features.
+Waltr uses `__Host-waltr-session` in production, `waltr-session-local` for insecure local fixtures, and the `waltr` PostgreSQL schema.
+A later deployment requires fresh browser authentication; old Kuri cookies and browser-session state do not transfer.
+The cutover provides no old-state migration or database cleanup.
+Historical data stays untouched, including applied SQL migration text and checksums.
+Faktory preserves its `authentik:` application principal mapping and all `FAKTORY_` configuration names.
+This local dependency change grants no deployment or database authority.
+
 ## Toolchains
 
 - Rust `1.96.0` with edition 2024.

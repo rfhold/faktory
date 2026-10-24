@@ -4,10 +4,6 @@ use std::{collections::HashSet, fmt, fs, sync::Arc, time::Duration};
 
 use axum::response::IntoResponse as _;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use kuri_server::{
-    access_auth::{AccessAuthConfig, AccessAuthHttpClient, AccessAuthenticator, OidcConfig},
-    persistence::{DatabaseBackend, DatabaseConfig, Persistence},
-};
 use mcp::{
     HardenedOAuthClientMetadataFetcher, McpOAuthEntropy, McpOAuthSecret, McpPrincipalId,
     McpSystemOAuthClock, OAuthAuthorizationServer, OAuthAuthorizationServerConfig,
@@ -22,6 +18,10 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 use url::Url;
+use waltr_server::{
+    access_auth::{AccessAuthConfig, AccessAuthHttpClient, AccessAuthenticator, OidcConfig},
+    persistence::{DatabaseBackend, DatabaseConfig, Persistence},
+};
 
 use crate::Secret;
 

@@ -121,7 +121,7 @@ services:
       FAKTORY_S3_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       FAKTORY_VISUAL_RENDERER_URL: http://visual-renderer:8081
       FAKTORY_VISUAL_RENDER_TIMEOUT_SECONDS: "30"
-      RUST_LOG: faktory_server=info,kuri_server=info,mcp=info,tower_http=info
+      RUST_LOG: faktory_server=info,waltr_server=info,mcp=info,tower_http=info
     depends_on:
       garage-init:
         condition: service_completed_successfully

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { after, before, describe, test } from "node:test";
 import * as pulumi from "@pulumi/pulumi";
-import { companionConfiguration, requireImmutableImage, validateHttpsOrigin } from "./policy";
+import { cimdTrustedPrivateOrigins, companionConfiguration, requireImmutableImage, validateHttpsOrigin } from "./policy";
 
 interface ResourceRecord { type: string; name: string; inputs: Record<string, any>; rawInputs: Record<string, any>; }
 const resources: ResourceRecord[] = [];
+const privateOrigins: string[] = JSON.parse(process.env.FAKTORY_INFRA_TEST_CIMD_ORIGINS ?? "[]");
 const previousConfig = process.env.PULUMI_CONFIG;
 let program: typeof import("./index");
 
@@ -29,6 +31,7 @@ before(async () => {
     "faktory:protectData": "false",
     "faktory:oauthWrappingKeyVersions": '["v1","v2"]',
     "faktory:oauthActiveWrappingKeyVersion": "v2",
+    ...(privateOrigins.length ? { "faktory:mcpOAuthCimdTrustedPrivateOrigins": JSON.stringify(privateOrigins) } : {}),
   });
   pulumi.runtime.setMocks({
     newResource: (args) => {
@@ -93,6 +96,28 @@ describe("configuration policy", () => {
     assert.throws(() => validateHttpsOrigin("http://s3.example.test", "s3"));
   });
 
+  test("private CIMD trust defaults off and validates bounded exact origins", () => {
+    assert.deepEqual(cimdTrustedPrivateOrigins(undefined), []);
+    assert.deepEqual(cimdTrustedPrivateOrigins([]), []);
+    assert.deepEqual(cimdTrustedPrivateOrigins([" https://waltr.example/ ", "https://waltr.example"]), ["https://waltr.example"]);
+    for (const invalid of [null, "https://client.example", [42], [""], ["https://*.example"], ["https://%2A.example"],
+      ["http://client.example"], ["https://user@client.example"], ["https://client.example/path/../"],
+      ["https://client.example/?"], ["https://client.example/#"], ["https://client.example\\\\evil"],
+      Array(17).fill("https://client.example"), [`https://${"a".repeat(504)}`],
+      Array.from({ length: 16 }, (_, index) => `https://${index}.${"a".repeat(250)}.example`)]) {
+      assert.throws(() => cimdTrustedPrivateOrigins(invalid), /CIMD requires/);
+    }
+  });
+
+  test("configured private CIMD origins reach appSecret and the server envFrom", () => {
+    if (privateOrigins.length) return;
+    const child = spawnSync(process.execPath, ["test", __filename], {
+      env: { ...process.env, FAKTORY_INFRA_TEST_CIMD_ORIGINS: JSON.stringify(["https://waltr.holdenitdown.net/", "https://waltr.holdenitdown.net"]) },
+      encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(child.status, 0, `${child.stdout}${child.stderr}`);
+  });
+
   test("validates bounded wrapping-key configuration", () => {
     assert.doesNotThrow(() => program.validateOAuthWrappingKeyConfiguration(["v1"], "v1"));
     assert.throws(() => program.validateOAuthWrappingKeyConfiguration("v1", "v1"));
@@ -119,6 +144,10 @@ describe("configuration policy", () => {
     assert.match(production, /^\s*faktory:databaseStorageSize: 20Gi$/m);
     assert.match(production, /^\s*faktory:backupRetention: 30d$/m);
     assert.match(production, /^\s*faktory:protectData: (?:"true"|true)$/m);
+    assert.deepEqual(preview.match(/^\s*faktory:mcpOAuthCimdTrustedPrivateOrigins:.*$/gm)?.map(line => line.trim()),
+      ["faktory:mcpOAuthCimdTrustedPrivateOrigins: [https://preview-waltr.holdenitdown.net]"]);
+    assert.deepEqual(production.match(/^\s*faktory:mcpOAuthCimdTrustedPrivateOrigins:.*$/gm)?.map(line => line.trim()),
+      ["faktory:mcpOAuthCimdTrustedPrivateOrigins: [https://waltr.holdenitdown.net]"]);
     for (const stack of [preview, production]) {
       assert.match(stack, /^\s*kubernetes:context: pantheon$/m);
       assert.match(stack, /^\s*faktory:s3Endpoint: https:\/\/s3\.pantheon\.holdenitdown\.net$/m);
@@ -175,6 +204,7 @@ describe("preview declarations", () => {
     const container = pod.containers[0];
     assert.equal(container.securityContext.seccompProfile, undefined);
     assert.equal(container.securityContext.readOnlyRootFilesystem, true);
+    assert.deepEqual(container.envFrom, [{ secretRef: { name: "faktory-app" } }]);
     assert.deepEqual(container.securityContext.capabilities.drop, ["ALL"]);
     assert.equal(container.startupProbe.httpGet.path, "/health");
     assert.equal(container.readinessProbe.httpGet.path, "/ready");
@@ -190,7 +220,8 @@ describe("preview declarations", () => {
     assert.equal(secret.FAKTORY_OAUTH_WRAPPING_KEYS_FILE, "/var/run/secrets/faktory/oauth/keyring.json");
     assert.equal(secret.FAKTORY_OAUTH_ALLOW_DCR, "true");
     assert.equal(secret.FAKTORY_OAUTH_ALLOW_CIMD, "true");
-    assert.equal(secret.FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS, undefined);
+    assert.equal(secret.FAKTORY_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS,
+      privateOrigins.length ? cimdTrustedPrivateOrigins(privateOrigins).join(",") : undefined);
     assert.equal(secret.FAKTORY_OAUTH_ALLOW_LOOPBACK_REDIRECTS, "true");
     assert.equal(secret.FAKTORY_S3_BUCKET, "test-artifacts");
     assert.equal(secret.FAKTORY_S3_ENDPOINT, "https://app-s3.example.test");

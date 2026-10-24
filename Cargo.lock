@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "faktory-proto"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "prost",
  "prost-types",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "faktory-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1511,7 +1511,6 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "kuri-server",
  "markup5ever_rcdom",
  "mcp",
  "opentelemetry",
@@ -1543,6 +1542,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "waltr-server",
  "xmlparser",
 ]
 
@@ -2713,130 +2713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuri"
-version = "0.2.0"
-source = "git+https://git.holdenitdown.net/rfhold/kuri.git?rev=18128ee24cfa00f1fb5bf10d6aa1859253a9a708#18128ee24cfa00f1fb5bf10d6aa1859253a9a708"
-dependencies = [
- "prost",
- "prost-types",
- "serde",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "kuri-agent"
-version = "0.2.0"
-source = "git+https://git.holdenitdown.net/rfhold/kuri.git?rev=18128ee24cfa00f1fb5bf10d6aa1859253a9a708#18128ee24cfa00f1fb5bf10d6aa1859253a9a708"
-dependencies = [
- "aws-sdk-s3",
- "axum",
- "base64 0.22.1",
- "futures-util",
- "http 1.5.0",
- "httpdate",
- "jsonwebtoken",
- "kuri",
- "mcp",
- "oauth2",
- "opendal",
- "refinery",
- "reqwest",
- "rustix",
- "rustls 0.23.44",
- "scylla",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "tokio",
- "tokio-postgres",
- "tokio-stream",
- "tokio-tungstenite",
- "tokio-util",
- "tonic",
- "tracing",
- "uuid",
- "webpki-roots 1.0.9",
-]
-
-[[package]]
-name = "kuri-agent-sandbox"
-version = "0.2.0"
-source = "git+https://git.holdenitdown.net/rfhold/kuri.git?rev=18128ee24cfa00f1fb5bf10d6aa1859253a9a708#18128ee24cfa00f1fb5bf10d6aa1859253a9a708"
-dependencies = [
- "globset",
- "hyper-util",
- "ignore",
- "kuri",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tower",
- "uuid",
-]
-
-[[package]]
-name = "kuri-server"
-version = "0.2.0"
-source = "git+https://git.holdenitdown.net/rfhold/kuri.git?rev=18128ee24cfa00f1fb5bf10d6aa1859253a9a708#18128ee24cfa00f1fb5bf10d6aa1859253a9a708"
-dependencies = [
- "aws-sdk-s3",
- "axum",
- "base64 0.22.1",
- "cookie",
- "futures-util",
- "http-body 1.1.0",
- "hyper 1.11.1",
- "hyper-util",
- "jaq-core",
- "jaq-interpret",
- "jaq-parse",
- "jaq-std",
- "jsonwebtoken",
- "kuri",
- "kuri-agent",
- "kuri-agent-sandbox",
- "mcp",
- "notify",
- "oauth2",
- "opentelemetry",
- "opentelemetry-appender-tracing",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "p256",
- "prost",
- "prost-types",
- "rand 0.9.5",
- "reqwest",
- "rustls 0.23.44",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "sqlx",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-otel-layer",
- "tonic-tracing-opentelemetry",
- "tonic-web",
- "tower",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "uuid",
- "webpki-roots 1.0.9",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3035,8 +2911,8 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp"
-version = "0.2.0"
-source = "git+https://git.holdenitdown.net/rfhold/kuri.git?rev=18128ee24cfa00f1fb5bf10d6aa1859253a9a708#18128ee24cfa00f1fb5bf10d6aa1859253a9a708"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -3070,8 +2946,8 @@ dependencies = [
 
 [[package]]
 name = "mcp-macros"
-version = "0.2.0"
-source = "git+https://git.holdenitdown.net/rfhold/kuri.git?rev=18128ee24cfa00f1fb5bf10d6aa1859253a9a708#18128ee24cfa00f1fb5bf10d6aa1859253a9a708"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4582,6 +4458,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5763,6 +5640,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -5831,11 +5709,13 @@ dependencies = [
  "socket2 0.6.5",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls 0.26.5",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -6252,6 +6132,148 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "waltr"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
+dependencies = [
+ "prost",
+ "prost-types",
+ "serde",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "waltr-agent"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
+dependencies = [
+ "aws-sdk-s3",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "http 1.5.0",
+ "httpdate",
+ "jsonwebtoken",
+ "mcp",
+ "oauth2",
+ "opendal",
+ "refinery",
+ "reqwest",
+ "rustix",
+ "rustls 0.23.44",
+ "scylla",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-postgres",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "uuid",
+ "waltr",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "waltr-agent-sandbox"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
+dependencies = [
+ "globset",
+ "hyper-util",
+ "ignore",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "uuid",
+ "waltr",
+]
+
+[[package]]
+name = "waltr-audio"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "opentelemetry",
+ "prost",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "tracing-opentelemetry",
+ "waltr",
+]
+
+[[package]]
+name = "waltr-server"
+version = "0.3.0"
+source = "git+https://git.holdenitdown.net/rfhold/waltr.git?tag=v0.3.1#8dd2a558be902d976d1d6ed34b389afd37fc2a08"
+dependencies = [
+ "aws-sdk-s3",
+ "axum",
+ "base64 0.22.1",
+ "cookie",
+ "futures-util",
+ "http-body 1.1.0",
+ "hyper 1.11.1",
+ "hyper-util",
+ "jaq-core",
+ "jaq-interpret",
+ "jaq-parse",
+ "jaq-std",
+ "jsonwebtoken",
+ "mcp",
+ "notify",
+ "oauth2",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "p256",
+ "prost",
+ "prost-types",
+ "rand 0.9.5",
+ "reqwest",
+ "rustls 0.23.44",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-otel-layer",
+ "tonic-tracing-opentelemetry",
+ "tonic-web",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "waltr",
+ "waltr-agent",
+ "waltr-agent-sandbox",
+ "waltr-audio",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
