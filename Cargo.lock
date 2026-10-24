@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "faktory-proto"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "prost",
  "prost-types",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "faktory-server"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "aws-config",
