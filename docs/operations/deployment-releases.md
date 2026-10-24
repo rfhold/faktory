@@ -20,7 +20,7 @@ The production data claims and PostgreSQL cluster carry Pulumi protection. Reten
 
 ## Delivery Declarations
 
-The preview pipeline in [`.tekton/faktory-preview.yaml`](../../.tekton/faktory-preview.yaml) targets `main`. It builds Linux AMD64 and ARM64 server images. Matching native tasks run each packaged CadQuery renderer and validate its multipart artifacts and GLB before manifest publication. The signed release pipeline in [`.tekton/faktory-release.yaml`](../../.tekton/faktory-release.yaml) targets only exact stable tags of the form `vX.Y.Z`. Both declarations run a pinned Gitleaks scan.
+The preview pipeline in [`.tekton/faktory-preview.yaml`](../../.tekton/faktory-preview.yaml) targets `main`. It builds Linux AMD64 and ARM64 server images. Matching native tasks run each packaged CadQuery renderer and validate its multipart artifacts and GLB before manifest publication. The signed release pipeline in [`.tekton/faktory-release.yaml`](../../.tekton/faktory-release.yaml) targets only exact stable tags of the form `vX.Y.Z`. Both declarations run a pinned Gitleaks scan. Maintained CI tool images use `latest` with `imagePullPolicy: Always`; the pipelines select `cr.holdenitdown.net/rfhold/general-ci:latest`. Third-party tool images retain their exact version and digest pins. Application build inputs, runtime-check image parameters, and exact tested release digests remain unchanged.
 Release promotes selected preview digests without image builds, repeated CadQuery or visual-renderer checks, or a new manifest.
 It performs a fresh packaged companion-host smoke check on the digest it selects.
 

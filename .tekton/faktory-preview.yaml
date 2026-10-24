@@ -590,7 +590,8 @@ spec:
                 secretName: tekton-cluster-kubeconfig
           steps:
             - name: preview-and-apply
-              image: cr.holdenitdown.net/rfhold/general-ci@sha256:6943f91d774980357b24730a14ac4b026325d50962df4b2e15e24c3f43190e5b
+              image: cr.holdenitdown.net/rfhold/general-ci:latest
+              imagePullPolicy: Always
               workingDir: $(workspaces.source.path)/infra/pulumi
               env:
                 - { name: KUBECONFIG, value: /etc/kubeconfig/kubeconfig }

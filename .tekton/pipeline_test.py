@@ -216,8 +216,9 @@ class ReleasePromotionTest(unittest.TestCase):
                      "gitleaks dir --config .gitleaks.toml"):
             self.assertIn(gate, self.release)
         for removed in ("buildctl", "BUILDKIT", "publish-manifest", "verify-amd64",
-                        "verify-arm64", "verify-visual-renderer-amd64", ":latest", ":sha-"):
+                        "verify-arm64", "verify-visual-renderer-amd64", ":sha-"):
             self.assertNotIn(removed, self.release)
+        self.assertNotIn(":latest", self.release.replace("cr.holdenitdown.net/rfhold/general-ci:latest", ""))
         self.assertEqual(re.findall(r"pipelineTaskName: (.+)", self.release), ["verify-companion-release", "promote-release", "deploy-production"])
         self.assertIn("$(tasks.promote-release.results.image)", self.release)
         self.assertIn("$(tasks.promote-release.results.visual-renderer-image)", self.release)
@@ -228,7 +229,7 @@ class ReleasePromotionTest(unittest.TestCase):
         self.assertIn("emptyDir: {}", task)
         self.assertIn("image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424", task)
         self.assertIn("cp /ko-app/crane /tools/crane", task)
-        self.assertIn("image: cr.holdenitdown.net/rfhold/general-ci@sha256:6943f91d774980357b24730a14ac4b026325d50962df4b2e15e24c3f43190e5b", task)
+        self.assertIn("image: cr.holdenitdown.net/rfhold/general-ci:latest\n              imagePullPolicy: Always", task)
         self.assertIn("{ name: crane-tool, mountPath: /tools, readOnly: true }", task)
         self.assertIn('export PATH="/tools:$PATH"', self.script)
         self.assertIn("crane version", self.script)

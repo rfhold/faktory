@@ -75,7 +75,7 @@ docker compose config --quiet
 git diff --check
 ```
 
-Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. They do not repeat the local quality suite. Preview runs each Faktory image's matching native renderer check before manifest publication.
+Run this sequence locally before pushing. The preview and release pipelines retain the pinned Gitleaks scan and delivery checks. Maintained CI tool images follow the [image policy](docs/operations/deployment-releases.md); third-party tool images retain their exact pins. They do not repeat the local quality suite. Preview runs each Faktory image's matching native renderer check before manifest publication.
 Release promotes selected preview digests without image builds or repeated CadQuery and visual-renderer checks.
 It performs a fresh packaged companion-host smoke check on its selected digest.
 
