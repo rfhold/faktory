@@ -20,6 +20,8 @@ The production data claims and PostgreSQL cluster carry Pulumi protection. Reten
 
 ## Delivery Declarations
 
+The service workflows use `pipelinesascode.tekton.dev/task` to import and inline only their referenced shared Tasks from immutable Homelab commit `db8891ad3b9467db8ff15d80bb931e01c2af2e0d`. Installing a cluster Task does not automatically resolve a named `taskRef` during Pipelines as Code processing. Shared Task updates require an explicit consumer pin update and separately approved Task installation before execution; source or cluster availability alone does not prove run health.
+
 The preview pipeline in [`.tekton/faktory-preview.yaml`](../../.tekton/faktory-preview.yaml) targets `main` push/incoming events. After checkout and the pinned Gitleaks scan, five independent `service-build-v1` Tasks build server and companion-host images for Linux AMD64 and ARM64, plus an AMD64-only visual-renderer image. Each architecture is paired with its native BuildKit endpoint. Targets are `runtime`, `companion-runtime`, and `visual-renderer-runtime`; all require user `65532:65532` and the full commit SHA through `REVISION`. Only the Rust server builds receive the Secret-bound Git credential workspace. The visual renderer is the explicit single-platform exception: its Dockerfile guard, Chromium sandbox, security settings, and runtime AMD64 placement remain unchanged.
 
 Each image uses `service-manifest-v1` to join immutable build results in AMD64/ARM64 order. The visual renderer also receives an index, with exactly one AMD64 entry. Main publishes bare full-SHA aliases:
