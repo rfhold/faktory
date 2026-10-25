@@ -13,7 +13,7 @@ use crate::model::{
 
 impl ServerHandler for FaktoryMcp {
     fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("faktory", "0.1.0")
+        ServerInfo::new("faktory", "0.2.6")
     }
 
     fn capabilities(&self) -> ServerCapabilities {

@@ -20,50 +20,39 @@ The production data claims and PostgreSQL cluster carry Pulumi protection. Reten
 
 ## Delivery Declarations
 
-The preview pipeline in [`.tekton/faktory-preview.yaml`](../../.tekton/faktory-preview.yaml) targets `main`. It builds Linux AMD64 and ARM64 server images. Matching native tasks run each packaged CadQuery renderer and validate its multipart artifacts and GLB before manifest publication. The signed release pipeline in [`.tekton/faktory-release.yaml`](../../.tekton/faktory-release.yaml) targets only exact stable tags of the form `vX.Y.Z`. Both declarations run a pinned Gitleaks scan. Maintained CI tool images use `latest` with `imagePullPolicy: Always`; the pipelines select `cr.holdenitdown.net/rfhold/general-ci:latest`. Third-party tool images retain their exact version and digest pins. Application build inputs, runtime-check image parameters, and exact tested release digests remain unchanged.
-Release promotes selected preview digests without image builds, repeated CadQuery or visual-renderer checks, or a new manifest.
-It performs a fresh packaged companion-host smoke check on the digest it selects.
+The preview pipeline in [`.tekton/faktory-preview.yaml`](../../.tekton/faktory-preview.yaml) targets `main` push/incoming events. After checkout and the pinned Gitleaks scan, five independent `service-build-v1` Tasks build server and companion-host images for Linux AMD64 and ARM64, plus an AMD64-only visual-renderer image. Each architecture is paired with its native BuildKit endpoint. Targets are `runtime`, `companion-runtime`, and `visual-renderer-runtime`; all require user `65532:65532` and the full commit SHA through `REVISION`. Only the Rust server builds receive the Secret-bound Git credential workspace. The visual renderer is the explicit single-platform exception: its Dockerfile guard, Chromium sandbox, security settings, and runtime AMD64 placement remain unchanged.
 
-Preview also builds separate AMD64 visual-renderer and companion-host images.
-A native AMD64 task exercises the visual renderer with the declared hardening controls and Chromium sandbox.
-It validates the colored GLB's `three-v2` response, seven names, PNG dimensions, MIME types, and visible color.
-BuildKit's `containerimage.digest` metadata supplies the companion build result as an immutable image reference.
-A companion task exercises that exact reference, not the mutable preview alias.
-The next task checks that digest's runtime user and OCI revision before deployment consumes the same reference.
-Preview resolves all three images to immutable digests.
-Release resolves these aliases for the exact release commit:
+Each image uses `service-manifest-v1` to join immutable build results in AMD64/ARM64 order. The visual renderer also receives an index, with exactly one AMD64 entry. Main publishes bare full-SHA aliases:
 
-- `faktory:preview-<full-commit-SHA>`
-- `faktory-visual-renderer:preview-<full-commit-SHA>-amd64`
-- `faktory-companion-host:preview-<full-commit-SHA>-amd64`
+- `faktory:<full-commit-SHA>`
+- `faktory-visual-renderer:<full-commit-SHA>`
+- `faktory-companion-host:<full-commit-SHA>`
 
-Release validates platform, runtime user, and OCI revision metadata before it copies the exact digests under the stable version tag.
-The companion selection task resolves its preview alias once.
-Release runs a fresh smoke check on that selected digest, then promotes and deploys that same digest.
-This check establishes selected-digest smoke evidence; it does not prove equality with a prior preview run's digest.
-Both deploy tasks pass their selected digests through `image`, `visualRendererImage`, and `companionImage`.
-The optional hostname still controls companion resource creation.
-The full local quality sequence remains a required pre-push check and does not run inside these pipelines.
+The signed release pipeline in [`.tekton/faktory-release.yaml`](../../.tekton/faktory-release.yaml) targets only exact stable `vX.Y.Z` tags. One `service-promote-v1` Task resolves the three full-SHA indexes once, validates exact platforms, runtime users, and OCI revisions, and prechecks every stable destination before publishing any exact source index bytes. There are no release builds or source-manifest joins. Missing sources fail without a rebuild fallback. No application `latest` alias is published.
 
-These declarations do not prove pipeline success or stack deployment. The signed release path requires a committed remote `main`, a configured Pipeline-as-Code environment, a successful preview run for the exact release commit, and the `faktory-release-trusted-signers` Secret containing the trusted public signing key. Registry, Git, Pulumi, Authentik, and cluster credentials and services are external prerequisites, not resources proven by this repository.
-BuildKit and native renderer verification nodes remain preview prerequisites.
-Release also requires capacity to execute the selected AMD64 companion image's fresh smoke check.
+Neither deployment DAG runs CadQuery, visual-renderer, companion, or other functional tests. Local verifier helpers and test suites remain available; the full local quality sequence remains a required pre-push check. Security scans and shared image identity validation still gate delivery. Maintained CI tools use `general-ci:latest` with `imagePullPolicy: Always`; retained third-party tools keep their exact pins, including Gitleaks.
+
+Both environments use `service-pulumi-up-v1` with `source-subdir=infra/pulumi`, frozen Bun installation, and direct `pulumi up --yes --skip-preview`; no standalone preview runs. Preview maps manifest results to `image`, `visualRendererImage`, and `companionImage`; production consumes the promotion Task's complete immutable image map. Authentik credentials are enabled; Grafana and OpenBao access are disabled. The optional hostname still controls companion resource creation.
+
+These declarations do not prove pipeline success or stack deployment. All four homelab shared v1 Tasks require separate installation before consumer execution. The signed release path requires a committed remote `main`, configured Pipelines-as-Code, successful main publication for the exact release commit, and the `faktory-release-trusted-signers` Secret containing the trusted public signing key. Native BuildKit workers, registry, Git, Pulumi, Authentik, and cluster credentials and services are external prerequisites, not resources proven by this repository. No native image execution or live deployment is established by static validation.
 
 ## Signed Release Flow
 
 1. Complete the full checks in [`../quality/testing.md`](../quality/testing.md) on the intended commit.
-2. Verify the commit's `origin/main` membership and successful preview run, including both native server checks and both AMD64 service checks. Verify that `[workspace.package].version` in `Cargo.toml` and `version` in `web/package.json` equal `X.Y.Z`. Retain preview digest references as preview evidence. Retain the release-selected companion digest and its fresh smoke result as separate release evidence.
+2. Verify the commit's `origin/main` membership and successful main publication of all three full-SHA indexes. Verify that `[workspace.package].version` in `Cargo.toml` and `version` in `web/package.json` equal `X.Y.Z`. Retain the immutable index references as publication evidence, not functional-test evidence.
 3. Create an annotated, signed `vX.Y.Z` tag with a key present in the trusted signer Secret, then push that exact tag. This is an external mutation and requires repository release authority.
 4. The pipeline verifies the exact tag syntax, full webhook SHA, annotated tag object, signature, trusted signer, tag-to-webhook equality, `origin/main` ancestry, and both version values.
-5. Require a successful Gitleaks scan before promotion. Resolve the companion preview alias once to an immutable digest. Require its fresh packaged smoke check. Preserve that tested reference through promotion. Resolve the main and visual-renderer aliases to full SHA-256 digests. Missing sources or registry lookup failures stop release; no rebuild fallback exists.
-6. Before any copy, validate both server platform configs and the visual-renderer and companion-host Linux AMD64 configs. Every config must declare user `65532:65532` and the exact release commit as its OCI revision.
-7. Preflight all three stable destinations before the first copy. Each alias must be absent through explicit `MANIFEST_UNKNOWN` or `NAME_UNKNOWN`, or equal its source digest. Conflicts, authorization failures, network errors, and unclassified errors stop promotion.
-8. Recheck each destination before its copy. If absent, copy the immutable source reference. Verify all three stable `vX.Y.Z` aliases against their selected digests. Equal aliases permit idempotent retries. The pipeline publishes no `latest` alias. Registry writes lack cross-repository atomicity; an earlier equal alias can remain after a later failure. Deployment requires all three verifications.
-9. Supply the selected digests to `pulumi preview --stack prod` and `pulumi up --stack prod` through `image`, `visualRendererImage`, and `companionImage`. Preserve the smoke-tested companion digest exactly. Pulumi rejects mutable image references.
+5. Require a successful Gitleaks scan before the single image-set promotion. Resolve each bare full-SHA index once. Missing sources or registry lookup failures stop release; no rebuild fallback exists.
+6. Validate both server and companion-host platform configs and the visual-renderer's single Linux AMD64 config. Every config must declare user `65532:65532` and the exact release commit as its OCI revision.
+7. Preflight all three stable destinations before the first publication. Each alias must be absent through a structured `MANIFEST_UNKNOWN` 404, or equal its source digest. Conflicts, authorization failures, network errors, and unclassified errors stop promotion.
+8. Recheck each destination before publishing the exact source index bytes and verify its digest afterward. Equal aliases permit idempotent retries. Registry writes lack cross-repository atomicity; an earlier equal alias can remain after a later failure. Registry-side immutable tags or exclusive writers remain necessary against concurrent external writers. Deployment requires all three verifications.
+9. Supply the promotion result's complete image map to direct `pulumi up --stack prod --yes --skip-preview` through `image`, `visualRendererImage`, and `companionImage`. Pulumi rejects mutable image references.
 
 ## Availability and Rollback
 
 The deployment has one replica and strategy `Recreate`. An update stops the prior pod before the replacement becomes available, so every preview, production, or rollback deployment has expected service downtime. There is no automatic application rollback in the pipeline.
+
+A failed or cancelled PipelineRun does not prove rollback or the absence of external effects. Completed image publication and Pulumi changes can remain. Remote BuildKit can continue or finish after cancellation; its final status requires separate confirmation. Before an authorized retry, inspect immutable aliases and digests, remote BuildKit status, and Pulumi pending operations and resources. Live inspection, retry, and rollback each require exact target-specific authorization.
 
 Manual rollback requires target-specific production authorization and reviewed server, visual-renderer, and enabled companion-host digests.
 All selected images must remain compatible with current database, object, RPC, recipe, and companion-kit contracts.

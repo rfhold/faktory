@@ -52,15 +52,15 @@ The companion host receives only the exact application parent origin.
 
 ## Delivery and Verification
 
-Preview builds the main image, AMD64 visual-renderer image, and AMD64 companion-host image.
-BuildKit metadata supplies the companion image digest directly to the build task result.
-Preview exercises that exact digest, checks its revision and runtime user, and supplies the same digest to deployment.
-Release selects the companion preview alias once and performs a fresh packaged smoke check on the selected digest.
-It promotes and deploys that exact tested digest; it does not infer the digest from prior preview-run evidence.
-Release promotes all three selected image digests and does not rebuild environment-specific bytes.
-Preflight all three stable destinations before the first copy.
+Preview independently builds Linux AMD64 and ARM64 server and companion-host images, plus the explicit AMD64-only visual renderer, with `service-build-v1`.
+The companion builds receive no Git credential workspace.
+`service-manifest-v1` verifies each immutable companion build result's platform, revision, and runtime user, then publishes the dual-platform index at the bare full-SHA alias.
+The visual renderer receives a single-platform index; the server receives a dual-platform index.
+Neither deployment DAG runs packaged functional smoke tests; local helpers remain available for separate checks.
+One release `service-promote-v1` Task resolves all three full-SHA indexes, validates their identities, and prechecks all stable destinations before any publication.
+It promotes exact index bytes without rebuilding environment-specific images and verifies all stable aliases before deployment.
+Both environments pass a complete immutable image map to direct `service-pulumi-up-v1` apply, without a standalone preview.
 If any lookup, identity, platform, or destination check fails, stop promotion.
-Verify all three stable aliases before deployment.
 [Deployment and Releases](deployment-releases.md) owns the full release and rollback procedure.
 
 Before companion activation, review these prerequisites:

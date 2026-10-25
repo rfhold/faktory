@@ -11,8 +11,8 @@ The MVP has one Rust server replica, one bounded in-process render queue, and on
 Compose substitutes single-node Garage and local PostgreSQL services. It also builds one AMD64 visual renderer and configures its internal URL. Compose sets `FAKTORY_AUTH_MODE=disabled`, publishes Faktory on `0.0.0.0:8080`, and sets `FAKTORY_PUBLIC_BASE_URL=http://172.16.1.40:8080`. The service accepts unauthenticated LAN traffic, so use it only on a trusted private network and restrict TCP 8080 with the host firewall. Garage stays on loopback. PostgreSQL and the worker have no host ports. Disabled mode bypasses OAuth redirect validation, but generated absolute URLs use the configured public base. The single server replica remains a correctness constraint. Do not scale it without designs for render leases, metadata concurrency, and watch fanout.
 
 Preview builds Linux AMD64 and ARM64 server images from committed conda-forge explicit locks.
-It also builds and verifies separate AMD64 visual-renderer and companion-host images.
-Release promotes selected preview digests and performs a fresh smoke check on its selected companion-host digest.
+It independently builds dual-platform companion-host images and the explicit AMD64-only visual renderer, then publishes full-SHA indexes after shared image identity validation.
+Release promotes those exact indexes without rebuilding or running packaged functional tests; local renderer and companion checks remain separate.
 The visual-renderer workload selects AMD64 nodes; native ARM64 visual-renderer behavior remains unknown and unsupported.
 [`deployment-releases.md`](deployment-releases.md) owns deployment and release behavior.
 
